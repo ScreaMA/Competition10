@@ -18,8 +18,13 @@ automation:
   comment_on_issue: true
   branch_prefix: "auto-fix"
   # 每轮轮询先检查自己创建的PR是否已合并，合并后把本地主干同步到远端最新
-  # 只做快进（--ff-only）：本地领先/分叉或工作区不干净时保持现状，下一轮重试
+  # 优先快进；本地与远端分叉时按下面的 sync_strategy 处理，冲突则回滚并下轮重试
   auto_sync: true
+  # 分叉处理方式：
+  #   rebase   把本地提交重放到远端之上（默认，保持线性历史）
+  #   merge    生成一个合并提交
+  #   ff-only  只允许快进，分叉时保持现状（最保守）
+  sync_strategy: "rebase"
   # 同步时是否顺带删除远端已合并分支（默认保留，便于回溯）
   delete_remote_branch_after_merge: false
   # 已处理Issue记录文件（防止重复处理）

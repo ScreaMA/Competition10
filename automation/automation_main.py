@@ -88,6 +88,8 @@ class Automation:
         self.branch_prefix = str(automation.get("branch_prefix") or "auto-fix")
         # PR合并后是否把本地代码同步到远端最新
         self.auto_sync = bool(automation.get("auto_sync", True))
+        # 本地与远端分叉时的处理方式：rebase(默认) / merge / ff-only
+        self.sync_strategy = str(automation.get("sync_strategy") or "rebase")
         # 同步时是否顺带删除远端已合并分支
         self.delete_remote_branch = bool(
             automation.get("delete_remote_branch_after_merge", False)
@@ -189,7 +191,8 @@ class Automation:
                 LOGGER.info("PR #%s（issue #%d）已合并，同步本地主干 %s",
                             number, issue_number, self.main_branch())
                 if self.pusher.sync_main(self.main_branch(), branch,
-                                         self.delete_remote_branch):
+                                         self.delete_remote_branch,
+                                         self.sync_strategy):
                     self.monitor.mark_synced(issue_number, f"PR #{number} merged")
                     synced += 1
                 else:

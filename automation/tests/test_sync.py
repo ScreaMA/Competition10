@@ -79,11 +79,12 @@ class FakeClient:
 class FakePusher:
     def __init__(self, result: bool = True) -> None:
         self.result = result
-        self.calls: list[tuple[str, str, bool]] = []
+        self.calls: list[tuple[str, str, bool, str]] = []
 
     def sync_main(self, main_branch: str, merged_branch: str = "",
-                  delete_remote_branch: bool = False) -> bool:
-        self.calls.append((main_branch, merged_branch, delete_remote_branch))
+                  delete_remote_branch: bool = False,
+                  strategy: str = "rebase") -> bool:
+        self.calls.append((main_branch, merged_branch, delete_remote_branch, strategy))
         return self.result
 
 
@@ -111,6 +112,7 @@ def _automation(pending, pulls, pusher_result=True, auto_sync=True,
     automation.client = client
     automation.auto_sync = auto_sync
     automation.delete_remote_branch = delete_remote
+    automation.sync_strategy = "rebase"
     automation._main_branch = None
     return automation, pusher, monitor, client
 
@@ -125,7 +127,7 @@ def test_sync_when_pr_merged():
     )
 
     assert automation.sync_repository() == 1
-    assert pusher.calls == [("main", "auto-fix/issue-2-x", False)]
+    assert pusher.calls == [("main", "auto-fix/issue-2-x", False, "rebase")]
     assert monitor.synced == [(2, "PR #3 merged")]
 
 
@@ -258,15 +260,61 @@ def test_sync_main_skips_dirty_worktree(repo_pair):
     assert (repo_pair / "code.txt").read_text(encoding="utf-8") == "local edit\n"
 
 
-def test_sync_main_refuses_non_fast_forward(repo_pair):
-    """本地领先远端时不做合并（避免覆盖/产生合并提交）"""
+def test_sync_main_ff_only_refuses_divergence(repo_pair):
+    """strategy=ff-only：本地领先远端时保持现状"""
     pusher = GitPusher(client=None, repo_dir=repo_pair)
     (repo_pair / "local.txt").write_text("local ahead\n", encoding="utf-8")
     _git(repo_pair, "add", "-A")
     _git(repo_pair, "commit", "-m", "local ahead")
 
-    assert pusher.sync_main("main") is False
+    assert pusher.sync_main("main", strategy="ff-only") is False
     assert (repo_pair / "code.txt").read_text(encoding="utf-8") == "v1\n"
+
+
+def test_sync_main_rebases_local_commits(repo_pair):
+    """默认rebase：本地提交重放到远端之上，两边改动都保留且历史线性"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(repo_pair, "add", "-A")
+    _git(repo_pair, "commit", "-m", "local commit")
+
+    assert pusher.sync_main("main") is True
+    assert (repo_pair / "code.txt").read_text(encoding="utf-8") == "v2\n"  # 远端改动
+    assert (repo_pair / "local.txt").read_text(encoding="utf-8") == "local\n"
+
+    log = _git(repo_pair, "log", "--oneline").splitlines()
+    assert "local commit" in log[0]      # 本地提交在最上面
+    assert "remote update" in log[1]     # 下面紧跟着远端提交
+    assert pusher.has_changes() is False
+
+
+def test_sync_main_merge_strategy_creates_merge_commit(repo_pair):
+    """strategy=merge：生成合并提交，两边改动都保留"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(repo_pair, "add", "-A")
+    _git(repo_pair, "commit", "-m", "local commit")
+
+    assert pusher.sync_main("main", strategy="merge") is True
+    assert (repo_pair / "code.txt").read_text(encoding="utf-8") == "v2\n"
+    assert (repo_pair / "local.txt").read_text(encoding="utf-8") == "local\n"
+    assert _git(repo_pair, "log", "--merges", "--oneline")
+
+
+def test_sync_main_aborts_on_conflict(repo_pair):
+    """rebase冲突：回滚到原状态，不留下半成品"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "code.txt").write_text("local version\n", encoding="utf-8")
+    _git(repo_pair, "add", "-A")
+    _git(repo_pair, "commit", "-m", "conflicting commit")
+    head_before = _git(repo_pair, "rev-parse", "HEAD")
+
+    assert pusher.sync_main("main") is False
+    assert _git(repo_pair, "rev-parse", "HEAD") == head_before
+    assert (repo_pair / "code.txt").read_text(encoding="utf-8") == "local version\n"
+    # rebase 状态已清理，可以直接继续工作
+    assert not (repo_pair / ".git" / "rebase-merge").exists()
+    assert not (repo_pair / ".git" / "rebase-apply").exists()
 
 
 def test_sync_main_cleans_only_merged_local_branch(repo_pair):

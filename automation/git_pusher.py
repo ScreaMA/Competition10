@@ -206,21 +206,28 @@ class GitPusher:
     # === 与远端同步 ===
 
     def sync_main(self, main_branch: str, merged_branch: str = "",
-                  delete_remote_branch: bool = False) -> bool:
+                  delete_remote_branch: bool = False,
+                  strategy: str = "rebase") -> bool:
         """把本地主干同步到远端最新（PR合并后调用）
 
         参数:
             main_branch: 主干分支名（如 main）
             merged_branch: 刚被合并的工作分支，同步后顺带清理本地分支
             delete_remote_branch: 是否同时删除远端已合并分支
+            strategy: 本地与远端分叉时的处理方式
+                - "rebase": 把本地提交重放到远端之上（默认，保持线性历史）
+                - "merge": 生成一个合并提交
+                - "ff-only": 只允许快进，分叉时保持现状
 
         返回:
-            True 表示本地确实前进了；False 表示已是最新或安全起见跳过了
+            True 表示本地已与远端主干一致（前进了，或本来就一致）
+            False 表示未同步（工作区脏、拉取失败、冲突已回滚等），调用方可下轮重试
 
         安全约束（重要）:
-            - 只做快进合并（--ff-only），本地领先或已分叉时保持现状并告警，
-              绝不用远端覆盖本地提交
+            - 优先快进（--ff-only）
+            - 需要 rebase/merge 时，一旦冲突立即 --abort 回滚，绝不留下半成品
             - 工作区不干净时直接跳过，避免把未提交的改动卷进/丢失
+            - 清理本地分支用 `git branch -d`，未合并的分支会拒绝删除
         """
         if self.has_changes():
             LOGGER.warning("工作区有未提交改动，跳过同步")
@@ -240,11 +247,26 @@ class GitPusher:
 
         remote_ref = f"{self.remote}/{main_branch}"
         before = self._git("rev-parse", "HEAD").stdout
-        merge = self._git("merge", "--ff-only", remote_ref)
-        if not merge.ok:
-            LOGGER.warning("无法快进到 %s（本地领先或已分叉），保持现状：%s",
-                           remote_ref, (merge.stderr or merge.stdout).splitlines()[-1:])
-            return False
+
+        if not self._git("merge", "--ff-only", remote_ref).ok:
+            if strategy == "ff-only":
+                LOGGER.warning("本地 %s 与 %s 已分叉（strategy=ff-only），保持现状",
+                               main_branch, remote_ref)
+                return False
+            if strategy == "merge":
+                merged = self._git("merge", "--no-edit", remote_ref)
+                abort_args = ("merge", "--abort")
+            else:
+                merged = self._git("rebase", remote_ref)
+                abort_args = ("rebase", "--abort")
+
+            if not merged.ok:
+                self._git(*abort_args)
+                LOGGER.warning("与 %s 同步出现冲突，已回滚（strategy=%s）：%s",
+                               remote_ref, strategy,
+                               (merged.stderr or merged.stdout).splitlines()[-1:])
+                return False
+            LOGGER.info("本地提交已按 %s 方式叠放到 %s 之上", strategy, remote_ref)
 
         after = self._git("rev-parse", "HEAD").stdout
         if before == after:
