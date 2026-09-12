@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""分析 debug.log，统计回合处理情况与每回合决策耗时。
+
+用法:
+    python CoreGeek/tools/analyze_log.py                 # 默认分析 CoreGeek/debug.log
+    python CoreGeek/tools/analyze_log.py --log x.log
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_LOG = ROOT / "CoreGeek" / "debug.log"
+
+ROUND_RE = re.compile(r"request_decoded id=(\d+) round=(\d+)")
+DONE_RE = re.compile(
+    r"strategy_done id=(\d+) round=(\d+) commands=(\d+) elapsed=([\d.]+)ms"
+)
+SENT_RE = re.compile(r"response_sent id=(\d+) status=(\d+) bytes=(\d+)")
+ERROR_RE = re.compile(r"\b(ERROR|CRITICAL)\b")
+SLOW_RE = re.compile(r"decision slow at round (\d+)")
+
+
+def analyze(log_file: Path) -> int:
+    """返回进程退出码（0=正常）"""
+    if not log_file.is_file():
+        print(f"日志文件不存在: {log_file}")
+        return 1
+
+    rounds: dict[int, int] = {}      # request_id -> round
+    processed: dict[int, int] = {}   # round -> commands
+    elapsed: dict[int, float] = {}   # round -> 耗时ms
+    statuses: dict[int, int] = {}
+    errors: list[str] = []
+    slow_rounds: list[int] = []
+    truncated_bodies = 0
+
+    with log_file.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if "truncated" in line and "request_raw" in line:
+                truncated_bodies += 1
+            if ERROR_RE.search(line):
+                errors.append(line.strip()[:200])
+
+            match = ROUND_RE.search(line)
+            if match:
+                rounds[int(match.group(1))] = int(match.group(2))
+                continue
+
+            match = DONE_RE.search(line)
+            if match:
+                round_no = int(match.group(2))
+                processed[round_no] = int(match.group(3))
+                elapsed[round_no] = float(match.group(4))
+                continue
+
+            match = SENT_RE.search(line)
+            if match:
+                statuses[int(match.group(1))] = int(match.group(2))
+                continue
+
+            match = SLOW_RE.search(line)
+            if match:
+                slow_rounds.append(int(match.group(1)))
+
+    print("=" * 60)
+    print(f"日志文件: {log_file}")
+    print(f"文件大小: {log_file.stat().st_size / 1024:.1f} KB")
+    print("=" * 60)
+
+    if not processed:
+        print("未解析到回合记录（日志可能为空或格式不符）")
+        return 1
+
+    numbers = sorted(processed)
+    print(f"处理回合数: {len(processed)}")
+    print(f"回合范围  : {numbers[0]} - {numbers[-1]}")
+    print(f"指令总数  : {sum(processed.values())}"
+          f"（平均 {sum(processed.values()) / len(processed):.1f}/回合）")
+    print(f"零指令回合: {sum(1 for count in processed.values() if count == 0)}")
+
+    if elapsed:
+        values = sorted(elapsed.values())
+        print(f"决策耗时  : 平均 {sum(values) / len(values):.2f}ms"
+              f"，中位 {values[len(values) // 2]:.2f}ms"
+              f"，最慢 {values[-1]:.2f}ms")
+        if slow_rounds:
+            print(f"超时预警回合(>{len(slow_rounds)}个): {slow_rounds[:10]}")
+
+    if statuses:
+        codes = {}
+        for status in statuses.values():
+            codes[status] = codes.get(status, 0) + 1
+        print(f"HTTP状态  : {codes}")
+
+    if truncated_bodies:
+        print(f"截断的请求日志条目: {truncated_bodies}（超过单条上限被截断）")
+
+    print(f"错误条数  : {len(errors)}")
+    for line in errors[:10]:
+        print(f"  {line}")
+
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="分析客户端 debug.log")
+    parser.add_argument("--log", default=str(DEFAULT_LOG), help="日志文件路径")
+    args = parser.parse_args()
+    raise SystemExit(analyze(Path(args.log)))
+
+
+if __name__ == "__main__":
+    main()

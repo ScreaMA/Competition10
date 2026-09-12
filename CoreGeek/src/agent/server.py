@@ -1,10 +1,15 @@
 """服务器模块：HTTP服务器，接收判题系统的POST请求。
 
 对应设计文档 3.2 节。
+
+注意（实测踩坑）：判题系统是向 `POST /` 发送请求的，部分实现会只在
+`POST /action` 上路由而收不到消息。本模块不检查 `self.path`，
+任何路径的POST请求都会被正常处理。
 """
 
 import json
 import logging
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -12,19 +17,33 @@ from .brain import decide
 
 LOGGER = logging.getLogger(__name__)
 
+# 单条 request_raw 日志的最大长度，超出则截断，避免日志文件过大
+MAX_LOG_BODY_LENGTH = 5000
+
+# 决策耗时告警阈值（设计文档6.6节：预留0.2秒缓冲）
+DECISION_BUDGET_WARN_MS = 800
+
 # 请求ID计数器
 _request_id = 0
+
+
+def _truncate(text: str, limit: int = MAX_LOG_BODY_LENGTH) -> str:
+    """超长文本截断，保留长度信息"""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated {len(text) - limit} chars]"
 
 
 class Handler(BaseHTTPRequestHandler):
     """HTTP请求处理器"""
 
     def do_POST(self) -> None:
-        """处理POST请求"""
+        """处理POST请求（不区分路径，`/` 与 `/action` 均处理）"""
         global _request_id
         _request_id += 1
         req_id = _request_id
         round_no: Any = "?"
+        started = time.perf_counter()
 
         try:
             # 1. 读取请求体
@@ -32,8 +51,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length)
 
             # 2. 记录原始请求（INFO级别，单行JSON）
-            LOGGER.info("request_raw id=%d bytes=%d body=%s",
-                        req_id, length, raw.decode("utf-8"))
+            LOGGER.info("request_raw id=%d path=%s bytes=%d body=%s",
+                        req_id, self.path, length, _truncate(raw.decode("utf-8")))
 
             # 3. 解析JSON
             payload = json.loads(raw.decode("utf-8"))
@@ -53,19 +72,23 @@ class Handler(BaseHTTPRequestHandler):
             LOGGER.debug(json.dumps(payload, ensure_ascii=False, indent=2))
             LOGGER.debug("=" * 80)
 
-            # 6. 调用决策引擎
-            response = decide(payload)
+            # 6. 调用决策引擎（返回指令与可选的LLM prompt）
+            response, llm_prompt = decide(payload)
 
             # 7. 构建完整响应
             full_response = {
                 "roleCommandMap": response,
-                "prompt": "",  # LLM调用预留
+                "prompt": llm_prompt,
                 "executeCmd": "",  # 沙盒命令预留
             }
 
-            # 8. 记录策略完成
-            LOGGER.info("strategy_done id=%d round=%d commands=%d",
-                        req_id, round_no, len(response))
+            # 8. 记录策略完成（含决策耗时）
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            LOGGER.info("strategy_done id=%d round=%d commands=%d elapsed=%.2fms",
+                        req_id, round_no, len(response), elapsed_ms)
+            if elapsed_ms > DECISION_BUDGET_WARN_MS:
+                LOGGER.warning("decision slow at round %s: %.2fms",
+                               round_no, elapsed_ms)
 
             # 9. 编码响应
             body = json.dumps(full_response, ensure_ascii=False).encode("utf-8")

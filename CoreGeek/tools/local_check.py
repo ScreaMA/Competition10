@@ -3,10 +3,13 @@
 用法（在 CoreGeek 目录下）:
     python tools/local_check.py [port]
 
-会做三件事：
+会做四件事：
 1. 直接调用 brain.decide()，用 docs/request.txt 的真实报文校验输出格式；
-2. 启动HTTP服务器，通过真实POST请求校验端到端链路；
-3. 构造边界场景（缺字段、无基地、空角色、大量机器人等）验证不崩溃。
+2. 启动HTTP服务器，通过真实POST请求校验端到端链路（`/` 与 `/action` 两条路径）；
+3. 构造边界场景（缺字段、无基地、空角色、大量机器人等）验证不崩溃；
+4. 连续1300回合的决策耗时检查（性能要求：单回合 < 1秒）。
+
+单元测试请运行: python -m pytest tests/ -v
 """
 
 from __future__ import annotations
@@ -61,36 +64,55 @@ def stats(commands: dict) -> str:
 def case_direct() -> None:
     """1. 直接调用决策函数"""
     payload = load_sample()
-    commands = decide(payload)
+    commands, prompt = decide(payload)
     check_format(commands)
     print(f"[1] 直接调用 decide(): round={payload['roundNo']} -> {stats(commands)}")
     print(f"    {json.dumps(commands, ensure_ascii=False)}")
+    print(f"    每日LLM prompt长度: {len(prompt)} 字符")
 
 
 def case_http(port: int) -> None:
-    """2. 端到端HTTP请求"""
+    """2. 端到端HTTP请求（判题系统发往 `POST /`）"""
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.3)
+
+    def post(path: str, payload: dict) -> dict:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}",
+            data=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            assert response.status == 200
+            return json.loads(response.read().decode("utf-8"))
+
     try:
+        for path in ("/", "/action"):
+            payload = load_sample()
+            parsed = post(path, payload)
+            assert set(parsed) == {"roleCommandMap", "prompt", "executeCmd"}
+            check_format(parsed["roleCommandMap"])
+            print(f"[2] POST {path} -> {stats(parsed['roleCommandMap'])}")
+
         for round_no in (1, 71, 85, 1300):
             payload = load_sample()
             payload["roundNo"] = round_no
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{port}/",
-                data=body,
-                headers={"Content-Type": "application/json; charset=utf-8"},
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                raw = response.read().decode("utf-8")
-                assert response.status == 200
-            parsed = json.loads(raw)
-            assert set(parsed) == {"roleCommandMap", "prompt", "executeCmd"}
+            parsed = post("/", payload)
             check_format(parsed["roleCommandMap"])
             phase = "白天" if (round_no - 1) % 130 < 70 else "夜晚"
-            print(f"[2] HTTP round={round_no}({phase}) -> {stats(parsed['roleCommandMap'])}")
+            print(f"[2] HTTP round={round_no}({phase}) -> "
+                  f"{stats(parsed['roleCommandMap'])}")
+
+        # 超大请求体：验证不会因为日志截断或解析而失败
+        payload = load_sample()
+        payload["worldNews"]["folkLegends"] = "很长的新闻" * 5000
+        parsed = post("/", payload)
+        check_format(parsed["roleCommandMap"])
+        print(f"[2] 超大请求体({len(json.dumps(payload, ensure_ascii=False))}字符)"
+              f" -> {stats(parsed['roleCommandMap'])}")
     finally:
         server.shutdown()
         server.server_close()
@@ -99,7 +121,6 @@ def case_http(port: int) -> None:
 def case_robustness() -> None:
     """3. 边界场景：任何情况下都必须返回合法字典"""
     sample = load_sample()
-
     scenarios: dict[str, dict] = {}
 
     payload = copy.deepcopy(sample)
@@ -152,21 +173,27 @@ def case_robustness() -> None:
     payload["teamOur"]["playerTasks"] = []
     scenarios["无任务点数据"] = payload
 
+    payload = copy.deepcopy(sample)
+    payload["roundNo"] = 1
+    for task in payload["teamOur"]["playerTasks"]:
+        task.pop("timeoutRounds", None)  # 真实报文中该字段可能缺失
+    scenarios["任务点缺少timeoutRounds"] = payload
+
     for name, payload in scenarios.items():
-        commands = decide(payload)
+        commands, _ = decide(payload)
         check_format(commands)
         print(f"[3] {name} -> {stats(commands)}")
 
 
 def case_soak(rounds: int = 1300) -> None:
-    """4. 连续1300回合的决策耗时检查（复用同一份地图，逐回合推进）"""
+    """4. 连续1300回合的决策耗时检查"""
     payload = load_sample()
     slowest = 0.0
     total = 0.0
     for round_no in range(1, rounds + 1):
         payload["roundNo"] = round_no
         started = time.perf_counter()
-        commands = decide(payload)
+        commands, _ = decide(payload)
         elapsed = time.perf_counter() - started
         total += elapsed
         slowest = max(slowest, elapsed)
@@ -175,6 +202,7 @@ def case_soak(rounds: int = 1300) -> None:
         f"[4] 连续{rounds}回合决策: 总耗时{total:.2f}s, "
         f"单回合最慢{slowest * 1000:.1f}ms, 平均{total / rounds * 1000:.2f}ms"
     )
+    assert slowest < 1.0, "单回合决策耗时必须小于1秒"
 
 
 def main() -> None:

@@ -1,0 +1,14 @@
+# 行尾符约定
+# 判题系统在 Linux 上通过 `bash run.sh <port>` 启动，
+# shell 脚本必须是 LF，否则会报 $'\r': command not found
+*.sh text eol=lf
+*.bat text eol=crlf
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+
+# 二进制
+*.tar.gz binary
+*.png binary

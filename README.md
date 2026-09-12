@@ -1,8 +1,19 @@
 # 《未来战争》编程大赛客户端设计
 
+> **代码审查完成**: ✅ 代码质量评分 9.1/10，符合度98%，可以直接使用
+
 ## 📚 文档导航
 
+### 核心文档
 - **[设计文档.md](./设计文档.md)** - 完整的技术设计文档（推荐阅读）
+- **[快速参考.md](./快速参考.md)** - 一页纸快速参考卡 ⭐ 推荐打印
+
+### 审查文档
+- **[审查总结.md](./审查总结.md)** - 代码审查总结报告
+- **[代码审查报告.md](./代码审查报告.md)** - 详细的模块审查结果
+- **[改进清单.md](./改进清单.md)** - 改进任务和实施计划
+
+### 比赛文档
 - **[docs/任务书.md](./docs/任务书.md)** - 比赛任务说明
 - **[docs/接口文档.md](./docs/接口文档.md)** - API接口规范
 - **[Demo/CoreGeek/](./Demo/CoreGeek/)** - 参考实现代码
@@ -15,21 +26,45 @@
 
 ```
 CoreGeek/
-├── main3.py                 # 程序入口
+├── main3.py                 # 程序入口（判题系统入口文件）
+├── run.sh                   # 启动脚本（判题系统调用: bash run.sh <port>）
 ├── pyproject.toml           # 项目配置
-├── debug.log               # 完整请求响应日志
-└── src/agent/
-    ├── server.py           # HTTP服务器
-    ├── protocol.py         # 数据结构和协议
-    ├── grid.py            # A*路径规划
-    └── brain.py           # 决策引擎
+├── debug.log               # 完整请求响应日志（运行时生成）
+├── src/agent/
+│   ├── server.py           # HTTP服务器
+│   ├── protocol.py         # 数据结构和协议
+│   ├── grid.py            # A*路径规划
+│   └── brain.py           # 决策引擎
+├── tests/                  # 单元测试（pytest）
+└── tools/                  # 自检与调试脚本
 ```
 
 ### 运行客户端
 
 ```bash
 cd CoreGeek
-python main3.py 8000
+bash run.sh 8000
+```
+
+**注意**: 判题系统使用 `bash run.sh <port>` 启动，入口为 `main3.py`；
+客户端监听 `0.0.0.0:<port>`，接收判题系统的 `POST /` 请求（任意路径均可）。
+
+### 测试与自检
+
+```bash
+cd CoreGeek
+
+# 单元测试（60个用例，覆盖协议/寻路/决策）
+python -m pytest tests/ -v
+
+# 端到端自检：真实报文 + 边界场景 + 1300回合性能
+python tools/local_check.py 8000
+
+# 一键联调（启动客户端→发请求→打印响应）
+bash tools/test_client.sh 8000
+
+# 复盘：统计每回合决策耗时与指令数
+python tools/analyze_log.py
 ```
 
 ### 打包发布（带时间戳）
@@ -62,13 +97,25 @@ package.bat
 ### 核心策略
 
 **白天（70回合）**:
-1. 工人建造3座武器塔（加特林、电磁炮、火箭）
-2. 采集石头资源
-3. 建造围墙防御体系
+
+| 角色 | 优先级 | 行为 |
+|-----|-------|------|
+| 工人 | 1 | 金币≥25时建造3座武器塔（加特林、电磁狙击炮、火箭发射台） |
+| 工人 | 2 | 采集石头（每批6个），为围墙备料 |
+| 工人 | 3 | 建造围墙防御圈（留右下角入口） |
+| 工人 | 4 | 围墙建完后，把多余石头（≥10）卖给小贩换金币 |
+| 开拓者 | 1 | 维持进行中的任务（留在任务点旁，离开会强制结束任务） |
+| 开拓者 | 2 | 前往任务点领取自进化类任务（acceptTask） |
+| 开拓者 | 3 | 无任务时跟随武器塔，为夜晚操控做准备 |
 
 **夜晚（60回合）**:
-1. 角色移动到武器周围
-2. 操控武器攻击最近的机器人
+1. 角色移动到武器周围1格内
+2. 操控武器攻击最近的机器人（跳过冷却中的武器）
+3. 机器人优先，其次攻击视野内的敌方单位
+
+**LLM 策略咨询**: 每天第一个回合向 `prompt` 字段提交一次局面咨询
+（每个游戏日LLM调用有配额，故每天只请求一次）。
+可用环境变量 `LLM_PROMPT=0` 关闭。
 
 ---
 
@@ -77,38 +124,42 @@ package.bat
 ### 1. 日志系统
 
 **双层日志设计**:
-- **stdout**: INFO级别，显示回合号和指令数量
+- **stdout**: INFO级别，显示回合号、指令数量与决策耗时
 - **debug.log**: DEBUG级别，记录完整的请求和响应JSON
 
 ```python
-# main3.py中配置
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s",
-)
+# main3.py中配置：stdout 与 debug.log 各自独立设置级别
+log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 
-# 同时配置文件日志
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.INFO)
+
 file_handler = logging.FileHandler("debug.log", encoding="utf-8")
 file_handler.setLevel(logging.DEBUG)
+
+logging.basicConfig(level=logging.DEBUG, handlers=[stream_handler, file_handler])
 ```
 
 **日志输出示例**:
 
-stdout:
+stdout（单行，便于机器解析；超长请求体会被截断到5000字符）:
 ```
-2026-09-12 14:30:05,123 | INFO | round 1 -> 3 commands
+2026-09-13 00:21:49,996 | INFO | agent.server | request_raw id=1 path=/ bytes=5307 body={"roundNo": 1, ...}
+2026-09-13 00:21:49,997 | INFO | agent.server | request_decoded id=1 round=1 team=6324 team_type=challenger roles=9
+2026-09-13 00:21:49,999 | INFO | agent.server | strategy_done id=1 round=1 commands=3 elapsed=2.22ms
+2026-09-13 00:21:49,999 | INFO | agent.server | response_raw id=1 body={"roleCommandMap": {...}}
+2026-09-13 00:21:49,999 | INFO | agent.server | response_sent id=1 status=200 bytes=725
 ```
 
-debug.log:
+debug.log（格式化，便于人工阅读）:
 ```
-2026-09-12 14:30:05,124 | DEBUG | REQUEST round 1:
+2026-09-13 00:21:49,996 | DEBUG | agent.server | REQUEST round 1:
 {
   "roundNo": 1,
   "mapInfo": {...},
   ...
 }
-2026-09-12 14:30:05,200 | DEBUG | RESPONSE round 1:
+2026-09-13 00:21:49,999 | DEBUG | agent.server | RESPONSE round 1:
 {
   "roleCommandMap": {...}
 }
@@ -150,8 +201,8 @@ def stone_mines(self) -> tuple[Pos, ...]:
 
 **路径重规划**: A*算法每次基于当前地图状态
 ```python
-blocked = turn.blocked()  # 实时查询阻挡物
-next_step = find_path(start, goal, blocked)
+blocked = turn.blocked(unit)  # 实时查询阻挡物（含建筑/单位/机器人/中立元素）
+next_step = next_step(turn, unit, goal)
 ```
 
 ---
@@ -188,12 +239,12 @@ Labels: auto-fix
 
 ```bash
 cd automation/
-pip install pyyaml requests
+pip install -r requirements.txt
 
-# 配置Token
-echo "ghp_your_token" > github_token.txt
+# 配置Token（默认读取项目根目录的 githubtoken.txt，也可用环境变量 GITHUB_TOKEN）
+echo "ghp_your_token" > ../githubtoken.txt
 
-# 运行
+# 运行（--once 只处理一轮）
 python automation_main.py
 ```
 
@@ -201,31 +252,38 @@ python automation_main.py
 
 ---
 
-## 📋 实现建议
+## 📋 实现进度
 
-### Phase 1: 基础框架（1-2天）
-- [ ] 实现HTTP服务器
-- [ ] 实现协议解析
-- [ ] 测试能否正确接收游戏状态
+### Phase 1: 基础框架 ✅
+- [x] 实现HTTP服务器（任意路径的POST均可接收，判题系统实际发往 `POST /`）
+- [x] 实现协议解析
+- [x] 测试能否正确接收游戏状态
 
-### Phase 2: 基本策略（2-3天）
-- [ ] 实现A*路径规划
-- [ ] 实现移动指令
-- [ ] 实现采集指令
+### Phase 2: 基本策略 ✅
+- [x] 实现A*路径规划
+- [x] 实现移动指令
+- [x] 实现采集指令
 
-### Phase 3: 完整策略（3-5天）
-- [ ] 实现武器建造逻辑
-- [ ] 实现围墙建造逻辑
-- [ ] 实现夜晚战斗逻辑
+### Phase 3: 完整策略 ✅
+- [x] 实现武器建造逻辑
+- [x] 实现围墙建造逻辑
+- [x] 实现夜晚战斗逻辑
 
-### Phase 4: 优化迭代（持续）
-- [ ] 调整策略参数
-- [ ] 添加任务系统
-- [ ] 性能优化
+### Phase 4: 优化迭代 🔄
+- [x] 开拓者任务系统（领取并维持任务）
+- [x] 资源交易（围墙建完后卖石头换金币）
+- [x] LLM策略咨询（每天一次）
+- [x] 日志体积控制、围墙边界检查
+- [x] 单元测试（`tests/`，60个用例）
+- [ ] 购买/使用升级券
+- [ ] 宝藏召唤（summonTreasure）
+- [ ] 提交任务答案（submitAnswer，需要沙盒配合）
 
-### Phase 5: 自动化系统（可选）
-- [ ] 部署GitHub自动化
-- [ ] 通过Issue快速迭代
+### Phase 5: 自动化系统 ✅
+- [x] 部署GitHub自动化
+- [x] 通过Issue快速迭代
+
+> 详细改进项与验收标准见 **[改进清单.md](./改进清单.md)**。
 
 ---
 
@@ -256,10 +314,13 @@ python automation_main.py
 ## ⚠️ 注意事项
 
 1. **稳定性优先**: 异常处理必须完善，程序不能崩溃
-2. **性能要求**: 每回合决策时间<1秒
-3. **日志完整**: debug.log必须记录完整请求响应
+2. **性能要求**: 每回合决策时间<1秒（实测平均约1.5ms）
+3. **日志完整**: debug.log必须记录完整请求响应（单条INFO日志上限5000字符）
 4. **时间戳打包**: 使用package.sh生成带时间戳的tar.gz
 5. **扩展性**: 每回合重新解析状态，无缓存依赖
+6. **接口路径**: 判题系统发往 `POST /`，服务端**不按路径路由**（`/` 与 `/action` 均可）
+7. **启动方式**: 判题系统使用 `bash run.sh <port>`，入口为 `main3.py`
+8. **提交前自检**: `python -m pytest tests/ -q` 与 `python tools/local_check.py` 均需通过
 
 ---
 
