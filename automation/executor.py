@@ -18,6 +18,9 @@ LOGGER = logging.getLogger(__name__)
 # INFO 日志中保留的 Claude 回复长度
 SUMMARY_LOG_LENGTH = 500
 
+# 让 Claude Code 进入非交互打印模式的参数；该模式下提示词可直接从 stdin 读入
+PRINT_MODE_FLAGS = ("-p", "--print")
+
 
 def _shorten(text: str, limit: int = SUMMARY_LOG_LENGTH) -> str:
     """截断长文本，保留长度信息"""
@@ -25,6 +28,11 @@ def _shorten(text: str, limit: int = SUMMARY_LOG_LENGTH) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}...(共{len(text)}字符)"
+
+
+def _single_line(prompt: str) -> str:
+    """把多行提示词压成单行（降级路径专用）"""
+    return " ".join(prompt.split())
 
 
 @dataclass
@@ -70,17 +78,39 @@ class ClaudeExecutor:
             LOGGER.warning("claude executable %r not found on PATH", self.executable)
         return found or self.executable
 
+    def _build_invocation(self, task: Task) -> tuple[list[str], str | None]:
+        """构造命令行与 stdin 内容，返回 (command, stdin_text)。
+
+        提示词默认从 stdin 送入，而不是作为 argv 的一个元素：Issue 提示词是多行
+        文本（标题、正文、要求各占一行），而 Windows 上 `claude` 通常解析到 npm
+        生成的 `claude.cmd` 垫片，命令行参数在经 cmd.exe 解析时会被第一个换行截断
+        ——Claude 只会看到提示词的第一行，标题和正文全部丢失，于是「没改代码」。
+        走 stdin 还能顺带绕开 Windows 约 32K 的命令行长度上限。
+        """
+        command = [self._resolve(), *self.extra_args]
+        if any(flag in self.extra_args for flag in PRINT_MODE_FLAGS):
+            return command, task.prompt
+        # 没配置 -p/--print 时 CLI 会进入交互模式（本身就会挂住），这里仅保证提示词
+        # 仍能完整送达，不额外改变原有行为
+        LOGGER.warning("%s missing in extra_args, prompt passed as a single-line argument",
+                       "/".join(PRINT_MODE_FLAGS))
+        return [*command, _single_line(task.prompt)], None
+
     def run(self, task: Task) -> ExecResult:
         """执行任务，返回执行结果"""
-        command = [self._resolve(), *self.extra_args, task.prompt]
-        LOGGER.info("executing claude for issue #%d (timeout=%ds)",
-                    task.issue_number, self.timeout)
+        command, stdin_text = self._build_invocation(task)
+        LOGGER.info(
+            "executing claude for issue #%d (timeout=%ds, prompt=%d chars/%d lines)",
+            task.issue_number, self.timeout,
+            len(task.prompt), task.prompt.count("\n") + 1,
+        )
         LOGGER.debug("command: %s", " ".join(command))
 
         started = time.time()
         try:
             completed = subprocess.run(
                 command,
+                input=stdin_text,
                 cwd=self.work_dir,
                 capture_output=True,
                 text=True,
