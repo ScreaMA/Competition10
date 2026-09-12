@@ -1,0 +1,20 @@
+# 日志与运行时产物
+debug.log
+*.log
+**/.processed_issues.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 打包产物
+CoreGeek_*.tar.gz
+
+# 密钥（对应设计文档11.7节：禁止提交token）
+github_token.txt
+githubtoken.txt
+automation/github_token.txt
+.env

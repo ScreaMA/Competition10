@@ -1,0 +1,34 @@
+# GitHub自动化系统配置（对应设计文档11.4节）
+
+github:
+  repo_url: "https://github.com/ScreaMA/Competition10.git"
+  # Token文件路径，相对于项目根目录（automation_main启动时会切换到项目根目录）
+  token_file: "githubtoken.txt"
+  repo_owner: "ScreaMA"
+  repo_name: "Competition10"
+  issue_labels: ["auto-fix", "enhancement", "bug"]
+  ignore_labels: ["wontfix", "manual-review"]
+
+automation:
+  mode: "polling"
+  poll_interval: 300  # 5分钟
+  auto_create_pr: true
+  comment_on_issue: true
+  branch_prefix: "auto-fix"
+  # 已处理Issue记录文件（防止重复处理）
+  state_file: "automation/.processed_issues.json"
+
+claude:
+  executable: "claude"  # Claude Code CLI路径
+  work_dir: "."  # 项目根目录
+  timeout: 600
+  extra_args: []  # 追加给CLI的额外参数
+
+git:
+  user_name: "Auto-Fix Bot"
+  user_email: "bot@competition10.local"
+  commit_prefix: "[Auto-Fix]"
+
+logging:
+  level: "INFO"
+  file: "automation/automation.log"
