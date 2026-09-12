@@ -348,6 +348,31 @@ GIT_TRACE=1 git push --dry-run origin main 2>&1 | grep credential
 
 > 自动化系统自身的推送不受影响：它在推送 URL 里直接携带 token，不经过 helper。
 
+### 自动化处理Issue后“没改代码”
+
+**排查顺序**:
+
+1. 看 `automation/automation.log` 里 `executing claude for issue #N` 那行的
+   `prompt=X chars/Y lines`。如果 X 很小、Y=1，说明提示词在传给 Claude 前就被截断了。
+2. 看紧随其后的 `claude summary:`：这条会把 Claude 的原话记下来，能直接看出它是
+   “没看到需求”还是“看过代码后判断无需修改”。
+
+提示词是**多行文本**（标题、正文、要求各占一行），早期实现把它作为命令行参数传给
+`claude`，在 Windows 上会被截断在第一行：`shutil.which("claude")` 解析到的是 npm 生成的
+`claude.cmd` 垫片，参数经 `cmd.exe` 解析时换行等同于命令结束，Issue 的标题与正文整段丢失。
+现在改为在 `-p` 模式下把提示词从 **stdin** 送入（`automation/executor.py` 的
+`_build_invocation`），既不受换行影响，也绕开了 Windows 约 32K 的命令行长度上限。
+
+验证方式（改动提示词传递后）：
+
+```bash
+cd <仓库根目录>
+python automation/automation_main.py --once   # 处理完一轮即退出
+```
+
+日志中若出现 `prompt=... chars/<N> lines`（N>1）且 `claude summary:` 里引用了 Issue 正文，
+即说明提示词已完整送达。
+
 ---
 
 ## 📞 支持
