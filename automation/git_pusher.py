@@ -44,6 +44,7 @@ class GitPusher:
         user_name: str = "Auto-Fix Bot",
         user_email: str = "bot@competition10.local",
         remote: str = "origin",
+        proxy: str = "",
     ) -> None:
         self.client = client
         self.repo_dir = Path(repo_dir)
@@ -52,6 +53,7 @@ class GitPusher:
         self.user_name = user_name
         self.user_email = user_email
         self.remote = remote
+        self.proxy = proxy
 
     @classmethod
     def from_config(cls, config: dict, client: GitHubClient, token: str,
@@ -65,13 +67,19 @@ class GitPusher:
             token=token,
             user_name=str(git.get("user_name") or "Auto-Fix Bot"),
             user_email=str(git.get("user_email") or "bot@competition10.local"),
+            # git.proxy 可单独覆盖，未设置时复用 github.proxy
+            proxy=str(git.get("proxy") or github.get("proxy") or ""),
         )
 
     # === 基础操作 ===
 
     def _git(self, *args: str, check: bool = False) -> GitResult:
         """执行git命令"""
-        command = ["git", *args]
+        command = ["git"]
+        # 直连 GitHub 不通时，git 也需要走代理
+        if self.proxy:
+            command += ["-c", f"http.proxy={self.proxy}"]
+        command += list(args)
         try:
             completed = subprocess.run(
                 command,

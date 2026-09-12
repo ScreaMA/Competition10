@@ -82,6 +82,7 @@ class Automation:
             token=self.token,
             owner=str(github.get("repo_owner") or ""),
             repo=str(github.get("repo_name") or ""),
+            proxy=str(github.get("proxy") or ""),
         )
 
         self.monitor = IssueMonitor.from_config(config, self.client)

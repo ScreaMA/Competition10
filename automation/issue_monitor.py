@@ -95,7 +95,7 @@ def load_token(path_value: str) -> str:
 class GitHubClient:
     """GitHub REST API 的最小封装"""
 
-    def __init__(self, token: str, owner: str, repo: str) -> None:
+    def __init__(self, token: str, owner: str, repo: str, proxy: str = "") -> None:
         self.owner = owner
         self.repo = repo
         self.session = requests.Session()
@@ -105,6 +105,10 @@ class GitHubClient:
             "X-GitHub-Api-Version": API_VERSION,
             "User-Agent": "competition10-automation",
         })
+        # 直连 GitHub 不通时可通过配置走本地代理
+        if proxy:
+            self.session.proxies.update({"http": proxy, "https": proxy})
+            LOGGER.info("github api using proxy %s", proxy)
 
     def request(
         self,
@@ -247,9 +251,14 @@ class IssueMonitor:
         return bool(set(issue.labels) & set(self.labels))
 
     def fetch_candidates(self) -> list[Issue]:
-        """拉取需要处理的Issue列表"""
+        """拉取需要处理的Issue列表
+
+        注意: GitHub API 的 `labels` 参数是“与”语义（要求Issue同时带全部标签），
+        而配置中的 issue_labels 是“或”语义（命中任意一个即处理），
+        因此这里拉取全部开放Issue，再在本地用 should_process 过滤。
+        """
         try:
-            issues = self.client.list_issues(self.labels or None)
+            issues = self.client.list_issues()
         except Exception:
             LOGGER.exception("failed to list issues")
             return []
