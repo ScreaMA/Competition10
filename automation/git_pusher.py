@@ -163,15 +163,18 @@ class GitPusher:
             # 未配置repo_url/token时，依赖本地已配置的凭据
             self._git("push", "-u", self.remote, branch_name, check=True)
 
-    def open_pull_request(self, task: Task, base: str) -> str:
+    def open_pull_request(self, task: Task, base: str, summary: str = "") -> str:
         """创建Pull Request，返回PR链接"""
         body = (
             f"由自动化系统根据 Issue #{task.issue_number} 生成。\n\n"
             f"**Issue标题**: {task.title}\n\n"
             f"**改动文件**:\n"
             + "\n".join(f"- `{name}`" for name in self.changed_files())
-            + "\n\n> 请人工审核后再合并。"
         )
+        if summary:
+            body += f"\n\n**执行摘要**（Claude 自述）:\n\n```\n{summary[:2000]}\n```"
+        body += "\n\n> 请人工审核后再合并。"
+
         try:
             pr = self.client.create_pull_request(
                 title=task.commit_message,
@@ -202,8 +205,12 @@ class GitPusher:
 
     # === 组合动作 ===
 
-    def publish(self, task: Task) -> str:
+    def publish(self, task: Task, summary: str = "") -> str:
         """提交、推送、创建PR并回评Issue，返回PR链接
+
+        参数:
+            task: 待执行的任务
+            summary: Claude 的执行摘要，会写入PR正文与Issue回评，便于人工复盘
 
         失败时回滚到原始分支，保证下一次任务从干净的起点开始。
         """
@@ -212,16 +219,21 @@ class GitPusher:
         try:
             if not self.commit_all(task.commit_message):
                 self.rollback(task.branch_name, original_branch)
+                detail = (
+                    f"\n\n<details><summary>执行摘要（Claude 自述）</summary>\n\n"
+                    f"```\n{summary[:2000]}\n```\n</details>"
+                    if summary else ""
+                )
                 self.comment_issue(
                     task.issue_number,
-                    f"自动化系统未检测到任何代码改动（分支 `{task.branch_name}` 未创建），"
-                    "请确认Issue描述是否明确。",
+                    f"自动化系统未检测到代码改动（分支 `{task.branch_name}` 已回滚），"
+                    f"未创建PR。请确认Issue描述是否需要代码变更。{detail}",
                 )
                 return ""
 
             self.push(task.branch_name)
             base = self.client.default_branch()
-            pr_url = self.open_pull_request(task, base)
+            pr_url = self.open_pull_request(task, base, summary)
             if pr_url:
                 self.comment_issue(
                     task.issue_number,

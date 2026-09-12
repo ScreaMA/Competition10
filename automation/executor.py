@@ -15,6 +15,17 @@ from dispatcher import Task
 
 LOGGER = logging.getLogger(__name__)
 
+# INFO 日志中保留的 Claude 回复长度
+SUMMARY_LOG_LENGTH = 500
+
+
+def _shorten(text: str, limit: int = SUMMARY_LOG_LENGTH) -> str:
+    """截断长文本，保留长度信息"""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...(共{len(text)}字符)"
+
 
 @dataclass
 class ExecResult:
@@ -103,8 +114,12 @@ class ClaudeExecutor:
             "claude finished: rc=%d ok=%s duration=%.1fs output=%d chars",
             completed.returncode, ok, duration, len(output),
         )
+        if output:
+            # 把 Claude 的结论记入日志，便于复盘“为什么这样改/为什么没改”
+            LOGGER.info("claude summary: %s", _shorten(output))
+            LOGGER.debug("claude output:\n%s", output)
         if error:
-            LOGGER.debug("claude stderr: %s", error[:2000])
+            LOGGER.warning("claude stderr: %s", _shorten(error))
         return ExecResult(
             ok=ok,
             returncode=completed.returncode,

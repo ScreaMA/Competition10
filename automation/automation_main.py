@@ -120,7 +120,7 @@ class Automation:
             self.monitor.mark_processed(issue.number, "executed", "pr skipped")
             return True
 
-        pr_url = self.pusher.publish(task)
+        pr_url = self.pusher.publish(task, summary=result.output)
         self.monitor.mark_processed(
             issue.number, "published" if pr_url else "no_change", pr_url,
         )
