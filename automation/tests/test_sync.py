@@ -334,3 +334,20 @@ def test_sync_main_cleans_only_merged_local_branch(repo_pair):
     branches = _git(repo_pair, "branch", "--format=%(refname:short)").split()
     assert "merged-work" not in branches
     assert "unmerged-work" in branches
+
+
+def test_sync_main_cleans_branch_when_already_up_to_date(repo_pair):
+    """主干已是最新时也要清理传入的已合并分支
+
+    回归：连续两个PR都合并时，处理第二个PR时主干可能已经是最新（第一个PR
+    同步时就拉过了），早期实现在“已是最新”分支提前返回，导致该PR的工作
+    分支永远不被清理。
+    """
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    assert pusher.sync_main("main") is True       # 先把主干拉到远端最新
+    _git(repo_pair, "branch", "merged-later")     # 在最新点上再开一个已合并分支
+
+    assert pusher.sync_main("main", "merged-later") is True
+
+    branches = _git(repo_pair, "branch", "--format=%(refname:short)").split()
+    assert "merged-later" not in branches

@@ -271,10 +271,11 @@ class GitPusher:
         after = self._git("rev-parse", "HEAD").stdout
         if before == after:
             LOGGER.info("本地 %s 已是最新 (%s)", main_branch, after[:8])
-            return True
+        else:
+            LOGGER.info("已同步 %s：%s -> %s", main_branch, before[:8], after[:8])
 
-        LOGGER.info("已同步 %s：%s -> %s", main_branch, before[:8], after[:8])
-
+        # 无论本次是否产生新提交，都要清理传入的已合并分支：
+        # 连续两个PR都合并时，第二个PR进来时主干可能已经是最新（前一次已同步过）
         if merged_branch and merged_branch != main_branch:
             # 用 -d（安全删除）：只有确实已并入主干才会删除，否则保留并告警
             removed = self._git("branch", "-d", merged_branch)
