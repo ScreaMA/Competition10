@@ -324,6 +324,32 @@ python automation_main.py
 
 ---
 
+## ❓ 常见问题
+
+### 本地 push 弹出 GitHub 账号选择框
+
+**原因**: Git for Windows 在系统级 gitconfig 里配了 `credential.helper=manager`（GCM），
+它排在 `store` 之前；git 会按「系统 → 全局 → 本地」顺序把 helper 追加成链，
+GitHub 无可用凭据时 GCM 就弹账号选择框。URL 级配置只是追加、不会替换，所以必须在
+本地作用域用**空值清空整条链**再指定 `store`：
+
+```bash
+cd <仓库根目录>            # 即 Competition10/
+git config --local credential.helper ""
+git config --local --add credential.helper store
+```
+
+凭据本身取自 `~/.git-credentials`（内容形如
+`https://x-access-token:<PAT>@github.com`）。验证方式（应只看到 `credential-store`）：
+
+```bash
+GIT_TRACE=1 git push --dry-run origin main 2>&1 | grep credential
+```
+
+> 自动化系统自身的推送不受影响：它在推送 URL 里直接携带 token，不经过 helper。
+
+---
+
 ## 📞 支持
 
 - 远程仓库: https://github.com/ScreaMA/Competition10.git
