@@ -203,6 +203,69 @@ class GitPusher:
         self._git("checkout", original_branch)
         self._git("branch", "-D", branch_name)
 
+    # === 与远端同步 ===
+
+    def sync_main(self, main_branch: str, merged_branch: str = "",
+                  delete_remote_branch: bool = False) -> bool:
+        """把本地主干同步到远端最新（PR合并后调用）
+
+        参数:
+            main_branch: 主干分支名（如 main）
+            merged_branch: 刚被合并的工作分支，同步后顺带清理本地分支
+            delete_remote_branch: 是否同时删除远端已合并分支
+
+        返回:
+            True 表示本地确实前进了；False 表示已是最新或安全起见跳过了
+
+        安全约束（重要）:
+            - 只做快进合并（--ff-only），本地领先或已分叉时保持现状并告警，
+              绝不用远端覆盖本地提交
+            - 工作区不干净时直接跳过，避免把未提交的改动卷进/丢失
+        """
+        if self.has_changes():
+            LOGGER.warning("工作区有未提交改动，跳过同步")
+            return False
+
+        fetch = self._git("fetch", self.remote)
+        if not fetch.ok:
+            LOGGER.warning("fetch 失败，跳过同步: %s",
+                           fetch.stderr or fetch.stdout)
+            return False
+
+        if self.current_branch() != main_branch:
+            LOGGER.info("切换到 %s 以同步远端提交", main_branch)
+            if not self._git("checkout", main_branch).ok:
+                LOGGER.warning("切换分支失败，跳过同步")
+                return False
+
+        remote_ref = f"{self.remote}/{main_branch}"
+        before = self._git("rev-parse", "HEAD").stdout
+        merge = self._git("merge", "--ff-only", remote_ref)
+        if not merge.ok:
+            LOGGER.warning("无法快进到 %s（本地领先或已分叉），保持现状：%s",
+                           remote_ref, (merge.stderr or merge.stdout).splitlines()[-1:])
+            return False
+
+        after = self._git("rev-parse", "HEAD").stdout
+        if before == after:
+            LOGGER.info("本地 %s 已是最新 (%s)", main_branch, after[:8])
+            return True
+
+        LOGGER.info("已同步 %s：%s -> %s", main_branch, before[:8], after[:8])
+
+        if merged_branch and merged_branch != main_branch:
+            # 用 -d（安全删除）：只有确实已并入主干才会删除，否则保留并告警
+            removed = self._git("branch", "-d", merged_branch)
+            if removed.ok:
+                LOGGER.info("已清理本地分支 %s", merged_branch)
+            else:
+                LOGGER.warning("本地分支 %s 未删除：%s", merged_branch,
+                               removed.stderr or removed.stdout)
+        if delete_remote_branch and merged_branch:
+            target = self._auth_url() or self.remote
+            self._git("push", target, "--delete", merged_branch)
+        return True
+
     # === 组合动作 ===
 
     def publish(self, task: Task, summary: str = "") -> str:

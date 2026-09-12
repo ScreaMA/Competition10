@@ -154,6 +154,12 @@ class GitHubClient:
         raw = self.request("GET", f"/repos/{self.owner}/{self.repo}/issues/{number}")
         return Issue.load(raw)
 
+    def get_pull_request(self, number: int) -> dict[str, Any]:
+        """获取单个Pull Request（含 merged/state/head.ref 等字段）"""
+        return self.request(
+            "GET", f"/repos/{self.owner}/{self.repo}/pulls/{number}"
+        ) or {}
+
     def comment_issue(self, number: int, body: str) -> Any:
         """在Issue下添加评论"""
         return self.request(
@@ -206,13 +212,40 @@ class ProcessedStore:
         """该Issue是否已处理过"""
         return str(issue_number) in self._data.get("issues", {})
 
-    def mark(self, issue_number: int, status: str, detail: str = "") -> None:
-        """记录处理结果"""
-        self._data.setdefault("issues", {})[str(issue_number)] = {
+    def record(self, issue_number: int) -> dict[str, Any]:
+        """获取某个Issue的处理记录"""
+        return self._data.get("issues", {}).get(str(issue_number), {})
+
+    def mark(self, issue_number: int, status: str, detail: str = "", **extra: Any) -> None:
+        """记录处理结果（extra 可带 pr / branch 等附加字段）"""
+        entry = {
             "status": status,
             "detail": detail,
             "time": datetime.now().isoformat(timespec="seconds"),
         }
+        entry.update(extra)
+        self._data.setdefault("issues", {})[str(issue_number)] = entry
+        self._save()
+
+    def pending_pull_requests(self) -> list[tuple[int, dict[str, Any]]]:
+        """返回「已创建PR但还没确认合并同步」的 (issue编号, 记录) 列表"""
+        pending: list[tuple[int, dict[str, Any]]] = []
+        for key, entry in self._data.get("issues", {}).items():
+            if entry.get("status") != "published" or entry.get("synced"):
+                continue
+            try:
+                pending.append((int(key), entry))
+            except (TypeError, ValueError):
+                continue
+        return sorted(pending)
+
+    def mark_synced(self, issue_number: int, detail: str = "") -> None:
+        """标记该Issue对应的PR已完成同步（合并或关闭）"""
+        entry = self._data.setdefault("issues", {}).setdefault(str(issue_number), {})
+        entry["synced"] = True
+        entry["synced_time"] = datetime.now().isoformat(timespec="seconds")
+        if detail:
+            entry["sync_detail"] = detail
         self._save()
 
 
@@ -270,7 +303,21 @@ class IssueMonitor:
                     len(issues), len(candidates))
         return candidates
 
-    def mark_processed(self, issue_number: int, status: str, detail: str = "") -> None:
+    def mark_processed(self, issue_number: int, status: str, detail: str = "",
+                       **extra: Any) -> None:
         """记录Issue已处理"""
         if self.store is not None:
-            self.store.mark(issue_number, status, detail)
+            self.store.mark(issue_number, status, detail, **extra)
+
+    def record(self, issue_number: int) -> dict[str, Any]:
+        """获取Issue的处理记录"""
+        return self.store.record(issue_number) if self.store is not None else {}
+
+    def pending_pull_requests(self) -> list[tuple[int, dict[str, Any]]]:
+        """已创建PR但尚未确认合并同步的Issue列表"""
+        return self.store.pending_pull_requests() if self.store is not None else []
+
+    def mark_synced(self, issue_number: int, detail: str = "") -> None:
+        """标记PR已同步"""
+        if self.store is not None:
+            self.store.mark_synced(issue_number, detail)
