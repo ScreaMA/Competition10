@@ -233,6 +233,7 @@ class Turn:
     robots: tuple[Robot, ...]  # 机器人
     player_tasks: tuple[PlayerTask, ...]  # 任务点
     phase_task: str  # 当前任务描述
+    last_cmd_result: str  # 上回合沙盒命令（executeCmd）的执行结果
     vendor_shop: list[dict[str, Any]]  # 小贩价格表
     weapon_shop: list[dict[str, Any]]  # 武器商店价格表
 
@@ -264,6 +265,7 @@ class Turn:
                 PlayerTask.load(t) for t in team_our.get("playerTasks") or ()
             ),
             phase_task=str(payload.get("phaseTask") or ""),
+            last_cmd_result=str(payload.get("lastCmdResult") or ""),
             vendor_shop=payload.get("vendorShopList") or [],
             weapon_shop=payload.get("weaponShopList") or [],
         )
