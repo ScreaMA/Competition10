@@ -13,7 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .brain import decide
+from .brain import decide, sandbox_command
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,11 +75,11 @@ class Handler(BaseHTTPRequestHandler):
             # 6. 调用决策引擎（返回指令与可选的LLM prompt）
             response, llm_prompt = decide(payload)
 
-            # 7. 构建完整响应
+            # 7. 构建完整响应（executeCmd 仅在自进化任务期间有内容）
             full_response = {
                 "roleCommandMap": response,
                 "prompt": llm_prompt,
-                "executeCmd": "",  # 沙盒命令预留
+                "executeCmd": sandbox_command(payload),  # 沙盒命令
             }
 
             # 8. 记录策略完成（含决策耗时）

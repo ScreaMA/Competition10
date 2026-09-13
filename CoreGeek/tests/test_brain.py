@@ -11,15 +11,21 @@ import agent.brain as brain
 from agent.brain import (
     SELL_BATCH,
     STONE_BATCH,
+    TASK_MARKER,
     TOWER_LOADOUT,
+    UPGRADE_GOLD,
+    WEAPON_UPGRADE_VOUCHER,
     _calc_tower_sites,
     _calc_wall_order,
     _generate_strategy_prompt,
     _pair_controllers_and_weapons,
+    _task_token,
     decide,
+    sandbox_command,
 )
 from agent.protocol import (
     CHALLENGER_TASK_1,
+    DAY_ROUNDS,
     GATLING,
     PIONEER,
     RAILGUN,
@@ -29,6 +35,7 @@ from agent.protocol import (
     WALL,
     WALL_MATERIAL,
     WEAPON_BUILD_COST,
+    WEAPON_SHOP,
     WORKER,
     Pos,
     Turn,
@@ -46,22 +53,29 @@ def _footprint_distance(pos: Pos, footprint) -> int:
     return min(distance(pos, cell) for cell in footprint)
 
 
+def _sandbox_result(phase_task: str, output: str, exit_code: int = 0) -> str:
+    """按接口文档格式构造一条沙盒命令执行结果（lastCmdResult）"""
+    return f"[exitCode:{exit_code}]\n{TASK_MARKER}{_task_token(phase_task)}\n{output}"
+
+
 # === 建造位置规划 ===
 
 
 def test_tower_sites_layout(payload_factory):
-    """武器塔位置：基地周围一圈内、按坐标排序的前3个格子"""
+    """武器塔位置：基地周围一圈内、分散在三个不同方位"""
     turn = Turn.load(payload_factory())
     sites = _calc_tower_sites(turn)
     footprint = station_footprint(STATION)
 
     assert len(sites) == 3
-    assert sites == (Pos(9, 22), Pos(9, 23), Pos(9, 24))
+    assert sites == (Pos(12, 23), Pos(10, 22), Pos(9, 23))
     for site in sites:
         assert turn.land(site)
         assert site not in footprint
         assert _footprint_distance(site, footprint) == 1
     assert len(set(sites)) == 3
+    # 回归：三座塔曾经全部挤在基地左边同一列(x=9)，现在必须覆盖不同方位
+    assert len({site.x for site in sites}) == 3
 
 
 def test_tower_loadout_covers_all_weapon_types():
@@ -115,13 +129,13 @@ def test_decide_day_builds_weapon(payload_factory, role_factory):
     payload = payload_factory(
         round_no=1,
         gold=WEAPON_BUILD_COST,
-        roles=[role_factory(10010, WORKER, 10, 22, backPackCapability=100)],
+        roles=[role_factory(10010, WORKER, 11, 22, backPackCapability=100)],
     )
     commands, _ = decide(payload)
 
     assert commands["10010"] == {
         "action": "build",
-        "targetPos": [{"x": 9, "y": 22}],
+        "targetPos": [{"x": 12, "y": 23}],
         "name": GATLING,
     }
 
@@ -178,6 +192,27 @@ def test_worker_stone_batch_makes_it_keep_collecting(payload_factory, role_facto
     )
     commands, _ = decide(payload)
     assert commands["10010"]["action"] == "collect"
+
+
+def test_worker_falls_back_to_weapon_before_night(payload_factory, role_factory):
+    """天黑前工人停止采集，回到武器旁待命，保证夜晚火力不空转"""
+    before = Pos(5, 23)
+    weapon_pos = Pos(9, 24)
+    payload = payload_factory(
+        round_no=DAY_ROUNDS - 3,  # 距天黑还有4回合
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, before.x, before.y, backPackCapability=100),
+            role_factory(10020, GATLING, weapon_pos.x, weapon_pos.y, attackRange=4),
+        ],
+        zones=[(STONE_MINE, 4, 24)],  # 紧邻石矿，但回防优先
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10010"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    assert distance(step, weapon_pos) < distance(before, weapon_pos)
 
 
 # === 资源交易 ===
@@ -245,6 +280,86 @@ def test_trade_keeps_stone_when_backpack_not_full(payload_factory, role_factory)
     commands, _ = decide(payload)
 
     assert "10010" not in commands
+
+
+def test_worker_keeps_mining_for_gold_after_walls_done(
+    payload_factory, role_factory,
+):
+    """围墙建完后工人继续采石换金币，避免经济在第1天就冻结"""
+    payload = _payload_with_full_walls(
+        payload_factory, role_factory,
+        worker_pos=Pos(5, 23),
+        zones=[(STONE_MINE, 4, 24)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "collect",
+        "targetPos": [{"x": 4, "y": 24}],
+    }
+
+
+# === 金币消费（武器升级） ===
+
+
+def _payload_with_full_defense(payload_factory, role_factory, gold: int,
+                               worker_pos: Pos, backpack=(), zones=()) -> dict:
+    """构造“围墙与三座武器都已建完”的局面"""
+    base = Turn.load(payload_factory())
+    roles = [
+        role_factory(40000 + index, WALL, pos.x, pos.y)
+        for index, pos in enumerate(_calc_wall_order(base))
+    ]
+    roles += [
+        role_factory(10020 + index, kind, pos.x, pos.y, attackRange=4)
+        for index, (kind, pos) in enumerate(
+            zip(TOWER_LOADOUT, _calc_tower_sites(base))
+        )
+    ]
+    roles.append(
+        role_factory(
+            10010, WORKER, worker_pos.x, worker_pos.y,
+            backPackCapability=100, backpack=list(backpack),
+        ),
+    )
+    return payload_factory(gold=gold, roles=roles, zones=list(zones))
+
+
+def test_worker_buys_upgrade_voucher_when_gold_spare(
+    payload_factory, role_factory,
+):
+    """防线建完后金币不再闲置：去武器商店买武器升级券"""
+    payload = _payload_with_full_defense(
+        payload_factory, role_factory,
+        gold=UPGRADE_GOLD,
+        worker_pos=Pos(20, 17),
+        zones=[(WEAPON_SHOP, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "buy",
+        "name": WEAPON_UPGRADE_VOUCHER,
+        "num": 1,
+    }
+
+
+def test_worker_uses_upgrade_voucher_on_weapon(payload_factory, role_factory):
+    """背包里有升级券时，走到武器旁使用（level1 -> level2）"""
+    site = _calc_tower_sites(Turn.load(payload_factory()))[0]
+    payload = _payload_with_full_defense(
+        payload_factory, role_factory,
+        gold=0,
+        worker_pos=Pos(site.x, site.y - 1),
+        backpack=[WEAPON_UPGRADE_VOUCHER],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "use",
+        "name": WEAPON_UPGRADE_VOUCHER,
+        "targetPos": [{"x": site.x, "y": site.y}],
+    }
 
 
 # === 任务系统 ===
@@ -329,6 +444,81 @@ def test_pioneer_falls_back_to_weapon(payload_factory, role_factory):
     assert commands["10011"]["action"] == "move"
 
 
+# === 自进化任务（沙盒作答） ===
+
+
+def test_sandbox_command_reads_task_file(payload_factory, role_factory):
+    """任务进行中：提交读取任务文件的沙盒命令"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task="请阅读task_1_beijing.md",
+    )
+    command = sandbox_command(payload)
+
+    assert 'cat -- "task_1_beijing.md"' in command
+    # 命令必须带上任务标识，才能确认下一回合的输出属于本任务
+    assert TASK_MARKER in command
+
+
+def test_sandbox_command_idle_without_task(payload_factory):
+    """没有进行中的任务时不使用沙盒"""
+    assert sandbox_command(payload_factory(round_no=1)) == ""
+
+
+def test_pioneer_submits_answer_from_sandbox(payload_factory, role_factory):
+    """开拓者拿到沙盒输出后在任务点旁提交答案"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    # 本回合还没有沙盒输出，先申请命令
+    assert sandbox_command(payload) != ""
+
+    # 下一回合带回沙盒输出，开拓者直接作答
+    payload["lastCmdResult"] = _sandbox_result(phase_task, "北京 晴 25摄氏度")
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": "北京 晴 25摄氏度",
+    }
+    # 已有答案后不再重复执行沙盒命令
+    assert sandbox_command(payload) == ""
+
+
+def test_pioneer_ignores_stale_or_failed_sandbox_output(
+    payload_factory, role_factory,
+):
+    """沙盒输出不属于当前任务或执行失败时，不能拿来作答"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+
+    # 上一个任务残留的输出
+    payload["lastCmdResult"] = _sandbox_result("请阅读task_2_shanghai.md", "上海 多云")
+    commands, _ = decide(payload)
+    assert "10011" not in commands
+
+    # 本任务但命令执行失败
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task, "No such file or directory", exit_code=1,
+    )
+    commands, _ = decide(payload)
+    assert "10011" not in commands
+
+
 # === 夜晚决策 ===
 
 
@@ -350,6 +540,33 @@ def test_decide_night_attacks_robot(payload_factory, role_factory, robot_factory
     assert commands["10020"] == {
         "action": "attack",
         "targetPos": [{"x": 12, "y": 24}],
+        "controllerId": "10010",
+    }
+
+
+def test_decide_night_prioritizes_dangerous_robot(
+    payload_factory, role_factory, robot_factory,
+):
+    """射程内同时有小型机器人与BOSS时，优先攻击威胁更高的BOSS"""
+    payload = payload_factory(
+        round_no=71,
+        roles=[
+            role_factory(10010, WORKER, 9, 23, backPackCapability=100),
+            role_factory(10020, GATLING, 9, 24, attackRange=5),
+        ],
+        robots=[
+            robot_factory(30001, 12, 24, targetTeam="challenger"),  # 小型, 距离3
+            robot_factory(
+                30002, 13, 26, roleType="bossRobot", health=800,
+                targetTeam="challenger",
+            ),  # BOSS, 距离4
+        ],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10020"] == {
+        "action": "attack",
+        "targetPos": [{"x": 13, "y": 26}],
         "controllerId": "10010",
     }
 
@@ -414,7 +631,7 @@ def test_decide_night_moves_controller_to_weapon(payload_factory, role_factory):
 
 
 def test_pair_controllers_and_weapons(payload_factory, role_factory):
-    """角色与武器按顺序配对，数量不匹配时取较少的那个"""
+    """角色与武器按距离就近配对，数量不匹配时取较少的那个"""
     payload = payload_factory(
         roles=[
             role_factory(10010, WORKER, 5, 23),
@@ -427,8 +644,10 @@ def test_pair_controllers_and_weapons(payload_factory, role_factory):
     pairs = _pair_controllers_and_weapons(Turn.load(payload))
 
     assert len(pairs) == 2
-    assert [controller.unit_id for controller, _ in pairs] == [10010, 10011]
+    # 回归：不再按ID顺序硬配对（开拓者在(10,12)离两座武器都最远，不应占坑）
+    assert [controller.unit_id for controller, _ in pairs] == [10010, 10012]
     assert [weapon.unit_id for _, weapon in pairs] == [10020, 10030]
+    assert distance(pairs[0][0].pos, pairs[0][1].pos) == 4
 
 
 # === LLM 策略咨询 ===
