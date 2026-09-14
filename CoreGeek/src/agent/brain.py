@@ -3645,6 +3645,47 @@ def _task_probe_done(turn: Turn) -> bool:
     return watch.probes >= TASK_PROBE_LIMIT
 
 
+def _task_last_chance(turn: Turn) -> bool:
+    """这一回合是不是"止损前最后一次真去取数的机会"（只读，S1）
+
+    取数连败只差一个回合到线（`TASK_API_FAIL_LIMIT`）时返回 True：
+    `_sandbox_command` 据此把这一回合留给执行器，不再跑 LLM 给的 `CMD:`。
+
+    两场复盘（PK591879/PK591880）都是"读题成功（exitCode:0、key=yes）但
+    `api=0`、几个回合后放弃"的形态，报告给的建议是"先执行 API 命令失败几次
+    再谈放弃"。可沙盒一回合只能跑一条命令：LLM 兜底一旦启动，待执行的 `CMD:`
+    就一直排在执行器前面（见 `_sandbox_command`），而 `cat`/`grep`/`./check`
+    这类命令一个接口都不碰——取数连败的这几个回合于是可能全被它们占掉，
+    执行器只跑了接任务后的头一回合（试的还是轮转偏移最小的那一批候选地址），
+    任务就在"一次都没真调过接口"的状态下被放弃。执行器每回合都会把候选地址
+    真调一遍（`[API]`/`[APIFAIL]` 必定出现在输出里），试的又是按当前回合号
+    轮转过的另一批地址（见执行器里的 `rotate`），最后一次机会押在它身上比
+    再跑一条不碰接口的命令更接近答案。
+
+    LLM 的待执行命令不会因此丢掉：`_sandbox_command` 只是这一回合不下发它，
+    `pending_cmd` 仍留在任务状态里，任务没被止损掉的话下一回合照旧会跑。
+    代价是这一回合少跑一条 LLM 命令——它在连败的这几个回合里已经跑过前面
+    几条，取舍与 `_shell_command_ok`/`_task_command_auth_ok` 一致：宁可换一条
+    更接近答案的命令，也不让任务在"一次都没真调过接口"的状态下被放弃。
+    判据只看本回合或上一回合记下的观察（与 `_task_abandoned` 同一套口径），
+    回合号对不上就当作没有观察。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        True 表示这一回合不再跑 LLM 的命令，改让执行器去取数
+    """
+    watch = _TASK_WATCH
+    if watch is None or not turn.phase_task:
+        return False
+    if watch.token != _task_token(turn.phase_task):
+        return False
+    if turn.round_no not in (watch.round_no, watch.round_no + 1):
+        return False
+    return watch.fails >= TASK_API_FAIL_LIMIT - 1
+
+
 def _task_llm_state(turn: Turn) -> dict[str, Any]:
     """当前任务的 LLM 交互状态（按任务标识存，跨回合保留）
 
@@ -4204,6 +4245,10 @@ def _sandbox_command(turn: Turn) -> str:
     读文件流程；探到 `TASK_PROBE_LIMIT` 次还没认出文件就改用执行器，把任务
     根目录（`TASK_ROOTS`）交给它自己找——不再反复扫同一棵目录树。
 
+    取数连败只差一回合到线时（`_task_last_chance`），这一回合不跑 LLM 给的
+    `CMD:` 而留给执行器：LLM 的命令未必碰接口，执行器则一定会把候选地址真调
+    一遍，任务不会在"一次都没真正调过接口"的状态下被放弃。
+
     答案区之后依次是工作目录诊断与任务文件回读（`[TASK_FILE]` 分段，供
     `_task_file` 认出沙盒里的真实文件名、给执行器圈定候选任务文件）。
     这两段都排在 `TASK_END_MARKER` 之后，永远不会被当成答案。
@@ -4219,8 +4264,11 @@ def _sandbox_command(turn: Turn) -> str:
     ):
         return ""
 
-    # LLM 给了取数命令就优先跑它：一回合只能发一条命令，它比"继续猜地址"更准
-    llm_command = _llm_task_command(turn)
+    # LLM 给了取数命令就优先跑它：一回合只能发一条命令，它比"继续猜地址"更准。
+    # 止损前最后一次机会除外（S1，见 `_task_last_chance`）：那一回合留给执行器，
+    # 由它把候选地址真调一遍。命令不会丢——`_llm_task_command` 没被调用，
+    # `pending_cmd` 仍留在任务状态里，任务没被止损掉的话下一回合照旧会跑。
+    llm_command = "" if _task_last_chance(turn) else _llm_task_command(turn)
     if llm_command:
         return llm_command
 

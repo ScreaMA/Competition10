@@ -4246,6 +4246,63 @@ def test_llm_command_is_run_in_sandbox(payload_factory, role_factory):
     assert brain.TASK_MARKER in command  # 包装过，答案区能对上当前任务
 
 
+def test_last_round_before_the_fail_limit_goes_to_the_executor(
+    payload_factory, role_factory,
+):
+    """取数连败到线前的最后一个回合留给执行器真去调一次接口（S1）
+
+    两场复盘（PK591879/PK591880）都是"读题成功（exitCode:0、key=yes）但
+    api=0、几个回合后放弃"。沙盒一回合只能发一条命令：LLM 兜底启动之后，
+    待执行的 `CMD:` 一直排在执行器前面，而 `cat`/`grep` 这类命令一个接口都不碰
+    ——取数连败的几个回合可能全被它们占掉，任务放弃时执行器只跑过接任务后的
+    头一回合（试的还是轮转偏移最小的那批地址），报告里"先执行几次 API 命令
+    失败再谈放弃"这条建议落不了地。这里锁两件事：连败还没到线时 LLM 的命令
+    照旧下发；到线前最后一个回合改用执行器（它必定会把候选地址真调一遍）。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+
+    def fail_round(round_no: int, llm_resp: str = "") -> dict:
+        """取数又失败一回合（每回合换一批猜错的地址）"""
+        payload = _llm_task_payload(
+            payload_factory, role_factory, phase_task, round_no,
+        )
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task,
+            f"{TASK_API_FAIL_MARKER} http://localhost:8899/guess{round_no}"
+            " HTTPError 404\n",
+        )
+        if llm_resp:
+            payload["llmResp"] = llm_resp
+        decide(payload)
+        return payload
+
+    # 连败第 1 回合：LLM 回了一条取数命令
+    fail_round(11, "CMD: cat task_1_beijing.md")
+
+    # 连败还没到线：这条命令照旧下发（执行器的片段里才有 heredoc 结束符）
+    on_time = fail_round(12)
+    assert brain._TASK_WATCH.fails < TASK_API_FAIL_LIMIT - 1
+    on_time_command = sandbox_command(on_time)  # 只取一次：取用后命令就出队了
+    assert "cat task_1_beijing.md" in on_time_command
+    assert "PYEOF" not in on_time_command
+
+    fail_round(13)
+    fail_round(14)
+    last = fail_round(15, "CMD: cat task_1_beijing.md")
+    assert brain._TASK_WATCH.fails == TASK_API_FAIL_LIMIT - 1
+
+    # 到线前最后一个回合：不再跑 LLM 的命令，改让执行器去取数
+    command = sandbox_command(last)
+    assert "PYEOF" in command  # 执行器：它一定会把候选地址真调一遍
+    assert f"OFFSET = 15" in command  # 轮转量是本回合号，试的是另一批地址
+    assert f"KEEP = {TASK_API_KEEP}" in command
+    # 命令没丢：`pending_cmd` 仍留在任务状态里，任务没被止损时下一回合照旧会跑
+    assert any(
+        state.get("pending_cmd") for state in brain._TASK_LLM_STATE.values()
+    )
+
+
 def test_shell_command_check_rejects_broken_commands():
     """命令体检：引号成对且单行、不带 heredoc 才算合格（不合格的不拼进沙盒）"""
     assert brain._shell_command_ok('curl -s "http://localhost:8899/weather"')
