@@ -371,6 +371,12 @@ TASK_API_MAX_CALLS = 8  # 一条命令里最多请求几次（本地接口，失
 # 轮转只发生在这一小段之后的兜底候选上。
 TASK_API_KEEP = 2
 TASK_API_TIME_BUDGET = 8  # 取数阶段的时间上限（秒），留出找文件与回读的余量
+# 这个配额只卡"第二发往后"的请求（S1，见执行器里那条判定）：`deadline` 是从
+# 取数这一步才开始记账的，而它前面的找文件/读文档只有 `TASK_EXEC_DIR_BUDGET`
+# 兜着，慢的时候能把整条命令的 15 秒吃掉大半——真到那一步，配额会把每一次
+# 请求都拦下，这一回合就成了"执行器跑过了、却一行取数证据都没有"（`[SCAN]`
+# 正常、`api=0` 也 `fail=0`，看门狗只能按"没跑出候选"归类）。第一个候选地址
+# 因此永远豁免配额：它是"这一回合到底试没试过接口"的唯一凭据。
 TASK_EXEC_DIR_BUDGET = 4000  # 全盘找文件时最多进几个目录（防止 walk 慢过 15 秒）
 TASK_API_QUERY_MAX = 2  # 每个接口地址最多试几个查询词
 TASK_API_BODY_LIMIT = 400  # 单个响应体最多带回的字符数
@@ -5000,7 +5006,17 @@ for path in files[:SOLVE_MAX]:
     text = read(path)
     bodies = []
     for url in rotate(candidates(text, name, urls), KEEP, OFFSET):
-        if calls >= MAX_CALLS or time.time() > deadline:
+        # 第一次请求不受取数预算限制（S1）：`deadline` 是"取数阶段"的配额，
+        # 从这一行才开始计时，而它前面的找文件/读文档没有配额（只有 DIR_BUDGET
+        # 兜着），沙盒文件系统慢的时候能把整条命令的 15 秒吃掉大半。旧写法拿
+        # 配额卡每一次请求，于是"读题成功（[SCAN] docs=2 urls=2 key=yes）、
+        # exitCode:0"的回合里一次请求都没发出去——输出里没有 `[API]` 也没有
+        # `[APIFAIL]`，看门狗只能按"执行器自己没跑出候选"归类（见
+        # `_task_fetch_failed` 第 3 条），明明手里握着文档给出的地址却一路空转到
+        # 止损。候选清单是现成的、地址也已经拼好，第一次请求只花一次请求的
+        # 超时（`TIMEOUT` 秒）就能把"这一回合到底试没试过接口"变成输出里的
+        # 一行证据；后面的请求照旧按配额来。
+        if calls >= MAX_CALLS or (calls and time.time() > deadline):
             break
         calls += 1
         body = fetch(url, headers)
@@ -5032,7 +5048,10 @@ if not calls:
         name = "task"
     bodies = []
     for url in rotate(candidates(doc_text, query, urls), KEEP, OFFSET):
-        if calls >= MAX_CALLS or time.time() > deadline:
+        # 同上：这一段的 `calls` 必然是 0（进得来就说明一条请求都没发），
+        # 所以第一次请求照样豁免取数预算——不然"找文件太慢"会连带把这条
+        # 兜底也掐掉，执行器跑过一遍却连一次 `[APIFAIL]` 都留不下。
+        if calls >= MAX_CALLS or (calls and time.time() > deadline):
             break
         calls += 1
         body = fetch(url, headers)

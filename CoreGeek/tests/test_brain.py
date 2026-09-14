@@ -6221,6 +6221,10 @@ def test_executor_calls_the_api_without_a_task_file(capsys):
         "rotate": rotate,
         "candidates": candidates,
         "fetch": _fetch,
+        # 取数循环把请求头原样交给 `fetch`（`body = fetch(url, headers)`），
+        # 而 `headers` 是在这段切片**之前**由 `request_headers(key)` 算出来的：
+        # 切片里缺这个绑定，循环第一圈就会抛 NameError，测试根本跑不到断言
+        "headers": {},
         "SOLVE_MAX": brain.TASK_SOLVE_MAX,
         "KEEP": brain.TASK_API_KEEP,
         "OFFSET": 5,
@@ -6244,6 +6248,111 @@ def test_executor_calls_the_api_without_a_task_file(capsys):
     assert TASK_DATA_MARKER in out
     assert f"{TASK_SOLUTION_MARKER}task_1_alpha.md" in out
     assert TASK_SOLUTION_END in out
+
+
+class _BudgetGone:
+    """时钟：算 `deadline` 那次还在预算里，之后时间已经走完了
+
+    模拟"找文件/读文档把整条命令的 15 秒吃掉大半"：`deadline` 是在那一段之后
+    才记账的，所以它自己算出来的是"从此刻起还有 `TIME_BUDGET` 秒"，而取数那一步
+    真正开始时（循环里的每一次读表）配额早就用光了。注意判定里的短路：
+    `calls and time.time() > deadline` 在 `calls == 0` 时**不读表**。
+    每次用一个新的实例：计数不能跨测试留着（第一次读表必须落在预算里）。
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def time(self):
+        self.calls += 1
+        return 0.0 if self.calls == 1 else 100.0
+
+
+def _run_fetch_loop(files, task_path, doc_text, urls, fetch, clock):
+    """按给定沙盒形态跑一遍取数主循环（`_executor_fetch_loop` 抽出来的那段）"""
+    _, candidates = _executor_queries()
+    namespace = {
+        "os": os,
+        "re": re,
+        "time": clock,
+        "files": files,
+        "read": lambda path: "",
+        "rotate": _executor_rotate(),
+        "candidates": candidates,
+        "fetch": fetch,
+        "headers": {},  # 切片里没有 `headers` 的绑定，缺了它第一圈就 NameError
+        "SOLVE_MAX": brain.TASK_SOLVE_MAX,
+        "KEEP": brain.TASK_API_KEEP,
+        "OFFSET": 0,
+        "MAX_CALLS": brain.TASK_API_MAX_CALLS,
+        "TIME_BUDGET": brain.TASK_API_TIME_BUDGET,
+        "DATA": TASK_DATA_MARKER,
+        "SOLUTION": TASK_SOLUTION_MARKER,
+        "SOLUTION_END": TASK_SOLUTION_END,
+        "TASK_PATH": task_path,
+        "doc_text": doc_text,
+        "urls": urls,
+    }
+    exec(_executor_fetch_loop(), namespace)  # noqa: S102
+
+
+def test_executor_asks_once_even_when_the_fetch_budget_is_already_gone():
+    """取数预算被"找文件"吃光时，第一个候选地址照样要真调一遍（S1）
+
+    `deadline` 是取数阶段的配额，从它那一行才开始计时；它前面的找任务文件与
+    读接口文档没有配额（只有 `DIR_BUDGET` 兜着），沙盒文件系统慢的时候能把
+    整条命令的 15 秒吃掉大半。旧写法拿这个配额卡每一次请求，于是"读题成功
+    （`[SCAN] docs=2 urls=2 key=yes`）、`exitCode:0`"的回合里一次请求都没发出去：
+    输出里既没有 `[API]` 也没有 `[APIFAIL]`，看门狗只能按"执行器自己没跑出
+    候选"归类（见 `_task_fetch_failed` 第 3 条），明明手里有文档给出的地址
+    （`urls` 非空、Key 也抠到了），任务却一路空转直到止损。
+
+    豁免只给第一个候选地址：它是"这一回合到底试没试过接口"的唯一凭据，
+    也只花一次请求的超时；后面的请求照旧按配额来。
+    """
+    asked: list[str] = []
+
+    def _fetch(url, headers):
+        asked.append(url)
+        return ""
+
+    _run_fetch_loop(
+        [f"{TASK_ROOTS[0]}/1-x/task_1_beijing.md"],
+        "task_1_beijing.md",
+        "接口文档：GET http://localhost:8899/api/city",
+        ["http://localhost:8899/api/city"],
+        _fetch,
+        _BudgetGone(),
+    )
+
+    assert len(asked) == 1  # 至少一次，且预算用尽后不再追加
+    assert asked[0].startswith(brain.TASK_API_DEFAULT)
+
+
+def test_executor_asks_once_without_a_task_file_when_the_budget_is_gone():
+    """同上，一份任务文件都没找到时那条兜底取数也要发得出去（S1）
+
+    兜底那一段的 `calls` 必然是 0（进得去就说明一条请求都没发），所以它同样
+    受这条豁免保护；否则"找文件太慢"会连带把兜底一起掐掉，执行器白跑一趟，
+    输出里连一行 `[APIFAIL]` 都留不下。
+    """
+    asked: list[str] = []
+
+    def _fetch(url, headers):
+        asked.append(url)
+        return ""
+
+    _run_fetch_loop(
+        [],  # 沙盒里一份任务文件都没找到
+        "task_1_beijing.md",
+        "接口文档：GET http://localhost:8899/api/city",
+        ["http://localhost:8899/api/city"],
+        _fetch,
+        _BudgetGone(),
+    )
+
+    assert len(asked) == 1
+    assert asked[0].startswith(brain.TASK_API_DEFAULT)
 
 
 def test_executor_without_task_file_keeps_a_usable_solution_name(capsys):
@@ -6274,6 +6383,10 @@ def test_executor_without_task_file_keeps_a_usable_solution_name(capsys):
         "rotate": rotate,
         "candidates": candidates,
         "fetch": _fetch,
+        # 取数循环把请求头原样交给 `fetch`（`body = fetch(url, headers)`），
+        # 而 `headers` 是在这段切片**之前**由 `request_headers(key)` 算出来的：
+        # 切片里缺这个绑定，循环第一圈就会抛 NameError，测试根本跑不到断言
+        "headers": {},
         "SOLVE_MAX": brain.TASK_SOLVE_MAX,
         "KEEP": brain.TASK_API_KEEP,
         "OFFSET": 0,
@@ -6327,6 +6440,10 @@ def test_executor_without_task_file_still_asks_with_the_task_query_word():
         "rotate": rotate,
         "candidates": candidates,
         "fetch": _fetch,
+        # 取数循环把请求头原样交给 `fetch`（`body = fetch(url, headers)`），
+        # 而 `headers` 是在这段切片**之前**由 `request_headers(key)` 算出来的：
+        # 切片里缺这个绑定，循环第一圈就会抛 NameError，测试根本跑不到断言
+        "headers": {},
         "SOLVE_MAX": brain.TASK_SOLVE_MAX,
         "KEEP": brain.TASK_API_KEEP,
         "OFFSET": 0,
