@@ -81,6 +81,11 @@ MIN_TOWERS_BEFORE_NIGHT = 2  # 入夜前的最低火力：不足时优先抢建�
 MIN_WALLS_BEFORE_NIGHT = 2
 WEAPON_UPGRADE_VOUCHER = "WeaponUpgradeVoucher1"  # 武器升级券（level1->level2）
 UPGRADE_GOLD = 100  # 购买一张武器升级券所需金币
+# 金币闲置熔断线：手里攥着够再建两座塔的金币时，不允许再把塔数配额压到满编
+# 以下（复盘里"金币连续多回合冻结在 50，无塔无墙无升级"就是这么来的）。
+# 一座塔 25 金换 10 点火力和一段射程，比攒到 100 金升一级划算得多，
+# 所以金币越积越多时优先把它变成塔，而不是留在手里。
+GOLD_FLUSH_TOWERS = WEAPON_BUILD_COST * 2
 
 # 可卖给小贩的矿石（按优先级排序，石矿既是围墙材料也是主要收入来源）
 SELLABLE_MINES = (STONE_MINE, IRON_MINE, COPPER_MINE)
@@ -111,9 +116,11 @@ TASK_MARKER = "[TASK]"
 # 沙盒输出中的答案结束标记：它之后的诊断信息（目录列表等）永远不会被当成答案
 TASK_END_MARKER = "[TASK_END]"
 
-# 是否在每天第一个回合提交LLM策略咨询prompt（可用环境变量 LLM_PROMPT=0 关闭）
-# 每个游戏日的LLM调用有限额，每天只请求一次以节省额度
+# 是否提交LLM策略咨询prompt（可用环境变量 LLM_PROMPT=0 关闭）
+# 接口文档：每队每个游戏日的 LLM 调用额度为 3 次（自进化任务期间不计入），
+# 额度在当日首回合重置，所以每个游戏日最多咨询 LLM_PROMPT_PER_DAY 次
 LLM_PROMPT_ENABLED = os.getenv("LLM_PROMPT", "1") != "0"
+LLM_PROMPT_PER_DAY = 3  # 每个游戏日用满的咨询次数（接口文档的每日额度）
 
 # LLM 建议里可以被决策层执行的部分：只开放有限几个"旋钮"，让建议和指令
 # 出自同一套决策函数，而不是各说各话（复盘里的"LLM建议与指令脱节"）。
@@ -324,7 +331,8 @@ def _worker_day_logic(
     围墙段，而不是几个人同时奔着同一个位置去，白走一趟还互相挡路。
 
     `plan` 是LLM建议落下来的有界计划（见 `_llm_plan`）：今天要保证几座塔、
-    先铺几段围墙、能不能买升级券。默认计划与改造前的行为完全一致。
+    先铺几段围墙、能不能买升级券。默认计划与改造前的行为完全一致；计划里的
+    塔数还要再经 `_tower_target` 做一次金币闲置熔断，金币富余时不会被压低。
 
     参数:
         turn: 当前回合信息
@@ -341,10 +349,10 @@ def _worker_day_logic(
     # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"
     wall_quota = len(turn.walls()) < plan.wall
 
-    # 优先建造武器（计划里塔数已经够了就不再往塔上压金币）
+    # 优先建造武器（塔数由 `_tower_target` 决定：计划配额 + 金币闲置熔断）
     if (
         towers_missing
-        and len(turn.weapons()) < plan.tower
+        and len(turn.weapons()) < _tower_target(turn, plan)
         and turn.gold >= WEAPON_BUILD_COST
     ):
         # 就近认领: 每个工人挑离自己最近的那座塔，两个工人自然分头开工，
@@ -1545,14 +1553,38 @@ def _llm_plan(payload: dict[str, Any]) -> LlmPlan:
     )
 
 
+def _tower_target(turn: Turn, plan: LlmPlan) -> int:
+    """本回合要保证建成的武器塔数量（含金币闲置熔断）
+
+    正常情况下就是 LLM 计划里的 `tower`（默认满编 3 座）；但金币已经攒到
+    `GOLD_FLUSH_TOWERS`（够再建两座塔）时一律提到满编：复盘里"金币 75 只花
+    25、余下 50 连躺三个回合"的根因就是计划把塔数配额压低后金币再没有出口。
+    金币留在手里不产生任何防御力，宁可多建一座塔。
+
+    熔断只在金币富余时生效（阈值高于单座造价），所以 LLM 仍然可以为
+    "留钱买升级券"而少建一座塔；`upgrade` 开关与围墙配额都不受影响。
+
+    参数:
+        turn: 当前回合信息
+        plan: 本回合的LLM计划
+
+    返回:
+        白天要保证建成的塔数（LLM_MIN_TOWERS..LLM_MAX_TOWERS）
+    """
+    if turn.gold >= GOLD_FLUSH_TOWERS:
+        return LLM_MAX_TOWERS
+    return plan.tower
+
+
 def _plan_summary(turn: Turn, plan: LlmPlan) -> str:
     """把本回合的既定计划写成一句人话
 
     计划出自 `_calc_tower_sites`/任务排序等同一套决策函数，LLM 因此可以对
-    具体数字提意见，而不是和指令生成器各说各话。
+    具体数字提意见，而不是和指令生成器各说各话。塔数报的是
+    `_tower_target`（含金币闲置熔断），所以 LLM 看到的就是执行层真正要建的座数。
     """
     return (
-        f"武器目标 {plan.tower} 座（现有 {len(turn.weapons())} 座）；"
+        f"武器目标 {_tower_target(turn, plan)} 座（现有 {len(turn.weapons())} 座）；"
         f"优先铺围墙 {plan.wall} 段（现有 {len(turn.walls())} 段）；"
         f"升级券 {'可买' if plan.upgrade else '今天不买'}；"
         f"布防方位 {plan.defend or _enemy_brief(turn)}"
@@ -1585,10 +1617,13 @@ def _generate_strategy_prompt(
     payload: dict[str, Any],
     plan: LlmPlan = LLM_PLAN_DEFAULT,
 ) -> str:
-    """生成提交给LLM的策略咨询prompt（每个游戏日只请求一次）
+    """生成提交给LLM的策略咨询prompt（用满每个游戏日的调用额度）
 
-    接口文档规定每个游戏日有LLM调用次数限制（errorCode=5），
-    因此只在每天的第一个回合请求一次，并带上上一回合的LLM回复作为上下文。
+    接口文档规定每个游戏日有LLM调用次数限制（errorCode=5：每队每个游戏日
+    3 次，在当日首回合重置），因此只在每天的前 `LLM_PROMPT_PER_DAY` 个回合
+    各请求一次，并带上上一回合的LLM回复作为上下文。复盘里"只在第 1 回合
+    调用过 LLM，R2~R4 的 prompt 为空、指令退化为无目标移动"，只问一次
+    等于把额度白白浪费掉，这里把当日额度用满。
 
     prompt 里一并给出"本回合既定计划"并要求最后回一行 `PLAN:`：建议因此
     能落到具体数字上，回复里的 PLAN 行由 `_llm_plan` 解析回指令生成器
@@ -1604,8 +1639,8 @@ def _generate_strategy_prompt(
     """
     if not LLM_PROMPT_ENABLED:
         return ""
-    # 每天的第一个回合（第1、131、261...回合）
-    if turn.round_no % ROUNDS_PER_DAY != 1:
+    # 当日前几个回合（第1、2、3回合与131、132、133回合...）
+    if (turn.round_no - 1) % ROUNDS_PER_DAY >= LLM_PROMPT_PER_DAY:
         return ""
 
     robots = turn.alive_robots_targeting_me()

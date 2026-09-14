@@ -9,10 +9,12 @@ import pytest
 
 import agent.brain as brain
 from agent.brain import (
+    GOLD_FLUSH_TOWERS,
     LLM_MAX_WALLS,
     LLM_MIN_TOWERS,
     LLM_PLAN_DEFAULT,
     LLM_PLAN_TEMPLATE,
+    LLM_PROMPT_PER_DAY,
     SELL_BATCH,
     STONE_BATCH,
     TASK_END_MARKER,
@@ -1296,17 +1298,30 @@ def test_pair_controllers_and_weapons(payload_factory, role_factory):
 # === LLM 策略咨询 ===
 
 
-def test_strategy_prompt_only_on_first_round_of_day(payload_factory, monkeypatch):
-    """每天第一个回合生成一次prompt，其余回合为空（节省LLM额度）"""
+def test_strategy_prompt_uses_daily_quota(payload_factory, monkeypatch):
+    """每个游戏日把 LLM 额度用满：当日前3个回合各咨询一次，之后为空
+
+    回归：以前每天只在第 1 回合咨询一次，复盘里"R2、R3 请求中 prompt 为空，
+    决策循环仅在 R1 调用了 LLM、指令退化为无目标移动"。
+    """
     monkeypatch.setattr(brain, "LLM_PROMPT_ENABLED", True)
+    assert LLM_PROMPT_PER_DAY == 3  # 接口文档：每队每个游戏日 3 次额度
 
-    prompt = _generate_strategy_prompt(Turn.load(payload_factory(round_no=1)), {})
-    assert "回合 1" in prompt
-    assert "白天" in prompt
+    for round_no in range(1, LLM_PROMPT_PER_DAY + 1):
+        prompt = _generate_strategy_prompt(
+            Turn.load(payload_factory(round_no=round_no)), {},
+        )
+        assert f"回合 {round_no}" in prompt
+        assert "白天" in prompt
 
-    assert _generate_strategy_prompt(Turn.load(payload_factory(round_no=2)), {}) == ""
-    assert _generate_strategy_prompt(Turn.load(payload_factory(round_no=131)), {})
-    assert _generate_strategy_prompt(Turn.load(payload_factory(round_no=132)), {}) == ""
+    # 当日额度用完后不再请求（errorCode=5 是额度超限）
+    assert _generate_strategy_prompt(Turn.load(payload_factory(round_no=4)), {}) == ""
+
+    # 次日首回合额度重置
+    for round_no in range(131, 131 + LLM_PROMPT_PER_DAY):
+        turn = Turn.load(payload_factory(round_no=round_no))
+        assert _generate_strategy_prompt(turn, {})
+    assert _generate_strategy_prompt(Turn.load(payload_factory(round_no=134)), {}) == ""
 
 
 def test_strategy_prompt_can_be_disabled(payload_factory, monkeypatch):
@@ -1489,6 +1504,55 @@ def test_decide_returns_commands_and_prompt(payload_factory):
     commands, prompt = decide(payload_factory(round_no=1))
     assert isinstance(commands, dict)
     assert isinstance(prompt, str)
+
+
+# === 金币闲置熔断（issue #12） ===
+
+
+def _two_towers_payload(payload_factory, role_factory, gold: int) -> dict:
+    """构造"两座塔已建完、金币闲置"的局面，工人站在第 3 座塔位旁"""
+    sites = _calc_tower_sites(Turn.load(payload_factory()))
+    return payload_factory(
+        round_no=1,
+        gold=gold,
+        roles=[
+            role_factory(10010, WORKER, 9, 22, backPackCapability=100),
+            role_factory(10020, GATLING, sites[0].x, sites[0].y, attackRange=4),
+            role_factory(10030, RAILGUN, sites[1].x, sites[1].y, attackRange=6),
+        ],
+    )
+
+
+def test_gold_flush_overrides_tower_cap(payload_factory, role_factory):
+    """金币够再建两座塔时把塔数配额提到满编，不再持币空转
+
+    回归：复盘里"金币 75 只花 25 建 1 座塔，余下 50 连续三个回合冻结"。
+    """
+    payload = _two_towers_payload(payload_factory, role_factory, GOLD_FLUSH_TOWERS)
+    sites = _calc_tower_sites(Turn.load(payload))
+
+    # 计划把塔数压到 2 座，但手里还攥着两座塔的钱：第 3 座照建
+    payload["llmResp"] = "PLAN: tower=2"
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": sites[2].x, "y": sites[2].y}],
+        "name": ROCKET,
+    }
+
+
+def test_gold_flush_keeps_plan_cap_below_threshold(
+    payload_factory, role_factory,
+):
+    """金币不到熔断线时仍然听计划的，留钱买升级券"""
+    payload = _two_towers_payload(
+        payload_factory, role_factory, GOLD_FLUSH_TOWERS - 1,
+    )
+    payload["llmResp"] = "PLAN: tower=2"
+
+    commands, _ = decide(payload)
+    assert "10010" not in commands
 
 
 # === 鲁棒性 ===
