@@ -31,6 +31,7 @@ from agent.brain import (
     _generate_strategy_prompt,
     _llm_plan,
     _pair_controllers_and_weapons,
+    _plan_summary,
     _reserved_build_sites,
     _task_token,
     _valid_stand_cells,
@@ -97,8 +98,12 @@ def test_tower_sites_layout(payload_factory):
 
 
 def test_tower_loadout_covers_all_weapon_types():
-    """建造顺序包含全部三种武器"""
-    assert TOWER_LOADOUT == (GATLING, RAILGUN, ROCKET)
+    """建造顺序包含全部三种武器，且射程最远的火箭发射台先落地
+
+    回归：复盘里敌方开局就建射程 10 的火箭发射台，我方先建的却是射程 3 的
+    加特林，机器人走到基地跟前才开始挨打（"武器优先级表（rocket 优先）"）。
+    """
+    assert TOWER_LOADOUT == (ROCKET, RAILGUN, GATLING)
 
 
 def test_tower_sites_without_station(payload_factory):
@@ -202,7 +207,7 @@ def test_decide_day_builds_weapon(payload_factory, role_factory):
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 12, "y": 23}],
-        "name": GATLING,
+        "name": ROCKET,
     }
 
 
@@ -252,7 +257,7 @@ def test_worker_retries_next_site_after_failed_action(
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 12, "y": 23}],
-        "name": GATLING,
+        "name": ROCKET,
     }
 
     # 上一回合被判为失败（目标点被夺取等）：换第2座塔位(10,22)重试
@@ -267,13 +272,13 @@ def test_worker_retries_next_site_after_failed_action(
     # 只剩一座塔位可建时不换位，否则只会白白空转
     payload["teamOur"]["roles"] += [
         role_factory(10020, RAILGUN, 10, 22, attackRange=6),
-        role_factory(10030, ROCKET, 9, 23, attackRange=10),
+        role_factory(10030, GATLING, 9, 23, attackRange=3),
     ]
     commands, _ = decide(payload)
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 12, "y": 23}],
-        "name": GATLING,
+        "name": ROCKET,
     }
 
 
@@ -372,7 +377,7 @@ def test_worker_keeps_building_when_defense_not_ready_before_night(
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 12, "y": 23}],
-        "name": GATLING,
+        "name": ROCKET,
     }
 
 
@@ -470,7 +475,7 @@ def test_second_worker_skips_build_when_gold_runs_out(
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 12, "y": 23}],
-        "name": GATLING,
+        "name": ROCKET,
     }
     # 第二名工人改去采集（经济分工里它负责铁/铜），不再空下一条 build
     assert commands["10012"] == {
@@ -1646,17 +1651,17 @@ def test_llm_plan_tower_cap_stops_extra_tower(payload_factory, role_factory):
         gold=WEAPON_BUILD_COST,
         roles=[
             role_factory(10010, WORKER, 9, 22, backPackCapability=100),
-            role_factory(10020, GATLING, sites[0].x, sites[0].y, attackRange=4),
+            role_factory(10020, ROCKET, sites[0].x, sites[0].y, attackRange=10),
             role_factory(10030, RAILGUN, sites[1].x, sites[1].y, attackRange=6),
         ],
     )
 
-    # 默认计划: 金币够就直接开工第 3 座塔（火箭发射台）
+    # 默认计划: 金币够就直接开工第 3 座塔（加特林）
     commands, _ = decide(payload)
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": sites[2].x, "y": sites[2].y}],
-        "name": ROCKET,
+        "name": GATLING,
     }
 
     # 计划只要求 2 座塔: 不再开工第 3 座
@@ -1737,7 +1742,7 @@ def test_llm_plan_defend_side_builds_tower_on_that_side(
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 9, "y": 23}],
-        "name": GATLING,
+        "name": ROCKET,
     }
 
 
@@ -1759,7 +1764,7 @@ def _two_towers_payload(payload_factory, role_factory, gold: int) -> dict:
         gold=gold,
         roles=[
             role_factory(10010, WORKER, 9, 22, backPackCapability=100),
-            role_factory(10020, GATLING, sites[0].x, sites[0].y, attackRange=4),
+            role_factory(10020, ROCKET, sites[0].x, sites[0].y, attackRange=10),
             role_factory(10030, RAILGUN, sites[1].x, sites[1].y, attackRange=6),
         ],
     )
@@ -1780,7 +1785,7 @@ def test_gold_flush_overrides_tower_cap(payload_factory, role_factory):
     assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": sites[2].x, "y": sites[2].y}],
-        "name": ROCKET,
+        "name": GATLING,
     }
 
 
@@ -1795,6 +1800,63 @@ def test_gold_flush_keeps_plan_cap_below_threshold(
 
     commands, _ = decide(payload)
     assert "10010" not in commands
+
+
+# === 开局建造节奏与塔位提示（issue #26） ===
+
+
+def test_opening_round_keeps_second_tower_despite_plan(
+    payload_factory, role_factory,
+):
+    """开局两回合内塔数有硬下限：计划把塔数压到 1 座也照样补第 2 座
+
+    回归：复盘里"首日 3 回合只落地 1 座塔、R2 整回合零建造"，
+    第 2 座塔拖到 R3 才开工，而同局敌方是单回合双建，火力成型快得多。
+    """
+    sites = _calc_tower_sites(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=2,
+        gold=WEAPON_BUILD_COST + 5,  # 不够熔断线，但够再建一座塔
+        roles=[
+            role_factory(10010, WORKER, 9, 22, backPackCapability=100),
+            role_factory(10020, ROCKET, sites[0].x, sites[0].y, attackRange=10),
+        ],
+    )
+    payload["llmResp"] = "PLAN: tower=1"
+
+    commands, _ = decide(payload)
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": sites[1].x, "y": sites[1].y}],
+        "name": RAILGUN,
+    }
+
+    # 过了开局两回合后仍然听计划的：塔数压在 1 座就不再开工（留钱买升级券）
+    payload["roundNo"] = 3
+    commands, _ = decide(payload)
+    assert "10010" not in commands
+
+
+def test_strategy_prompt_includes_tower_sites(payload_factory, monkeypatch):
+    """prompt 摊开塔位坐标与对应的武器类型
+
+    复盘建议"prompt 注入最近可建位坐标，消除'先移动、下回合再建'的一回合延迟"，
+    同时让"说建哪座塔"与"建的是哪种武器"对得上（塔型由 `TOWER_LOADOUT` 决定，
+    不受 LLM 文字左右，只会照实告知）。
+    """
+    monkeypatch.setattr(brain, "LLM_PROMPT_ENABLED", True)
+    prompt = _generate_strategy_prompt(Turn.load(payload_factory(round_no=1)), {})
+
+    # 默认基地 (10,24) 的三座塔位，武器按射程优先的顺序绑定
+    assert "rocket(12,23)" in prompt
+    assert "railgun(10,22)" in prompt
+    assert "gatling(9,23)" in prompt
+
+
+def test_plan_summary_reports_no_tower_site_without_station(payload_factory):
+    """没有基地时塔位清单给出说明而不是崩溃"""
+    turn = Turn.load(payload_factory(station=None))
+    assert "暂无可用塔位" in _plan_summary(turn, LLM_PLAN_DEFAULT)
 
 
 # === 防守方围墙配额（issue #22） ===
