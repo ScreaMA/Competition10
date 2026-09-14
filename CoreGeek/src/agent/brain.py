@@ -1883,6 +1883,10 @@ def _pioneer_day_logic(
     文件）或已经占满 `TASK_TIMEOUT_ROUNDS` 个回合时，`_task_abandoned` 判定放弃，
     开拓者不再守任务点、`_sandbox_command` 也不再下发读文件命令，直接回基地
     跟队——离开任务点周围一格会让判题系统强制结束这个任务。
+    止损前先把手里攒出来的答卷交掉、止损后转去另一个还开着的任务点
+    （见下面的止损分支）：复盘里"答案到手却跟着任务一起被放弃"（PK591011 的
+    R13、PK591537 的 R14）与"任务2 全程可接却没人接"（PK591595 的 R17/R18）
+    都是这一步白丢的分。
 
     任务规则（任务书5章）:
         - 开拓者需在己方任务点周围一格内领取任务
@@ -1912,6 +1916,36 @@ def _pioneer_day_logic(
     #    一格会让判题系统强制结束这个任务，开拓者因此回到战斗调度，
     #    而不是被一个永远拿不到答案的任务占死（S1）
     if turn.phase_task and _task_abandoned(turn):
+        task_pos = _nearest_task_position(turn, pioneer.pos)
+        watch = _TASK_WATCH
+        # 止损归止损，手里已经攒出来的答卷先交掉（S1）：LLM 直接给的答案
+        # （`_llm_direct_answer`）与答案缓存都不依赖沙盒，而"放弃"这一步排在
+        # "提交"前面——答案到手的当回合正好撞上止损线时（复盘 PK591011 的
+        # R13、PK591537 的 R14 都是沙盒卡住后被直接放弃），这份答案就跟着
+        # 任务一起被丢掉，白丢一次得分机会。提交次数照旧受 `TASK_SUBMIT_LIMIT`
+        # 约束（`watch.submits` 已经超线时不再交），不会把提交额度刷爆；
+        # 夜里不交卷（开拓者要操控武器，任务也已经被强制结束）
+        if (
+            task_pos is not None
+            and turn.is_day
+            and watch is not None
+            and watch.submits <= TASK_SUBMIT_LIMIT
+            and _task_distance(turn, pioneer.pos, task_pos) <= 1
+        ):
+            answer = _task_answer(turn) or _cached_answer(turn)
+            if answer is not None:
+                commands[pioneer.unit_id] = submit_answer_command(answer)
+                return
+        # 止损之后开拓者也不是就此收工：另一个还开着的任务点照样去领
+        # （S2，复盘里任务2 全程"可接/15回合"却没人接——被止损的开拓者直接
+        # 回基地跟队，剩下的白天再没碰过任务）。刚放弃的这个点要排除掉，
+        # 回头再接上等于没止损（看门狗按任务标识计数，同一份沙盒还会照旧卡住）
+        if (
+            task_pos is not None
+            and _task_distance(turn, pioneer.pos, task_pos) <= 1
+            and _accept_task(turn, pioneer, claimed, commands, skip=task_pos)
+        ):
+            return
         _pioneer_follow_weapons(turn, pioneer, wall_order, claimed, commands)
         return
 
@@ -1939,21 +1973,12 @@ def _pioneer_day_logic(
     # 2. 有可接取的任务: 按优先级依次尝试领取
     # 之前的实现只试最优先的那个任务点：那一格被挡住/绕不过去时开拓者就整回合
     # 放弃任务、跑去跟随武器塔，两个任务点（合计160分+160金币）都会白白过期。
-    valid_tasks = [task for task in turn.player_tasks if task.is_valid]
-    if valid_tasks:
-        ordered = sorted(valid_tasks, key=lambda task: (
-            task.timeout_rounds if task.timeout_rounds > 0 else TASK_TIMEOUT_UNKNOWN,
-            distance(pioneer.pos, task.task_position),
-            task.task_position.x,
-            task.task_position.y,
-        ))
-        for task in ordered:
-            if _head_to_task(turn, pioneer, task.task_position, claimed, commands):
-                return
+    if any(task.is_valid for task in turn.player_tasks):
         # 这一步走不动时留在原地等下一个回合（同伴让开、路就通了），
         # 而不是掉头回基地跟随武器塔——那等于往相反方向走，下一回合再往外走，
         # 来回打转永远到不了任务点（复盘里的"开拓者整局在基地附近徘徊、
         # 从未靠近任务点"，两处任务点合计160分+160金币一直没人领）
+        _accept_task(turn, pioneer, claimed, commands)
         return
 
     # 3. 任务点都在冷却中: 白天守在下一个会开放的任务点旁等它开放，天黑前再退回基地
@@ -2175,6 +2200,52 @@ def _head_to_task(
 
     commands[pioneer.unit_id] = move_command(step)
     return True
+
+
+def _accept_task(
+    turn: Turn,
+    pioneer: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    skip: Pos | None = None,
+) -> bool:
+    """按优先级依次尝试领取可接取的任务点
+
+    顺序是"临期优先、其次就近"（`timeoutRounds` 小的先做）：单个任务只有
+    15 回合时限（任务书5章），先去快过期的那个，两个任务的分数才都有机会
+    拿到手；走不通的那个退而试下一个，不会整局放弃任务。
+
+    `skip` 是"刚被看门狗放弃的那个任务点"（止损分支传入）：止损之后开拓者
+    回头再把同一个任务点接上等于没止损——看门狗按任务标识计数，同一个任务的
+    沙盒还会照旧卡住，那十来个回合等于白等第二遍。任务点2占两格（`_task_cells_of`），
+    所以按 `_task_distance` 判定"是不是同一个任务点"，而不是逐格比对坐标。
+
+    参数:
+        turn: 当前回合信息
+        pioneer: 当前决策的开拓者
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        skip: 不要接的任务点（刚放弃的那个）；没有时传 None
+
+    返回:
+        True 表示本回合已下达指令（领取或走向某个任务点）
+    """
+    ordered = sorted(turn.player_tasks, key=lambda task: (
+        task.timeout_rounds if task.timeout_rounds > 0 else TASK_TIMEOUT_UNKNOWN,
+        distance(pioneer.pos, task.task_position),
+        task.task_position.x,
+        task.task_position.y,
+    ))
+    for task in ordered:
+        if not task.is_valid:
+            continue
+        if skip is not None and _task_distance(
+            turn, task.task_position, skip,
+        ) <= 1:
+            continue
+        if _head_to_task(turn, pioneer, task.task_position, claimed, commands):
+            return True
+    return False
 
 
 def _task_point_cells(turn: Turn) -> tuple[Pos, ...]:

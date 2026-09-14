@@ -3477,6 +3477,81 @@ def test_task_loop_breaker_releases_pioneer_after_repeated_sandbox_output(
     assert sandbox_command(payload) == ""
 
 
+def test_abandoned_task_still_submits_the_answer_in_hand(
+    payload_factory, role_factory,
+):
+    """止损回合手里的答卷先交掉：答案与止损线撞在同一回合时不再白丢
+
+    回归：LLM 直接给的答案（`_llm_direct_answer`）与答案缓存都不依赖沙盒，
+    而"放弃"这一步排在"提交"前面——取数连败到线的那个回合答案才到手时，
+    这份答案就跟着任务一起被丢掉，一次提交机会都没有（PK591011 的 R13、
+    PK591537 的 R14 都是沙盒卡死后被直接放弃，任务分全丢）。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+
+    for offset in range(TASK_API_FAIL_LIMIT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task,
+            f"{TASK_API_FAIL_MARKER} http://localhost:8899/guess{offset}"
+            " HTTPError 404\n",
+        )
+        if offset == TASK_API_FAIL_LIMIT - 1:
+            payload["llmResp"] = "ANSWER: 北京故宫"  # 止损这一回合答案才到
+        commands, _ = decide(payload)
+
+        if offset < TASK_API_FAIL_LIMIT - 1:
+            # 还没到止损线、手里也没有答卷：继续守在任务点旁等答案
+            assert commands.get("10011", {}).get("action") != "submitAnswer"
+            continue
+        # 到线这一回合：先把这份答案交掉（放弃归放弃，答卷不能跟着一起丢）
+        assert commands["10011"] == {
+            "action": "submitAnswer", "taskAnswer": "北京故宫",
+        }
+
+
+def test_abandoned_task_hands_the_pioneer_to_the_other_task_point(
+    payload_factory, role_factory,
+):
+    """止损之后转去另一个还开着的任务点，而不是直接回基地跟队
+
+    回归：PK591595 里任务1 在 R15 被放弃后开拓者一路回基地，任务2 全程
+    "可接/15回合"却再没人接（PK591537 的 R15-R18 同样）。止损放弃的只是
+    这一个任务点，另一个点还开着就接着做——但刚放弃的那个点不能回头再接，
+    看门狗按任务标识计数，同一个任务的沙盒还会照旧卡住。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    abandoned, other = Pos(14, 14), Pos(20, 14)
+
+    for offset in range(TASK_LOOP_LIMIT):
+        payload = payload_factory(
+            round_no=11 + offset,
+            gold=0,
+            roles=[
+                role_factory(10011, PIONEER, 14, 14, backPackCapability=40),
+                role_factory(10020, GATLING, 9, 24, attackRange=4),
+            ],
+            tasks=[(14, 14), (20, 14, {"taskType": "自进化类2"})],
+            phase_task=phase_task,
+        )
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task,
+            "# 自进化任务 A-1：查询北京文化遗产\n## 任务背景\n"
+            "请阅读task_1_beijing.md，获取任务信息\n",
+        )
+        commands, _ = decide(payload)
+
+    # 止损这一回合：朝另一个任务点走（武器塔在 (9,24)，回基地是相反方向）
+    assert commands["10011"]["action"] == "move"
+    step = Pos(
+        commands["10011"]["targetPos"][0]["x"],
+        commands["10011"]["targetPos"][0]["y"],
+    )
+    assert distance(step, other) < distance(abandoned, other)
+
+
 def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
     payload_factory, role_factory,
 ):
