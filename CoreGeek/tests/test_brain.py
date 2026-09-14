@@ -3682,6 +3682,18 @@ def test_task_prompt_carries_task_and_sandbox_evidence(payload_factory, role_fac
     assert "localhost:8899" in prompt  # 沙盒证据要带上，LLM 才看得到接口
 
 
+def test_task_prompt_tells_llm_to_authenticate(payload_factory, role_factory):
+    """喂给 LLM 的约束里写明鉴权（S3）：401/403 是头没带对，不是答案"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京文化遗产"
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    _, prompt = decide(payload)
+
+    assert "Authorization" in prompt  # 文档里给的头长什么样
+    assert "401" in prompt  # 别把鉴权失败的响应当答案交上去
+
+
 def test_task_prompt_stops_after_limit(payload_factory, role_factory):
     """同一个任务问满次数后不再继续问（别把任务窗都耗在提问上）"""
     brain._TASK_LLM_STATE.clear()
@@ -4730,7 +4742,7 @@ def test_executor_api_fail_reports_status_and_body(capsys):
     """
     command = _task_executor("task_1_beijing.md")
     script = command.split("\n", 1)[1]
-    match = re.search(r"def fetch\(url\):.*?(?=\ndef )", script, re.S)
+    match = re.search(r"def fetch\(url, headers\):.*?(?=\ndef )", script, re.S)
     assert match
 
     class HTTPError(Exception):
@@ -4760,7 +4772,7 @@ def test_executor_api_fail_reports_status_and_body(capsys):
         "urllib": _Urllib,
     }
     exec(match.group(0), namespace)  # noqa: S102
-    assert namespace["fetch"]("http://localhost:8899/weather") == ""
+    assert namespace["fetch"]("http://localhost:8899/weather", {"Accept": "*/*"}) == ""
 
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
@@ -4773,7 +4785,7 @@ def test_executor_api_fail_without_status_keeps_one_line(capsys):
     """连不上（无状态码）时诊断行仍然只有一行，且不带多余空格"""
     command = _task_executor("task_1_beijing.md")
     script = command.split("\n", 1)[1]
-    match = re.search(r"def fetch\(url\):.*?(?=\ndef )", script, re.S)
+    match = re.search(r"def fetch\(url, headers\):.*?(?=\ndef )", script, re.S)
     assert match
 
     class URLError(Exception):
@@ -4801,6 +4813,110 @@ def test_executor_api_fail_without_status_keeps_one_line(capsys):
     }
     exec(match.group(0), namespace)  # noqa: S102
 
-    assert namespace["fetch"]("http://localhost:8899/x") == ""
+    assert namespace["fetch"]("http://localhost:8899/x", {"Accept": "*/*"}) == ""
     lines = capsys.readouterr().out.splitlines()
     assert lines == [f"{brain.TASK_API_FAIL_MARKER} http://localhost:8899/x URLError"]
+
+
+def _executor_auth():
+    """从生成的沙盒脚本里取出鉴权部分（`api_key` + `request_headers`）"""
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    key_fn = re.search(r"def api_key\(text\):.*?(?=\ndef request_headers\()", script, re.S)
+    head_fn = re.search(r"def request_headers\(key\):.*?(?=\ndef find_files\()", script, re.S)
+    assert key_fn and head_fn
+    namespace: dict = {
+        "re": re,
+        "KEY_PATTERNS": brain.TASK_API_KEY_PATTERNS,
+        "KEY_MIN": brain.TASK_API_KEY_MIN_LEN,
+        "KEY_PLACEHOLDERS": brain.TASK_API_KEY_PLACEHOLDERS,
+        "AUTH_HEADER": brain.TASK_API_AUTH_HEADER,
+        "KEY_HEADER": brain.TASK_API_KEY_HEADER,
+        "BEARER": brain.TASK_API_BEARER,
+    }
+    exec(key_fn.group(0) + head_fn.group(0), namespace)  # noqa: S102
+    return namespace["api_key"], namespace["request_headers"]
+
+
+def test_executor_api_key_follows_document_headers():
+    """接口文档里写明的 Key 要抠出来随请求发（S3，PK590918/PK590917 的 R16 401）
+
+    复盘里我方请求只带 `Accept`，接口回
+    `[APIFAIL] ... HTTPError 401 => missing 'Authorization' header`，同一回合
+    对手已经带着 Bearer 取到数。文档给出 Key 的写法各家不同，几种常见写法都要认。
+    """
+    key, _ = _executor_auth()
+
+    assert key("请求头：Authorization: Bearer sk-abc123456") == "sk-abc123456"
+    assert key("X-API-Key: 8f3c1d9e2b") == "8f3c1d9e2b"
+    assert key("api_key=token-abcdef") == "token-abcdef"
+    assert key("| API Key | abc123456 | 用于鉴权 |") == "abc123456"
+
+
+def test_executor_api_key_skips_document_prose():
+    """文档里的占位写法与行文不能当成 Key（发一个假 Key 只会再撞一次 401）"""
+    key, _ = _executor_auth()
+
+    assert key("Authorization: Bearer YOUR_API_KEY") == ""
+    assert key("| API Key | required |") == ""
+    assert key("Authorization：<你的 API Key>") == ""
+    # `Bearer` 后面直接换行、下一行是地址：那不是 Key
+    assert key("Authorization: Bearer\nhttp://localhost:8899/x") == ""
+    assert key("请阅读 task_1_beijing.md，获取任务信息") == ""
+
+
+def test_executor_request_headers_add_bearer_and_key():
+    """拿到 Key 时两个头一起带（多带一个不影响无鉴权接口，少带一个必然 401）"""
+    _, headers = _executor_auth()
+
+    assert headers("") == {"Accept": "*/*"}
+    got = headers("sk-abc123456")
+    assert got[brain.TASK_API_AUTH_HEADER] == f"{brain.TASK_API_BEARER}sk-abc123456"
+    assert got[brain.TASK_API_KEY_HEADER] == "sk-abc123456"
+
+
+def test_executor_fetch_sends_the_headers_it_gets():
+    """`fetch` 必须把请求头带进 `urllib.request.Request`（S3 的最后一环）"""
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]
+    match = re.search(r"def fetch\(url, headers\):.*?(?=\ndef )", script, re.S)
+    assert match
+
+    seen: dict = {}
+
+    class _Response:
+        def read(self):
+            return b'{"city":"beijing"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _Request:
+        def __init__(self, url, headers=None):
+            seen["headers"] = headers
+
+    def _urlopen(request, timeout=None):
+        return _Response()
+
+    class _RequestModule:
+        Request = _Request
+        urlopen = staticmethod(_urlopen)
+
+    class _Urllib:
+        request = _RequestModule
+
+    namespace = {
+        "FAIL": brain.TASK_API_FAIL_MARKER,
+        "TIMEOUT": brain.TASK_API_TIMEOUT,
+        "BODY_LIMIT": brain.TASK_API_BODY_LIMIT,
+        "urllib": _Urllib,
+    }
+    exec(match.group(0), namespace)  # noqa: S102
+
+    headers = {"Accept": "*/*", "Authorization": "Bearer sk-abc123456"}
+    body = namespace["fetch"]("http://localhost:8899/weather", headers)
+    assert body == '{"city":"beijing"}'
+    assert seen["headers"] == headers

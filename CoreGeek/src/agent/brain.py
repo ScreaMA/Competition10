@@ -358,7 +358,7 @@ TASK_SOLUTION_MARKER = "[SOLUTION]"  # 答案段落开头，后跟任务文件�
 TASK_SOLUTION_END = "[/SOLUTION]"
 TASK_DATA_MARKER = "[API]"  # 真实取数的证据：只有请求成功才会打印
 TASK_API_FAIL_MARKER = "[APIFAIL]"  # 取数失败也留一行诊断（URL + 异常类型）
-TASK_SCAN_MARKER = "[SCAN]"  # 沙盒里找到多少任务文件/接口文档/可用地址
+TASK_SCAN_MARKER = "[SCAN]"  # 找到多少任务文件/接口文档/可用地址 + 有没有抠到鉴权 Key
 TASK_ANSWER_MIN_LEN = 4  # 答案最短长度（任务原文动辄几千字，这条挡住空答）
 TASK_ECHO_RUN = r"[一-鿿]{6,}"  # 任务描述里的中文长句（复读判定用）
 TASK_API_DEFAULT = "http://localhost:8899"  # 沙盒内的本地接口
@@ -371,6 +371,33 @@ TASK_API_BODY_LIMIT = 400  # 单个响应体最多带回的字符数
 TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一）
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
+# 接口鉴权（S3，复盘 PK590918/PK590917）：接口文档的样例里写着该带哪个头，而
+# 执行器一直只发 `Accept`，R16 的 `[APIFAIL] ... HTTPError 401 => missing
+# 'Authorization' header` 就是这么来的——同一回合对手已经带着 Bearer 取到数
+# （`__API status=OK ... auth=Bearer`）。文档里 Key 的写法各家不同
+# （`Authorization: Bearer sk-xxx`、`X-API-Key: xxx`、`api_key=xxx`、表格里的
+# `| API Key | xxx |`），这里按几种常见写法把 Key 抠出来随请求一起发；抠不到
+# 就照旧裸请求——多带一个头不影响本就无需鉴权的接口，少带一个头则必然 401。
+TASK_API_KEY_MIN_LEN = 6  # Key 至少这么长：更短的串多半是行文里的词，不是 Key
+TASK_API_KEY_PATTERNS = (
+    # `Authorization: Bearer <key>` / `Authorization=<key>`（`Bearer` 可有可无）
+    r"authorization[\"']?\s*[:=：]\s*[\"'`\s]*(?:bearer\s+)?"
+    r"([A-Za-z0-9._~+/=\-]{%d,})" % TASK_API_KEY_MIN_LEN,
+    # `X-API-Key: <key>` / `api_key=<key>` / `token：<key>` / 表格里的 `| API Key | <key> |`
+    r"(?:x-api-key|api[-_ ]?key|apikey|access[-_ ]?token|token)[\"']?\s*[:=：|]\s*[\"'`\s]*"
+    r"([A-Za-z0-9._~+/=\-]{%d,})" % TASK_API_KEY_MIN_LEN,
+)
+# 文档里的占位写法（`Authorization: Bearer <你的 API Key>` 这类），抠出来也不是 Key；
+# 后半列是表格里常见的一格说明文字，别把它当成 Key 发出去
+TASK_API_KEY_PLACEHOLDERS = frozenset({
+    "your_api_key", "your-api-key", "your_apikey", "yourkey", "your_key",
+    "api_key", "apikey", "api-key", "key", "token", "access_token",
+    "xxx", "xxxx", "xxxxxx", "placeholder", "example",
+    "required", "optional", "string", "header", "bearer",
+})
+TASK_API_AUTH_HEADER = "Authorization"  # 文档写 Bearer 的那一种（对手用的也是它）
+TASK_API_KEY_HEADER = "X-API-Key"  # 另一种常见写法，两个一起带上
+TASK_API_BEARER = "Bearer "
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
 # 找接口文档时额外跳过的系统文档树（S2）：执行器要按"读文档 -> 拼地址"取数，
 # 而全盘捞回来的文档里最先命中的往往是库自带的说明（复盘 PK590252 的 R14/R16
@@ -3322,6 +3349,8 @@ def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
         evidence[:TASK_LLM_EVIDENCE_LIMIT],
         "",
         "约束：沙盒无法访问外网，本地接口在 http://localhost:8899；",
+        "接口要鉴权时，按接口文档里的写法带上请求头（如 Authorization: Bearer，"
+        "Key 就在文档里）；返回 401/403 说明头没带对，别把错误信息当答案。",
         "一条命令限时 15 秒，一回合只能发一条命令，命令的 stdout 会原样回到我这里。",
         "请只回一行，二选一：",
         "CMD: <一条能在沙盒里直接跑出答案的 shell 命令，只输出答案本身>",
@@ -3556,6 +3585,12 @@ def _task_executor(task_path: str) -> str:
         .replace("__SCAN__", repr(TASK_SCAN_MARKER))
         .replace("__DOC__", repr(TASK_DOC_MARKER))
         .replace("__TEXT_HINT__", str(TASK_TEXT_HINT))
+        .replace("__KEY_PATTERNS__", repr(TASK_API_KEY_PATTERNS))
+        .replace("__KEY_MIN__", str(TASK_API_KEY_MIN_LEN))
+        .replace("__KEY_PLACEHOLDERS__", repr(TASK_API_KEY_PLACEHOLDERS))
+        .replace("__AUTH_HEADER__", repr(TASK_API_AUTH_HEADER))
+        .replace("__KEY_HEADER__", repr(TASK_API_KEY_HEADER))
+        .replace("__BEARER__", repr(TASK_API_BEARER))
     )
     # 沙盒的解释器叫 python3 或 python，挑一个能用的（挑不到时脚本不会执行，
     # 答案区为空 -> 这一回合不提交，下一回合重来）。
@@ -3599,6 +3634,12 @@ FAIL = __FAIL__
 SCAN = __SCAN__
 DOC = __DOC__
 TEXT_HINT = __TEXT_HINT__
+KEY_PATTERNS = __KEY_PATTERNS__
+KEY_MIN = __KEY_MIN__
+KEY_PLACEHOLDERS = __KEY_PLACEHOLDERS__
+AUTH_HEADER = __AUTH_HEADER__
+KEY_HEADER = __KEY_HEADER__
+BEARER = __BEARER__
 SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
 
 
@@ -3611,14 +3652,17 @@ def read(path):
         return ""
 
 
-def fetch(url):
+def fetch(url, headers):
     """调用接口并把响应体截断返回（失败时打一行诊断，绝不抛异常打断整条命令）
 
     失败诊断要留在输出里：复盘里沙盒"执行了但没答案"时，日志上看不到任何
     原因（旧实现把异常吞掉、命令又带 `2>/dev/null`），只能靠猜。
+
+    headers 由 `request_headers` 按文档里抠出来的 Key 拼好（S3）：鉴权头是
+    401 与 200 之间唯一的差别。
     """
     try:
-        request = urllib.request.Request(url, headers={"Accept": "*/*"})
+        request = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             return response.read().decode("utf-8", "replace").strip()[:BODY_LIMIT]
     except Exception as exc:
@@ -3640,6 +3684,40 @@ def fetch(url):
             line += " => " + detail[:BODY_LIMIT]
         print(FAIL, line)
         return ""
+
+
+def api_key(text):
+    """文档里写明的接口 Key（没写、或只写了占位符时返回空串）
+
+    接口文档的样例里通常直接给出该带的头（`Authorization: Bearer sk-xxx`、
+    `X-API-Key: xxx`、`api_key=xxx`，或表格里的 `| API Key | xxx |`），照抄
+    下来就能过鉴权（S3，复盘 PK590918/PK590917 的接口一直 401：`missing
+    'Authorization' header`）。命中第一条能过体检的值就返回；一条都挑不出来
+    时返回空串，调用方照旧裸请求。
+    """
+    for pattern in KEY_PATTERNS:
+        for match in re.finditer(pattern, text, re.I):
+            value = match.group(1).strip("`\\\"'.,")
+            if len(value) < KEY_MIN or len(set(value)) < 3:
+                continue  # 太短，或 `xxxxxx` 这类占位，都不是 Key
+            if value.lower() in KEY_PLACEHOLDERS or value.lower().startswith("http"):
+                continue  # 文档里的 `Authorization: Bearer YOUR_API_KEY`／换行后接着的地址
+            return value
+    return ""
+
+
+def request_headers(key):
+    """请求头：有 Key 就同时带上 Bearer 与 X-API-Key（S3）
+
+    两种写法在鉴权接口里都常见，文档也未必把两种都写上；多带一个对方不认识
+    的头不影响正常请求，而一条命令的请求名额有限（`TASK_API_MAX_CALLS`），
+    不拿它去试第二种写法——试错的那次注定 401，还得再花一次请求补回来。
+    """
+    headers = {"Accept": "*/*"}
+    if key:
+        headers[AUTH_HEADER] = BEARER + key
+        headers[KEY_HEADER] = key
+    return headers
 
 
 def find_files(patterns, limit, roots=ROOTS, prune=PRUNE):
@@ -3860,7 +3938,13 @@ if not doc_files:
     doc_files = find_files(DOC_NAMES, 6, ("/",), DOC_PRUNE)
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
-print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
+# 鉴权 Key 先从接口文档里找，找不到再退到任务文件（S3）：文档写的是"该带哪个
+# 头"，偶尔也有把 Key 直接写在题面里的。两处都没有时 headers 里只剩 Accept，
+# 照旧裸请求——不发一个没有 Key 的 Authorization 头。
+key = api_key(doc_text) or api_key("\\n".join(read(path) for path in files[:SOLVE_MAX]))
+headers = request_headers(key)
+print(SCAN, "tasks=%d docs=%d urls=%d key=%s" % (
+    len(files), len(doc_files), len(urls), "yes" if key else "no"))
 # 接口文档的开头各打一行（DOC）：文档页被当成"取数结果"取回来时（`/docs`
 # 这类地址返回的就是文档本身），决策侧靠这些指纹认出"答案就是文档原文"
 # （见 `_task_text_answer`）。指纹必须排在 `[SOLUTION]` 段之前，取数失败时
@@ -3881,7 +3965,7 @@ for path in files[:SOLVE_MAX]:
         if calls >= MAX_CALLS or time.time() > deadline:
             break
         calls += 1
-        body = fetch(url)
+        body = fetch(url, headers)
         if body:
             print(DATA, url, "=>", len(body))
             bodies.append(body)
