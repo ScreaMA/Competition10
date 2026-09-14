@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -3591,6 +3592,52 @@ def test_task_survives_scan_output_that_never_calls_the_api(
                 assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
 
 
+def test_llm_command_round_is_not_a_read_file_loop(
+    payload_factory, role_factory,
+):
+    """上一回合跑的是 LLM 给的命令时，不按"读文件死循环"熔断任务（S1）
+
+    回归：PK591783 的 R13 与 PK591806 的 R11–R17。沙盒跑的是 LLM 给的一条
+    命令（`cat task_1_alpha.md` 走错路径、回读同一份文档），输出里自然没有
+    `[SCAN]`——那是"这一回合没派执行器去取数"，不是"读文件读不出新东西"。
+    旧看门狗把它归进读文件死循环：输出逐字相同，`repeats` 每回合累加，
+    接上任务后的第 3 个回合就熔断，`api=0` 恒 0 的任务连同这名劳动力一起
+    丢掉，执行器的取数链路一次都没轮上。这类回合该走取数连败线
+    （`TASK_API_FAIL_LIMIT`，比读文件循环线宽），LLM 的六次求助与执行器的
+    重试才有机会跑完。
+    """
+    phase_task = "请阅读task_1_alpha.md，获取任务信息"
+    token = _task_token(phase_task)
+    brain._TASK_LLM_STATE.clear()
+    brain._TASK_WATCH = None
+
+    for offset in range(TASK_LOOP_LIMIT + 1):
+        round_no = 11 + offset
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, round_no,
+        )
+        # LLM 给的命令走错了路径，每回合回读回来的都是同一行报错
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task, "cat: task_1_alpha.md: No such file or directory\n",
+        )
+        # 上一回合的沙盒跑的就是这条命令（`_llm_task_command` 记下的回合号）
+        brain._TASK_LLM_STATE[token] = {
+            "prompts": offset + 1, "pending_cmd": "", "cmd_round": round_no - 1,
+            "answer": "",
+        }
+
+        commands, _ = decide(payload)
+
+        assert brain._TASK_WATCH is not None
+        assert brain._TASK_WATCH.repeats < TASK_LOOP_LIMIT
+        assert sandbox_command(payload) != ""  # 任务还在做，没有被提前止损
+        command = commands.get("10011")
+        assert command is None or command["action"] == "move"
+        if command is not None and command["action"] == "move":
+            step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+            assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
+
+
 def test_scan_output_without_api_calls_counts_as_fetch_failure():
     """判据 3：`[SCAN]` 在、取数记录不在 = 取数失败；读到数就不算（S1）
 
@@ -4191,6 +4238,38 @@ def test_crlf_safe_command_leaves_other_commands_alone():
         "",
     ):
         assert brain._crlf_safe_command(command) == command, command
+
+
+def test_crlf_safe_command_completes_the_script_path_after_cd():
+    """“先 cd 再跑脚本”的命令也要归一化行尾（S2，PK591806 的 R14）
+
+    归一化的前置片段排在整条命令最前面，那时工作目录还没切过去：
+    `[ -f ./check ]` 判的是沙盒的工作目录（`/`），脚本明明在
+    `/tmp/selfEvolutionTask/1-x` 下，归一化静默跳过，`./check` 照旧以 CRLF
+    落地、只换来一行 `/bin/sh^M: bad interpreter`（一个任务回合白搭）。
+    """
+    wrapped = brain._crlf_safe_command("cd /tmp/selfEvolutionTask/1-x && ./check")
+    assert wrapped.startswith("CRLF_P='/tmp/selfEvolutionTask/1-x/check';")
+    assert "sed -i" in wrapped
+    assert wrapped.endswith("cd /tmp/selfEvolutionTask/1-x && ./check")
+
+
+def test_script_dir_only_follows_a_cd_before_the_script():
+    """只有脚本之前、且带命令分隔符的 `cd <目录>` 才用来补全路径
+
+    补出来的路径不存在时 `_crlf_safe_command` 的 `[ -f ]` 会把归一化跳过，
+    所以"补不出来"与"补错了"都不影响原命令照跑；但能补对的那几种要补对：
+    脚本之后的 `cd` 与它无关，绝对路径的脚本不需要补。
+    """
+    assert brain._script_dir("cd /tmp/selfEvolutionTask/1-x && ./check", "./check") == (
+        "/tmp/selfEvolutionTask/1-x/check"
+    )
+    assert brain._script_dir("cd /a && cd b && ./check", "./check") == "/a/b/check"
+    assert brain._script_dir("cd /a; ./check --round 3", "./check") == "/a/check"
+    assert brain._script_dir("./check && cd /tmp", "./check") == ""
+    assert brain._script_dir("/tmp/selfEvolutionTask/1-x/check.sh", "/tmp/x/check.sh") == ""
+    assert brain._script_dir("cd '/tmp/self evo' && ./check", "./check") == ""
+    assert brain._script_dir("", "") == ""
 
 
 def test_llm_check_command_reaches_sandbox_with_crlf_fix(
@@ -5468,3 +5547,120 @@ def test_executor_fetch_sends_the_headers_it_gets():
     body = namespace["fetch"]("http://localhost:8899/weather", headers)
     assert body == '{"city":"beijing"}'
     assert seen["headers"] == headers
+
+
+def _executor_fetch_loop():
+    """从生成的沙盒脚本里取出取数主循环（含“没有任务文件”时的那条兜底）"""
+    command = _task_executor("task_1_alpha.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(
+        r"\ndeadline = time\.time\(\) \+ TIME_BUDGET\n.*?(?=\nPYEOF)", script, re.S,
+    )
+    assert match
+    return match.group(0)
+
+
+def test_executor_calls_the_api_without_a_task_file(capsys):
+    """一份任务文件都没找到时，执行器照样把接口地址试一遍（S1，PK591783 的 R11–R12）
+
+    复盘里沙盒读到接口文档（`[SCAN] docs=2 urls=2 key=yes`）、`[exitCode:0]`
+    全都正常，可 `api=0` 且一行 `[APIFAIL]` 都没有——取数循环挂在"任务文件
+    列表"上，任务描述里的文件名与沙盒里的对不上时（`files` 为空）整段跳过，
+    这一回合就成了"执行器跑过了、却连一次请求都没发"。接口文档与本地接口
+    本来就在手里，没有任务文件也得试一遍：`[API]` / `[APIFAIL]` 是"读题之后
+    真的去调了 API"的唯一凭据，看门狗也靠它判断该走哪条止损线。
+    """
+    _, candidates = _executor_queries()
+    rotate = _executor_rotate()
+    asked: list[str] = []
+
+    class _Time:
+        """冻结时间：deadline 判定不参与这条测试"""
+
+        @staticmethod
+        def time():
+            return 0.0
+
+    def _fetch(url, headers):
+        asked.append(url)
+        return '{"city":"alpha"}'
+
+    namespace = {
+        "os": os,
+        "re": re,
+        "time": _Time,
+        "files": [],  # 沙盒里一份任务文件都没找到
+        "read": lambda path: "",
+        "rotate": rotate,
+        "candidates": candidates,
+        "fetch": _fetch,
+        "SOLVE_MAX": brain.TASK_SOLVE_MAX,
+        "KEEP": brain.TASK_API_KEEP,
+        "OFFSET": 5,
+        "MAX_CALLS": brain.TASK_API_MAX_CALLS,
+        "TIME_BUDGET": brain.TASK_API_TIME_BUDGET,
+        "DATA": TASK_DATA_MARKER,
+        "SOLUTION": TASK_SOLUTION_MARKER,
+        "SOLUTION_END": TASK_SOLUTION_END,
+        "TASK_PATH": "task_1_alpha.md",
+        "doc_text": "接口文档：GET http://localhost:8899/api/city",
+        "urls": ["http://localhost:8899/api/city"],
+    }
+    exec(_executor_fetch_loop(), namespace)  # noqa: S102
+
+    # 请求真的发出去了（复盘里 api=0 且没有 [APIFAIL]，等于一个回合白跑）
+    assert asked
+    assert asked[0].startswith(brain.TASK_API_DEFAULT)
+    # 取到的数据照样打进答案段，段名用任务描述里点名的那份文件：
+    # `_solution_answer` 按文件名认领本任务的答案，占位名会让这一份取数作废
+    out = capsys.readouterr().out
+    assert TASK_DATA_MARKER in out
+    assert f"{TASK_SOLUTION_MARKER}task_1_alpha.md" in out
+    assert TASK_SOLUTION_END in out
+
+
+def test_executor_without_task_file_keeps_a_usable_solution_name(capsys):
+    """任务描述里没点名文件时，答案段挂一个占位名而不是任务根目录的目录名
+
+    `_sandbox_command` 在探测次数用满后会把任务根目录（`/tmp/selfEvolutionTask`）
+    交给执行器；那份目录名不是文档，`_solution_answer` 会按"描述里没给文件名"
+    取第一段答案，所以段名是什么不影响取答案——但不能把目录名当成任务文件名
+    带出去（它会进答案缓存，见 `_remember_task_answers`）。
+    """
+    _, candidates = _executor_queries()
+    rotate = _executor_rotate()
+
+    class _Time:
+        @staticmethod
+        def time():
+            return 0.0
+
+    def _fetch(url, headers):
+        return '{"city":"alpha"}'
+
+    namespace = {
+        "os": os,
+        "re": re,
+        "time": _Time,
+        "files": [],
+        "read": lambda path: "",
+        "rotate": rotate,
+        "candidates": candidates,
+        "fetch": _fetch,
+        "SOLVE_MAX": brain.TASK_SOLVE_MAX,
+        "KEEP": brain.TASK_API_KEEP,
+        "OFFSET": 0,
+        "MAX_CALLS": brain.TASK_API_MAX_CALLS,
+        "TIME_BUDGET": brain.TASK_API_TIME_BUDGET,
+        "DATA": TASK_DATA_MARKER,
+        "SOLUTION": TASK_SOLUTION_MARKER,
+        "SOLUTION_END": TASK_SOLUTION_END,
+        "TASK_PATH": brain.TASK_ROOTS[0],
+        "doc_text": "",
+        "urls": [],
+    }
+    exec(_executor_fetch_loop(), namespace)  # noqa: S102
+
+    out = capsys.readouterr().out
+    assert f"{TASK_SOLUTION_MARKER}task\n" in out
+    assert brain.TASK_ROOTS[0] not in out.split(TASK_SOLUTION_MARKER)[1].split("\n")[0]

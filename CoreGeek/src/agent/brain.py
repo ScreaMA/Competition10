@@ -494,7 +494,8 @@ class TaskWatch:
         output: 当时那份属于本任务的沙盒输出（没有输出时为空串）
         rounds: 这个任务已经占用开拓者的回合数
         repeats: 当前这份输出已经连续出现了几次（沙盒真在取数的回合不累计，
-            见 `_task_fetch_failed`）
+            见 `_task_fetch_failed`；上一回合跑的是 LLM 给的命令时同样不累计，
+            见 `_llm_command_round`）
         probes: 到这个回合为止发出去的沙盒探测命令数（见 `TASK_PROBE_LIMIT`）
         submits: 到这个回合为止打算交上去的答卷数（见 `TASK_SUBMIT_LIMIT`）
         fails: 到这个回合为止连续取数全失败的回合数（见 `TASK_API_FAIL_LIMIT`）
@@ -3467,9 +3468,18 @@ def _watch_task(turn: Turn) -> None:
     # `api=0`，同样在第 3 个回合被熔断，重试与 LLM 兜底都没轮上。
     # 这两类都该归"取数连败"（`TASK_API_FAIL_LIMIT`）管：它比读文件循环线宽，
     # LLM 兜底（`TASK_LLM_MAX_PROMPTS`）才有机会把六次求助跑完。
+    # 上一回合跑的是 LLM 给的那条命令时同理（S1，复盘 PK591806 的 R11–R17）：
+    # 沙盒里跑的不是执行器，输出里当然没有 `[SCAN]`——那是"这一回合没派执行器
+    # 去取数"，不是"读文件读不出新东西"。按读文件死循环熔断的话，任务会在
+    # LLM 的六次求助还没跑完、执行器一次取数都没试过的时候就被放弃
+    # （PK591783 的 R13：`api=0` 恒 0 却已经 abandoned=yes，任务分与这名
+    # 劳动力一起丢掉）。这一回合照旧计入取数连败（`fails` 与输出无关），
+    # 由更宽的 `TASK_API_FAIL_LIMIT` 兜底，任务不会因此永远挂在任务点上。
     if not output:
         repeats = 0
     elif _task_fetch_failed(output):
+        repeats = 1
+    elif _llm_command_round(turn, previous.round_no):
         repeats = 1
     elif output == previous.output:
         repeats = previous.repeats + 1
@@ -3562,6 +3572,26 @@ def _task_llm_state(turn: Turn) -> dict[str, Any]:
         _task_token(turn.phase_task),
         {"prompts": 0, "pending_cmd": "", "cmd_round": 0, "answer": ""},
     )
+
+
+def _llm_command_round(turn: Turn, round_no: int) -> bool:
+    """`round_no` 那一回合的沙盒跑的是不是 LLM 给的那条命令（S1）
+
+    `_llm_task_command` 下发 `CMD:` 时把回合号记在任务状态里（`cmd_round`），
+    这里据此认出"上一回合的沙盒输出是那条命令的结果"。与执行器的输出相比，
+    它天然没有 `[SCAN]`——判据在 `_watch_task` 里用来把这类回合从"读文件
+    死循环"里摘出来（见那里的说明）。只读状态，不新建：没有求助记录的任务
+    不必因为看一眼多出一份空状态。
+    """
+    if not turn.phase_task:
+        return False
+    state = _TASK_LLM_STATE.get(_task_token(turn.phase_task))
+    if not state:
+        return False
+    # `cmd_round` 只在真的下发过命令时才非 0：回合号 0（还没记录）不算命中，
+    # 免得状态里的默认值把第一回合认成"跑过 LLM 的命令"
+    stamp = int(state.get("cmd_round") or 0)
+    return stamp > 0 and stamp == round_no
 
 
 def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
@@ -3725,13 +3755,40 @@ def _script_wrapper(token: str) -> bool:
     )
 
 
+def _script_path(token: str) -> bool:
+    """这个词看着是不是沙盒里的一个脚本（见 `_script_in_command`）
+
+    三件事: 带路径前缀（`./`、`../`、绝对路径）、不是沙盒自己的工具路径、
+    后缀在 `LLM_SCRIPT_EXTS` 里（`./check` 这类校验脚本没有后缀，所以空后缀也算）。
+    """
+    if not token.startswith(("./", "../", "/")):
+        return False
+    if token.startswith(LLM_SCRIPT_SYSTEM):
+        return False
+    if any(char in LLM_SCRIPT_BAD for char in token):
+        return False
+    return os.path.splitext(token)[1].lower() in LLM_SCRIPT_EXTS
+
+
+# 命令分段符：`a && b`、`a; b`、`a | b` 里的每一段都是一条独立的命令，脚本可能
+# 出现在任何一段的开头（`cd /tmp/selfEvolutionTask/1-x && ./check`）。
+LLM_COMMAND_SPLIT = re.compile(r"&&|\|\||;|\|")
+
+
 def _script_in_command(command: str) -> str:
     """命令里第一个被执行到的沙盒脚本（没有则返回空串）
 
-    跳过解释器/前缀命令与选项之后看第一个词：`./check`、`../check.sh`、
-    `/tmp/selfEvolutionTask/1-x/check.py` 是"跑沙盒里的一个脚本"，而归一化只对
-    脚本有意义——`cat ./task.md` 里的路径是数据文件（给取数结果做 sed 只会改坏
-    答案），`curl` 后面的地址同理，这些一概不碰。
+    跳过解释器/前缀命令与选项之后看每一段命令的第一个词：`./check`、
+    `../check.sh`、`/tmp/selfEvolutionTask/1-x/check.py` 是"跑沙盒里的一个脚本"，
+    而归一化只对脚本有意义——`cat ./task.md` 里的路径是数据文件（给取数结果做
+    sed 只会改坏答案），`curl` 后面的地址同理，这些一概不碰。
+
+    分段是必要的（S2，复盘 PK591806 的 R14）：LLM 给的命令常写成
+    `cd /tmp/selfEvolutionTask/1-x && ./check`，而 `cd` 既不是解释器也不是
+    脚本，旧实现盯着整条命令的第一个词看，脚本因此一次都没被认出来——`./check`
+    照旧以 CRLF 落地，只换来一行 `/bin/sh^M: bad interpreter`。每一段只看开头
+    那一个词（连同它前面的解释器/选项），`grep -o 'x' ./task.md` 这类"脚本路径
+    只是参数"的写法照旧不碰。
 
     参数:
         command: LLM 给的沙盒命令（单行）
@@ -3739,22 +3796,17 @@ def _script_in_command(command: str) -> str:
     返回:
         可以安全做行尾归一化的脚本路径；找不到时返回空串
     """
-    tokens = command.strip().split()
-    index = 0
-    while index < len(tokens) and _script_wrapper(tokens[index]):
-        index += 1
-    if index >= len(tokens):
-        return ""
-    token = tokens[index]
-    if not token.startswith(("./", "../", "/")):
-        return ""
-    if token.startswith(LLM_SCRIPT_SYSTEM):
-        return ""
-    if any(char in LLM_SCRIPT_BAD for char in token):
-        return ""
-    if os.path.splitext(token)[1].lower() not in LLM_SCRIPT_EXTS:
-        return ""
-    return token
+    for segment in LLM_COMMAND_SPLIT.split(command):
+        tokens = segment.strip().split()
+        index = 0
+        while index < len(tokens) and _script_wrapper(tokens[index]):
+            index += 1
+        if index >= len(tokens):
+            continue
+        token = tokens[index]
+        if _script_path(token):
+            return token
+    return ""
 
 
 def _crlf_safe_command(command: str) -> str:
@@ -3774,16 +3826,62 @@ def _crlf_safe_command(command: str) -> str:
     script = _script_in_command(command)
     if not script:
         return command
+    # 命令是“先 cd 再跑脚本”的写法时（`cd /tmp/selfEvolutionTask/1-x && ./check`），
+    # 前置片段排在整条命令最前面，那时工作目录还没切过去：`[ -f ./check ]` 判的
+    # 是沙盒的工作目录（`/`），脚本明明在，归一化却静默跳过，`./check` 照旧以
+    # CRLF 落地、只换来一行 `/bin/sh^M: bad interpreter`（S2，复盘 PK591806 的
+    # R14）。`_script_dir` 把脚本之前那个 `cd <目录>` 记下来，用它补全相对路径
+    # 再去判存在（见 `_script_dir`）。
+    path = _script_dir(command, script) or script
     # 正则里的 `\r` 不能直接写在 sed 表达式里（POSIX 没定义，个别 sed 当成
     # 字母 r，那样会把每行末尾的 r 都删掉、把脚本改坏），改用 printf 生成一个
     # 真正的回车字符拼进表达式。变量名带 `CRLF_` 前缀，避开命令自己可能用到的
     # 短名字（`P`、`CR` 这种在 LLM 给的命令里并不罕见）
     return (
-        f"CRLF_P='{script}'; CRLF_CR=$(printf '\\r'); "
+        f"CRLF_P='{path}'; CRLF_CR=$(printf '\\r'); "
         f"[ -f \"$CRLF_P\" ] && "
         f"sed -i \"s/$CRLF_CR\\$//\" \"$CRLF_P\" 2>/dev/null; "
         f"{command}"
     )
+
+
+# 命令里的 `cd <目录>`：目录参数只认不带引号的普通路径（带引号/变量的写法一律
+# 不解析，宁可少补一个路径也不猜错），后面必须跟着一个命令分隔符才作数——
+# `&&`、`;`、`||`、`|` 四种都算（见 `_script_dir`）。
+LLM_CD_PATTERN = re.compile(r"cd\s+([^\s;&|'\"`]+)\s*(?:&&|;|\|\||\|)")
+
+
+def _script_dir(command: str, script: str) -> str:
+    """把命令里的脚本路径补全成绝对路径（没有可用的 `cd` 时返回空串）
+
+    只看脚本出现之前的部分：脚本后面的 `cd` 跟这次调用没关系
+    （`./check && cd /tmp`）。连续多次 `cd` 按顺序拼接，相对路径接在上一段
+    后面（`cd /a && cd b && ./check` -> `/a/b/check`）；补出来的路径不存在时
+    `_crlf_safe_command` 的 `[ -f ]` 会把归一化跳过，行为与改造前一致。
+
+    参数:
+        command: LLM 给的沙盒命令（单行）
+        script: `_script_in_command` 认出来的脚本路径
+
+    返回:
+        脚本的绝对路径；补不出来时返回空串（调用方退回脚本原样）
+    """
+    if not script.startswith("./"):
+        return ""  # 已经是 `../x` 这类带前缀的写法，或本来就短，不补
+    at = command.find(script)
+    if at < 0:
+        return ""
+    folder = ""
+    for part in LLM_CD_PATTERN.findall(command[:at]):
+        if part.startswith("/"):
+            folder = part
+        elif folder:
+            folder = folder.rstrip("/") + "/" + part
+        else:
+            folder = part
+    if not folder:
+        return ""
+    return folder.rstrip("/") + "/" + script[2:]
 
 
 def _llm_task_command(turn: Turn) -> str:
@@ -4394,6 +4492,33 @@ for path in files[:SOLVE_MAX]:
     text = read(path)
     bodies = []
     for url in rotate(candidates(text, name, urls), KEEP, OFFSET):
+        if calls >= MAX_CALLS or time.time() > deadline:
+            break
+        calls += 1
+        body = fetch(url, headers)
+        if body:
+            print(DATA, url, "=>", len(body))
+            bodies.append(body)
+    if bodies:
+        solutions.append((name, bodies))
+
+# 一份任务文件都没找到时（`files` 为空：任务描述点名的文件名在沙盒里对不上，
+# 任务目录里也没有 task*/spec* 文档），上面的循环整段跳过，这一回合就成了
+# “执行器跑过了、却连一次请求都没发”：输出里 `[SCAN] tasks=0 ... api=0
+# fail=0` 全都正常，答案区却是空的——复盘 PK591684 的 R11-R13、PK591772 的
+# R12-R13 与 PK591783 的 R11-R12 都是这个形态，任务一路卡到止损，取数一次
+# 都没试过。接口文档（`urls`）与本地接口（`BASE`）本来就在手里，没有任务
+# 文件照样得把候选地址试一遍：`[API]` / `[APIFAIL]` 这两行是“读题之后真的
+# 去调了 API”的唯一凭据，也是看门狗判断该按哪条止损线走的依据
+# （见 `_task_fetch_failed` 的判据 3）。
+if not calls:
+    name = os.path.basename(TASK_PATH or "")
+    if not re.search(r"\\.(md|txt|json|csv|log)$", name, re.I):
+        # 任务描述里没点名文件时 `TASK_PATH` 可能是任务根目录：那不是一份任务
+        # 文件，答案段只能挂一个占位名（决策侧按“描述里没给文件名”取第一段）
+        name = "task"
+    bodies = []
+    for url in rotate(candidates(doc_text, "", urls), KEEP, OFFSET):
         if calls >= MAX_CALLS or time.time() > deadline:
             break
         calls += 1
