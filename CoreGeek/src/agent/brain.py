@@ -274,6 +274,13 @@ INCOME_MINES = (IRON_MINE, COPPER_MINE)
 # 铜矿没有这个风险；石材只作兜底。
 ECONOMY_MINE_ORDER = (COPPER_MINE, IRON_MINE, STONE_MINE)
 
+# 角色动作白名单（S2）：采集只有工人能做。开拓者拿到 collect 指令时判题系统
+# 直接回 `[COMMAND_ERROR] role 20011 (pioneer) wants collect, but only worker
+# can do this action`（PK590272 R15，当天 `fail=[20011:collect]` 连挂四个回合）
+# ——这条指令整回合作废，开拓者还被任务点拴着不能挪窝，任务与这名劳动力一起
+# 白搭。下发采集指令前一律过 `_can_collect`，开拓者只做任务与移动。
+COLLECT_ROLES = (WORKER,)
+
 # 任务点排序权重：报文缺少 timeoutRounds 时用最大值，不抢占"临期优先"
 TASK_TIMEOUT_UNKNOWN = 10 ** 9
 
@@ -349,6 +356,29 @@ TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一�
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
+
+# 沙盒里找文件的范围（S2）。旧实现一上来就 `os.walk("/")`，两个后果都出现在
+# 复盘里：PK590272 的 R12 首次扫描直接 `[TIMEOUT]`（15 秒限时被全盘 walk 吃掉），
+# 之后几回合回读回来的 `[SCAN] tasks=0 docs=6` 说明目录预算在系统目录上就用完了
+# ——目录按名字母序走，`/usr` 永远排在 `/tmp` 前面，任务文件一个都没扫到，
+# 读回来的反而是 `/usr/share/doc/uom-se-1.0.4/README.md` 这种无关系统文档。
+# 两处收口：
+#   1. 先扫 `SANDBOX_SCAN_ROOTS` 这几个"任务包该在的地方"（浅、快、命中率高），
+#      扫不到再退回根目录；
+#   2. 退回根目录时只走到 `SANDBOX_SCAN_MAXDEPTH` 层，并且不进 `TASK_EXEC_SKIP`
+#      里的操作系统目录树；接口文档只在任务目录里找（它跟任务文件在同一份
+#      任务包里），不再从 `/usr/share/doc` 的全盘文档里捞。
+SANDBOX_SCAN_ROOTS = (
+    "/tmp", "/var/tmp", "/root", "/home", "/opt", "/srv",
+    "/data", "/app", "/workspace", "/mnt", "/task", "/tasks",
+    "/usr/local",
+)
+SANDBOX_SCAN_MAXDEPTH = 3  # 相对扫描根目录的层数上限（深层系统文档一条都不进）
+TASK_EXEC_SKIP = (  # 退回根目录时不再进的操作系统目录树
+    "/usr/share", "/usr/lib", "/usr/include", "/usr/src",
+    "/lib", "/lib64", "/bin", "/sbin", "/boot", "/snap",
+    "/var/lib", "/var/cache", "/var/log", "/etc",
+)
 
 # 任务止损（S1）：自进化任务的闭环是"下发沙盒命令 -> 取数 -> submitAnswer"，
 # 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
@@ -466,6 +496,24 @@ LLM_PLAN_DEFAULT = LlmPlan()
 
 # 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
 TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
+
+# 不能当答案提交的文本特征（S1）：任务文件没读到、接口没调通时，沙盒的输出与
+# LLM 的回复都会带上这些字样。复盘 PK590276 的 R14 就是把沙盒的
+# `{"status":"error","message":"Endpoint not found: /tasks/task_1_beijing.md"}`
+# 原样 submitAnswer 交了上去——错误答案既拿不到分，又白耗一次任务冷却，
+# 而同一个任务在 R18 才刚读到正文。凡是要提交的候选答案都先过 `_bad_answer`，
+# 命中就这一回合不提交、继续等下一次沙盒输出。
+# 与 `TASK_ERROR_MARKERS` 分开：那一组判"这一份输出没读到文件"（用在整段沙盒
+# 输出上），这一组判"这段文本不可能是答案"（用在候选答案上）。
+TASK_BAD_ANSWER_PATTERNS = (
+    "no such file",           # 文件没读到
+    "permission denied",
+    "is a directory",
+    "endpoint not found",     # 接口没找到（R14 交上去的就是这一句）
+    "404",
+    "timeout",                # 沙盒超时（`[TIMEOUT]` / `TimeoutError`）
+    "traceback",              # 执行器自己崩了
+)
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -621,7 +669,7 @@ def _idle_gather(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> None:
-    """兜底：没有任何目标的角色就近采一铲矿
+    """兜底：没有任何目标的工人就近采一铲矿
 
     决策的各条分支都会尽量给角色安排动作，但任务点够不到、武器还没建成、
     地图上一座矿都采不了时，角色会整回合没有任何指令（复盘里的"角色原地
@@ -630,10 +678,11 @@ def _idle_gather(
 
     不打扰的情况:
         - 本回合已经有指令的角色（决策层已经给了更优先的动作）
-        - 任务进行中的开拓者：任务要求它留在任务点周围一格内，
-          任何移动都可能让任务强制结束
-        - 有任务可领的开拓者：接任务、交任务是主要得分来源，被兜底支去采矿
-          等于把开拓者从任务点上拽走（它的任务优先级最高，见 `_pioneer_day_logic`）
+        - 开拓者：采集是工人的专属动作（见 `COLLECT_ROLES`），它下 collect
+          会被判题系统驳回（PK590272 R12~R15 的 `fail=[20011:collect]`），
+          所以开拓者只走 `_pioneer_day_logic` 的任务与跟随分支——任务进行中
+          要留在任务点周围一格内（移动会让任务强制结束），有任务可领时接任务
+          才是主要得分来源，没任务时跟着武器塔待命
         - 黄昏（调用方不调用）：回防到武器旁待命比多采一铲矿更重要，
           武器要有角色操控才会开火
 
@@ -645,9 +694,7 @@ def _idle_gather(
     """
     if unit.unit_id in commands:
         return
-    if unit.kind == PIONEER and (
-        turn.phase_task or any(task.is_valid for task in turn.player_tasks)
-    ):
+    if not _can_collect(unit):
         return
     for mine_type in SELLABLE_MINES:
         if _go_mine(turn, unit, mine_type, claimed, commands):
@@ -1838,13 +1885,17 @@ def _task_wait_logic(
     自进化任务的答案要等下一回合的沙盒输出，而任务期间开拓者必须留在任务点
     周围一格内（离开会强制结束任务），于是它常常整回合什么都不做——复盘里
     "开拓者 20011 R11-R17 无任何指令、idle_man 升至 3"，一个可操控单位整段
-    白天白搭。这里给它安排两条就地能做的动作：
+    白天白搭。这里给它安排一个就地动作：
 
-        1. 身旁有矿就采一铲（采集不移动，任务照旧有效）
-        2. 否则在"仍然落在任务点周围一格内"的相邻格里挪一步，方向朝最近的
-           武器塔（不离开任务圈，顺带为夜晚操控武器省一段路）
+        在"仍然落在任务点周围一格内"的相邻格里挪一步，方向朝最近的武器塔
+        （不离开任务圈，顺带为夜晚操控武器省一段路）
 
-    两条都走不通时不下指令——原地待命比乱走安全（任务点的有效性只看距离），
+    原地采集不再是选项（S2）：开拓者下 collect 会被判题系统驳回——PK590272
+    里 R12~R15 连续四个回合 `fail=[20011:collect]`，R15 的
+    `[COMMAND_ERROR] role 20011 (pioneer) wants collect, but only worker can
+    do this action` 说得很清楚。驳回的指令整回合作废，开拓者白站一个回合。
+
+    挪不动时不下指令——原地待命比乱走安全（任务点的有效性只看距离），
     但只要有一件事可做，这名角色就不会再零指令空转。
 
     参数:
@@ -1854,16 +1905,7 @@ def _task_wait_logic(
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
     """
-    # 1. 旁边就有矿: 采一铲换资源（原地动作，不会离开任务圈）
-    if not pioneer.backpack_full:
-        for mine_type in SELLABLE_MINES:
-            mine = _adjacent_mine(turn, pioneer, mine_type)
-            if mine is not None and mine not in claimed:
-                commands[pioneer.unit_id] = collect_command(mine)
-                claimed.add(mine)
-                return
-
-    # 2. 没矿可采: 在任务圈内朝最近的武器塔挪一步
+    # 在任务圈内朝最近的武器塔挪一步（顺带为夜晚操控武器省一段路）
     weapons = turn.weapons()
     if not weapons:
         return
@@ -3145,6 +3187,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
     answer = str(_task_llm_state(turn).get("answer") or "").strip()
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
+    if _bad_answer(answer):
+        return None  # LLM 也有拿报错当答案的时候（S1：提交前一律过一遍校验）
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
     return answer
@@ -3161,7 +3205,9 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
     answer = region.strip()
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
-    if any(bad in answer for bad in TASK_ERROR_MARKERS):
+    # 这条路径把整段输出当答案，LLM 给的命令很可能自己也跑出了报错
+    # （S1：PK590276 R14 交上去的就是一条 `Endpoint not found`）
+    if _bad_answer(answer):
         return None
     if _task_echo(answer, turn.phase_task):
         return None
@@ -3230,6 +3276,10 @@ def _task_executor(task_path: str) -> str:
     所以取数脚本一次跑完：找任务文件与接口文档、按文档里的样例地址调用
     本地接口、把响应体打成 `[SOLUTION]` 段。
 
+    找文件的范围收在 `SANDBOX_SCAN_ROOTS`（先扫任务目录，再退回深度受限的
+    根目录，见那里的说明）：一上来就全盘 `os.walk("/")` 会把 15 秒限时耗光，
+    这是复盘里 `[TIMEOUT]` 与 `[SCAN] tasks=0 docs=6` 的成因（S2）。
+
     参数:
         task_path: 任务描述里点名的任务文件（沙盒路径或文件名）
 
@@ -3250,6 +3300,9 @@ def _task_executor(task_path: str) -> str:
         .replace("__DOC_NAMES__", repr(TASK_API_DOC_NAMES))
         .replace("__SUFFIXES__", repr(TASK_API_PATH_SUFFIXES))
         .replace("__PRUNE__", repr(TASK_EXEC_PRUNE))
+        .replace("__ROOTS__", repr(SANDBOX_SCAN_ROOTS))
+        .replace("__SKIP__", repr(TASK_EXEC_SKIP))
+        .replace("__MAX_DEPTH__", str(SANDBOX_SCAN_MAXDEPTH))
         .replace("__SOLUTION__", repr(TASK_SOLUTION_MARKER))
         .replace("__SOLUTION_END__", repr(TASK_SOLUTION_END))
         .replace("__DATA__", repr(TASK_DATA_MARKER))
@@ -3288,6 +3341,9 @@ SOLVE_MAX = __SOLVE_MAX__
 DOC_NAMES = __DOC_NAMES__
 SUFFIXES = __SUFFIXES__
 PRUNE = __PRUNE__
+ROOTS = __ROOTS__
+SKIP = __SKIP__
+MAX_DEPTH = __MAX_DEPTH__
 SOLUTION = __SOLUTION__
 SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
@@ -3320,22 +3376,33 @@ def fetch(url):
         return ""
 
 
-def find_files(patterns, limit):
-    """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
+def depth_of(path):
+    """路径的层级（分隔符统一成 `/`：沙盒是 Linux，本地测试跑在别的系统上）"""
+    return path.replace("\\\\", "/").rstrip("/").count("/")
 
-    全盘 walk 是这里最慢的一步，所以两个上限都要兜住：找到够数就停，
-    进的目录太多也停（沙盒命令整体限时 15 秒，宁可少找几个也不能超时）。
+
+def scan(root, patterns, found, seen, limit, budget):
+    """在 root 下按文件名找文件，返回还剩多少目录预算
+
+    两个上限一起兜：进目录的总数（`budget`，全盘 walk 会拖过 15 秒限时）与
+    深度（`MAX_DEPTH`，走到位就不再往下，`/usr/share/doc/...` 这种深层系统
+    文档因此整棵树都进不来）；`SKIP` 里的操作系统目录树则一步都不进。
     """
-    found = []
-    seen = set()
     visited = 0
-    for root, dirs, files in os.walk("/"):
+    base = depth_of(root)
+    for current, dirs, files in os.walk(root):
         visited += 1
-        if visited > DIR_BUDGET:
+        if visited > budget:
             break
-        dirs[:] = [d for d in dirs if os.path.join(root, d) not in PRUNE]
+        if depth_of(current) - base >= MAX_DEPTH:
+            dirs[:] = []
+        dirs[:] = [
+            name for name in dirs
+            if os.path.join(current, name) not in PRUNE
+            and os.path.join(current, name) not in SKIP
+        ]
         for name in files:
-            path = os.path.join(root, name)
+            path = os.path.join(current, name)
             if path in seen:
                 continue
             if not any(re.search(pattern, name, re.I) for pattern in patterns):
@@ -3343,7 +3410,26 @@ def find_files(patterns, limit):
             seen.add(path)
             found.append(path)
             if len(found) >= limit:
-                return found
+                return max(0, budget - visited)
+    return max(0, budget - visited)
+
+
+def find_files(patterns, limit, roots):
+    """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
+
+    按 `roots` 的顺序一个个扫，扫够 `limit` 份或目录预算用完就停。调用方把
+    "任务包该在的地方"（`ROOTS`）排在根目录前面，所以绝大多数情况下第一趟
+    就命中，根本走不到全盘兜底那一步。
+    """
+    found = []
+    seen = set()
+    budget = DIR_BUDGET
+    for root in roots:
+        if budget <= 0 or len(found) >= limit:
+            break
+        if not os.path.isdir(root):
+            continue
+        budget = scan(root, patterns, found, seen, limit, budget)
     return found
 
 
@@ -3352,7 +3438,9 @@ def task_files():
     wanted = os.path.basename(TASK_PATH) if TASK_PATH else ""
     named = []
     others = []
-    for path in find_files((r"^(task|spec).*\\.(md|txt|json)$",), 24):
+    for path in find_files(
+        (r"^(task|spec).*\\.(md|txt|json)$",), 24, ROOTS + ("/",),
+    ):
         if wanted and os.path.basename(path) == wanted:
             named.append(path)
         else:
@@ -3366,7 +3454,7 @@ def endpoints(doc_text):
     """接口文档里的调用样例：本地接口优先，其次才是文档里抓到的其他地址
 
     沙盒内的接口就在 BASE 上（TASK_API_DEFAULT），而 find_files(DOC_NAMES)
-    从全盘捞回来的文档里什么外链都有。旧实现把抓到的外链排在本地接口前面，
+    从任务目录里捞回来的文档里什么外链都有。旧实现把抓到的外链排在本地接口前面，
     MAX_CALLS 被这些在无网沙盒里调不通的地址耗光，真正能取数的本地接口
     一次都没被请求到，答案区永远是空的——三场复盘里"沙盒执行了（exitCode:0）
     却拿不到答案"就是这么来的。
@@ -3420,7 +3508,7 @@ def candidates(text, name, urls):
 
 
 files = task_files()
-doc_files = find_files(DOC_NAMES, 6)
+doc_files = find_files(DOC_NAMES, 6, ROOTS)
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
 print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
@@ -3561,11 +3649,13 @@ def _task_answer(turn: Turn) -> str | None:
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
     答案取任务标识到 `TASK_END_MARKER` 之间、`[SOLUTION]` 段里的内容。
 
-    两道闸门保证交上去的不是任务原文（复盘里 4 次 submitAnswer 交的全是
-    任务描述，Judge 一次都没放行）：
+    三道闸门保证交上去的不是任务原文、也不是一次取数失败的回声（复盘里
+    4 次 submitAnswer 交的全是任务描述，Judge 一次都没放行；PK590276 的 R14
+    交的则是一条 `Endpoint not found`）：
         1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
            执行器取不到数据时答案区是空的，这一回合就不提交；
-        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
+        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）；
+        3. 答案里不能带"这不是答案"的特征（`_bad_answer`）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
@@ -3597,7 +3687,7 @@ def _task_answer(turn: Turn) -> str | None:
     answer = _solution_answer(region, turn)
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
         return None
-    if _task_echo(answer, turn.phase_task):
+    if _bad_answer(answer) or _task_echo(answer, turn.phase_task):
         return None
     return answer
 
@@ -3640,6 +3730,18 @@ def _task_echo(answer: str, phase_task: str) -> bool:
     return any(run in answer for run in re.findall(TASK_ECHO_RUN, phase_task))
 
 
+def _bad_answer(answer: str) -> bool:
+    """候选答案里有没有"这不是答案"的特征（S1）
+
+    大小写不敏感：沙盒把超时打成 `[TIMEOUT]`、把取数失败打成 `TimeoutError`，
+    任务文件读不到时的报错又是 `No such file` 这种首字母大写的写法，形态不统一
+    （见 `TASK_BAD_ANSWER_PATTERNS`）。判错的代价只是这一回合不提交、等下一条
+    沙盒输出；判漏的代价是一次 0 分的 submitAnswer 加一整轮任务冷却。
+    """
+    lowered = answer.lower()
+    return any(pattern in lowered for pattern in TASK_BAD_ANSWER_PATTERNS)
+
+
 def _remember_task_answers(result: str) -> None:
     """把执行器解出来的答案按任务文件名记进答案缓存
 
@@ -3655,6 +3757,10 @@ def _remember_task_answers(result: str) -> None:
     把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
     ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
 
+    命中断言为坏答案的段同样不进缓存（S1：`_bad_answer`）：缓存里的答案下一
+    个任务一到手就会被直接交上去，把一条 404/超时文本存进去等于把一次 0 分
+    提交复制到之后每一个同类任务上。
+
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
     """
@@ -3664,7 +3770,12 @@ def _remember_task_answers(result: str) -> None:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and TASK_DATA_MARKER in evidence:
+        if (
+            name
+            and answer
+            and TASK_DATA_MARKER in evidence
+            and not _bad_answer(answer)
+        ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
 
@@ -3679,11 +3790,30 @@ def _cached_answer(turn: Turn) -> str | None:
 
     任务描述里没点名文件时返回 None：探测出来的文件名与任务描述的对应关系
     不确定，宁可多花一个来回执行一次，也不拿别的任务的答案去作答。
+
+    缓存里的答案在缓存时就过了一遍校验（见 `_remember_task_answers`），这里
+    再挡一道（S1）：`_cached_answer` 是直接喂给 `submitAnswer` 的那条路径，
+    提交前校验应当是最后一道闸门，而不是只在写入时校验一次。
     """
     target = _task_file(turn.phase_task)
     if target is None:
         return None
-    return _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
+    answer = _TASK_ANSWER_CACHE.get(
+        target.replace("\\", "/").rsplit("/", 1)[-1],
+    )
+    if answer is None or _bad_answer(answer) or _task_echo(answer, turn.phase_task):
+        return None
+    return answer
+
+
+def _can_collect(unit: Unit) -> bool:
+    """这个角色能不能下采集指令（S2：只有工人在 `COLLECT_ROLES` 里）
+
+    开拓者的采集指令会被判题系统直接驳回（见 `COLLECT_ROLES`），驳回后这一
+    回合的指令位就空掉了，角色白站一个回合。所有下发 `collect_command` 的
+    分支都要先过这里——包括任务等待期与白天的兜底采集。
+    """
+    return unit.kind in COLLECT_ROLES
 
 
 def _go_mine(
@@ -3694,7 +3824,7 @@ def _go_mine(
     commands: dict[int, dict[str, Any]],
 ) -> bool:
     """让单位去采矿"""
-    if unit.backpack_full:
+    if unit.backpack_full or not _can_collect(unit):
         return False
 
     mines = [

@@ -960,13 +960,18 @@ def test_economy_worker_skips_vendor_trip_close_to_night(
 # === 空转兜底与首夜防线（issue #13） ===
 
 
-def test_pioneer_without_task_gathers_instead_of_idling(
-    payload_factory, role_factory,
-):
-    """既没有任务也没有武器时，开拓者就近采矿，而不是原地待着
+def test_pioneer_never_gets_a_collect_command(payload_factory, role_factory):
+    """开拓者永远不下采集指令：采集是工人的专属动作（S2）
 
-    回归：复盘里"三个单位原地小步挪动、金币连续多回合冻结"——决策的每条
-    分支都没目标时角色会整回合没有任何指令。
+    回归：PK590272 里开拓者 20011 从 R12 起连续四个回合被指派 collect
+    （`fail=[20011:collect]`），R15 判题系统直接回
+    `[COMMAND_ERROR] role 20011 (pioneer) wants collect, but only worker
+    can do this action`——这条指令整回合作废，开拓者还被任务点拴着不能挪窝，
+    任务与这名劳动力一起白搭。
+
+    旧实现在"没有任务也没有武器"时会把开拓者支去就近采矿（复盘里"三个单位
+    原地小步挪动、金币连续多回合冻结"就是这条兜底加的）；现在改成什么都不下，
+    原地待命也比发一条注定被驳回的指令强。
     """
     payload = payload_factory(
         round_no=1,
@@ -976,10 +981,7 @@ def test_pioneer_without_task_gathers_instead_of_idling(
     )
     commands, _ = decide(payload)
 
-    assert commands["10011"] == {
-        "action": "collect",
-        "targetPos": [{"x": 4, "y": 24}],
-    }
+    assert "10011" not in commands
 
 
 def test_idle_gather_keeps_pioneer_on_running_task(
@@ -996,9 +998,11 @@ def test_idle_gather_keeps_pioneer_on_running_task(
     )
     commands, _ = decide(payload)
 
-    # 任务期间可以在任务点周围一格内采一铲矿（S1），但绝不能被支走
+    # 任务期间开拓者只能在任务点周围一格内挪步，绝不能被支走；
+    # 也不能下 collect——采集是工人的专属动作（见 COLLECT_ROLES），
+    # 开拓者的采集指令会被判题系统直接驳回（S2：PK590272 的 fail=[20011:collect]）
     command = commands.get("10011")
-    assert command is None or command["action"] in ("move", "collect")
+    assert command is None or command["action"] == "move"
     if command is not None:
         step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
         assert distance(step, Pos(14, 14)) <= 1
@@ -2960,8 +2964,8 @@ def test_task_loop_breaker_releases_pioneer_after_repeated_sandbox_output(
     # 还没到止损线时继续守在任务点上等答案：不提交任务原文，也不放弃任务
     for commands, payload in waiting:
         command = commands.get("10011")
-        # 等待期间不能交卷（沙盒没取到数）；但可以在任务圈内挪步或采一铲（S1）
-        assert command is None or command["action"] in ("move", "collect")
+        # 等待期间不能交卷（沙盒没取到数）；只能在任务圈内挪步（开拓者不能采集）
+        assert command is None or command["action"] == "move"
         if command is not None and command["action"] == "move":
             step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
             assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
@@ -3009,9 +3013,9 @@ def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
             )
             assert distance(step, weapon) < distance(Pos(14, 14), weapon)
         else:
-            # 时限内继续守在任务点旁等答案（可以在圈内挪步/采集，但不能交卷）
+            # 时限内继续守在任务点旁等答案（只能在圈内挪步，开拓者不能采集）
             command = commands.get("10011")
-            assert command is None or command["action"] in ("move", "collect")
+            assert command is None or command["action"] == "move"
             if command is not None and command["action"] == "move":
                 step = Pos(
                     command["targetPos"][0]["x"], command["targetPos"][0]["y"],
@@ -3035,7 +3039,7 @@ def test_task_watchdog_starts_over_for_another_task(payload_factory, role_factor
 
     # 仍在任务点旁等答案，没有被上一个任务的计数带走
     command = commands.get("10011")
-    assert command is None or command["action"] in ("move", "collect")
+    assert command is None or command["action"] == "move"
     if command is not None and command["action"] == "move":
         step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
         assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
@@ -3820,3 +3824,188 @@ def test_day_plan_makes_room_for_selling_when_backpack_full(
     assert len(_day_plan(loaded, stone_loaded).queue) <= len(
         _day_plan(empty, stone_empty).queue
     )
+
+
+# === issue #50：答案提交校验 / 沙盒扫描边界 / 角色动作白名单（PK590276、PK590272） ===
+
+
+def test_sandbox_answer_rejects_404_error_body(payload_factory, role_factory):
+    """取数取回来的是 404 报错时不能交卷（S1）
+
+    回归：PK590276 的 R14 把沙盒里的
+    `{"status":"error","message":"Endpoint not found: /tasks/task_1_beijing.md"}`
+    原样 submitAnswer 交了上去——任务分 0，还白耗一次任务冷却（同一个任务到
+    R18 才读到正文）。答案区里带取数证据（`[API]`）并不代表取到的是答案。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _solution_result(
+        phase_task,
+        "task_1_beijing.md",
+        '{"status":"error","message":"Endpoint not found: /tasks/task_1_beijing.md"}',
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+    # 没有交卷：沙盒命令照常下发，下一回合重新取数
+    assert sandbox_command(payload) != ""
+
+
+def test_sandbox_answer_rejects_timeout_output(payload_factory, role_factory):
+    """沙盒超时的输出（`[TIMEOUT]`）不能当答案提交（S1：PK590276 的 R12）"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", "[TIMEOUT] 命令执行超过 15 秒",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_task_answer_rejects_error_text_from_llm(payload_factory, role_factory):
+    """LLM 把报错文本当答案返回时同样不交卷（S1：提交前一律过一遍校验）"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "ANSWER: Endpoint not found: /tasks/task_1_beijing.md"
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_answer_cache_rejects_error_text(payload_factory, role_factory):
+    """缓存里的坏答案也不会被交上去（S1：缓存是直接喂给 submitAnswer 的路）
+
+    `_cached_answer` 命中时会立刻交卷，所以它必须是提交前的最后一道闸门，
+    而不是只在写入缓存时校验一次。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    brain._TASK_ANSWER_CACHE["task_1_beijing.md"] = "Endpoint not found"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+    # 坏答案也不能再触发"已有答案"的短路：沙盒命令照常下发
+    assert sandbox_command(payload) != ""
+
+
+def test_answer_cache_skips_error_solution():
+    """执行器把报错打成 `[SOLUTION]` 段时，这一份不进答案缓存（S1）
+
+    缓存里的答案下一个同类任务一到手就会被直接交上去，把一条 404 文本存进去
+    等于把一次 0 分提交复制到之后每一个同类任务上。
+    """
+    result = (
+        f"{TASK_DATA_MARKER} http://localhost:8899/heritage => 46\n"
+        f"{TASK_SOLUTION_MARKER}task_1_beijing.md\n"
+        '{"status":"error","message":"Endpoint not found"}\n'
+        f"{TASK_SOLUTION_END}\n"
+        f"{TASK_SOLUTION_MARKER}task_2_shanghai.md\n上海 多云\n"
+        f"{TASK_SOLUTION_END}\n"
+    )
+    brain._remember_task_answers(result)
+
+    assert "task_1_beijing.md" not in brain._TASK_ANSWER_CACHE
+    assert brain._TASK_ANSWER_CACHE["task_2_shanghai.md"] == "上海 多云"
+
+
+def _sandbox_executor_tools() -> dict:
+    """把沙盒执行器里的工具函数单独取出来（不跑主流程、不碰网络）
+
+    `sandbox_command` 下发的是一段自带常量的 python 脚本，这里只取到
+    `files = task_files()` 之前的部分，拿到 `find_files` / `scan` 与它们的
+    常量，好在临时目录上验证"找文件的边界"。
+    """
+    source = brain._task_executor("task_1_beijing.md")
+    body = source.split("<<'PYEOF' 2>/dev/null\n", 1)[1].rsplit("\nPYEOF", 1)[0]
+    tools = body.split("files = task_files()", 1)[0]
+    # 主流程（全盘扫描 + 调接口）绝不能进测试进程
+    assert "print(SCAN" not in tools
+    namespace: dict = {}
+    exec(compile(tools, "<sandbox-executor>", "exec"), namespace)
+    return namespace
+
+
+def test_sandbox_scan_prefers_task_dirs_and_caps_depth(tmp_path):
+    """沙盒找文件：按给定顺序扫、限深、不进系统目录树（S2）
+
+    回归：PK590272 的 R12 首次扫描直接 `[TIMEOUT]`，之后几回合回读回来的是
+    `[SCAN] tasks=0 docs=6`——旧实现一上来 `os.walk("/")`，目录按名字母序走，
+    `/usr` 永远排在 `/tmp` 前面，目录预算在系统目录上就耗光了，任务文件一个
+    都没扫到，读回来的是 `/usr/share/doc/uom-se-1.0.4/README.md` 这种无关文档。
+    """
+    tools = _sandbox_executor_tools()
+    # 常量确实注入到了沙盒脚本里（否则边界是写死的，改常量不生效）
+    assert tools["ROOTS"] == brain.SANDBOX_SCAN_ROOTS
+    assert tools["SKIP"] == brain.TASK_EXEC_SKIP
+    assert tools["MAX_DEPTH"] == brain.SANDBOX_SCAN_MAXDEPTH
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    (first / "task_1_beijing.md").parent.mkdir(parents=True)
+    (first / "task_1_beijing.md").write_text("beijing", encoding="utf-8")
+    (second / "task_2_shanghai.md").parent.mkdir(parents=True)
+    (second / "task_2_shanghai.md").write_text("shanghai", encoding="utf-8")
+
+    # 按传入顺序扫：第一个根就找够了（limit=1），不会白跑第二个根
+    found = tools["find_files"](
+        (r"^task.*\.md$",), 1, [str(first), str(second)],
+    )
+    assert [Path(path).name for path in found] == ["task_1_beijing.md"]
+
+    # 深度上限：MAX_DEPTH 层以内的目录扫得到，更深的目录整棵不进
+    shallow = tmp_path / "shallow"
+    shallow.mkdir()
+    (shallow / "task_1_shallow.md").write_text("x", encoding="utf-8")
+    deep = tmp_path / "a" / "b" / "c" / "d"
+    deep.mkdir(parents=True)
+    (deep / "task_1_deep.md").write_text("x", encoding="utf-8")
+
+    names = {
+        Path(path).name
+        for path in tools["find_files"]((r"^task.*\.md$",), 10, [str(tmp_path)])
+    }
+    assert "task_1_shallow.md" in names
+    assert "task_1_deep.md" not in names
+
+    # 系统目录树（SKIP）一步都不进：那里的无关文档不会被当成任务文件读回来
+    tools["SKIP"] = (str(second),)
+    names = {
+        Path(path).name
+        for path in tools["find_files"]((r"^task.*\.md$",), 10, [str(tmp_path)])
+    }
+    assert "task_2_shanghai.md" not in names
+
+
+def test_sandbox_scan_skips_system_document_trees():
+    """全盘兜底时不再进 `/usr/share` 这类系统目录（S2）
+
+    `/usr/share/doc/uom-se-1.0.4/README.md`、docbook 的 `task.xsl` 都在这些
+    目录树里——它们是旧实现"读错文件"的来源，不是任务包的一部分。
+    """
+    assert "/usr/share" in brain.TASK_EXEC_SKIP
+    # 任务包该在的目录排在根目录前面：绝大多数情况下走不到全盘兜底那一步
+    assert "/tmp" in brain.SANDBOX_SCAN_ROOTS
+    assert brain.SANDBOX_SCAN_ROOTS[-1] != "/"
+    assert brain.SANDBOX_SCAN_MAXDEPTH > 0
