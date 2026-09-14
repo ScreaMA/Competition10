@@ -7091,3 +7091,165 @@ def test_executor_skips_empty_result_bodies(capsys):
     assert TASK_SOLUTION_MARKER not in out     # 空壳不进答案段
     assert len(asked) > 1                      # 取数名额留给后面的候选地址
 
+
+# === issue #188：交过卷而任务还在 -> 那一份被打回，重新取数并最终清缓存 ===
+
+
+def _rejected_answer_payload(
+    payload_factory, role_factory, phase_task, round_no, answer="fc1e78eb2a5a",
+):
+    """构造"开拓者守着任务点、上一回合的沙盒输出解出了答案"的局面"""
+    payload = _task_payload(payload_factory, role_factory, phase_task, round_no)
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", answer,
+    )
+    return payload
+
+
+def test_submitted_answer_triggers_a_fresh_sandbox_run(
+    payload_factory, role_factory,
+):
+    """交过一次而任务还在时，执行器要重新跑一趟（S1，PK592108 的 R15–R17）
+
+    旧实现里"手里有答案"就等于"不必再下发沙盒命令"（`_task_answer` 一直非空），
+    于是执行器解出一次答案之后就再没跑过：答卷不管理由每回合复读一遍，直到
+    `TASK_SUBMIT_LIMIT` 次额度烧完、任务被判死，整段任务窗连一次重新取数都没有
+    （PK592108 的 R15–R17：`state=no_marker` 恒不变，R19 敌方都还没 ready）。
+    答卷本身照旧按 `TASK_SUBMIT_LIMIT` 重试——重试留给"答案没错、只是这一回合
+    没被放行"的情况，重新取数留给"答错了"，两条路各管一种失败。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    answer = "fc1e78eb2a5a"
+    payload = _rejected_answer_payload(
+        payload_factory, role_factory, phase_task, 11, answer,
+    )
+
+    # R11：答案到手，正常交卷；有答案就不必再跑沙盒（这条路不能被改坏）
+    commands, _ = decide(payload)
+    assert commands["10011"] == {"action": "submitAnswer", "taskAnswer": answer}
+    assert sandbox_command(payload) == ""
+
+    # R12：沙盒输出没变、任务仍留在 phaseTask 里 -> 那一份没被放行
+    payload["roundNo"] = 12
+    commands, _ = decide(payload)
+
+    # 答卷照旧重试（重试策略不变）
+    assert commands["10011"] == {"action": "submitAnswer", "taskAnswer": answer}
+    # 但这一回合要把执行器重新发下去：换一批轮转过的候选地址重新取数
+    assert sandbox_command(payload) != ""
+    assert "submit=rejected" in brain.task_brief(Turn.load(payload))
+
+
+def test_submit_limit_exhausted_answer_is_dropped_from_cache(
+    payload_factory, role_factory,
+):
+    """交满提交额度仍没被放行的答案要从缓存里删掉（S1）
+
+    缓存是"只增不改"的（`_remember_task_answers` 用 `setdefault`）：一份交满
+    `TASK_SUBMIT_LIMIT` 次都没被放行的答案留在里面，下一个领到同一份任务文件的
+    回合接取后就会立刻秒交（`_cached_answer`），连重新取数的机会都没有——同一个
+    0 分答案再送一遍，白占一个任务窗口。报告 P0-1 说的"失败后清缓存重读重提"。
+    触发线放在额度交满之后（不是第一次被打回）：额度本身就是留给"答案没错、
+    只是这一回合没被放行"的重试窗口，重试期间缓存必须留着。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    # 沙盒里早就解出过这份任务：每回合手里都有能交的答案（走的是缓存这条路）
+    brain._TASK_ANSWER_CACHE["task_1_beijing.md"] = '{"city": "北京", "count": 7}'
+
+    for offset in range(TASK_SUBMIT_LIMIT + 1):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        # 每回合的输出都不一样：这里走的是提交闸门，不是读文件死循环
+        # （同一份输出连着出现 `TASK_LOOP_LIMIT` 次会先触发读文件熔断）
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task, f"第 {offset} 次搜索，仍无任务文件\n",
+        )
+        commands, _ = decide(payload)
+
+        if offset < TASK_SUBMIT_LIMIT:
+            # 额度还没交满：答卷照旧重试，缓存必须留着
+            assert commands["10011"] == {
+                "action": "submitAnswer", "taskAnswer": '{"city": "北京", "count": 7}',
+            }
+            assert "task_1_beijing.md" in brain._TASK_ANSWER_CACHE
+
+    # 第 TASK_SUBMIT_LIMIT+1 次：这一份确定是死的，从缓存里删掉
+    assert "task_1_beijing.md" not in brain._TASK_ANSWER_CACHE
+
+
+def test_fresh_sandbox_result_replaces_the_rejected_answer(
+    payload_factory, role_factory,
+):
+    """执行器重新取数解出另一份答案时，交的是新的那一份（S1）
+
+    重新取数是重新下发执行器的意义所在：候选地址每回合按回合号轮转
+    （`_task_executor` 的 `offset`），多跑几趟才可能拿到另一份取数结果。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    payload = _rejected_answer_payload(
+        payload_factory, role_factory, phase_task, 11, "fc1e78eb2a5a",
+    )
+    decide(payload)  # R11 交第一次
+
+    payload["roundNo"] = 12
+    decide(payload)  # R12 被打回，重试同一份 + 重新取数
+
+    # R13：执行器换了一批候选地址，解出另一份答案
+    payload["roundNo"] = 13
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", "9f2c41d7b0e3",
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"] == {
+        "action": "submitAnswer", "taskAnswer": "9f2c41d7b0e3",
+    }
+
+
+def test_first_answer_does_not_trigger_a_sandbox_rerun(
+    payload_factory, role_factory,
+):
+    """没交过卷时不重跑执行器（S1）：`_task_submit_rejected` 只在"交过且任务还在"时为真
+
+    回归口径：判据挂在看门狗的 `submits` 上，而 `submits` 把本回合这一次也算在
+    内（见 `_watch_task`）——第一次交卷那一回合它是 1，不该被当成"已经交过"，
+    否则每份答案都要白等一个来回的沙盒执行。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    payload = _rejected_answer_payload(
+        payload_factory, role_factory, phase_task, 11,
+    )
+    decide(payload)
+
+    turn = Turn.load(payload)
+    assert not brain._task_submit_rejected(turn)
+    assert brain._TASK_WATCH is not None
+    assert brain._TASK_WATCH.submits == 1
+    assert "submit=-" in brain.task_brief(turn)
+
+
+def test_rejected_verdict_ignores_another_rounds_observation(
+    payload_factory, role_factory,
+):
+    """回合号对不上时不当成"已经交过"（S1）：别把别的一局的观察套到当前任务上
+
+    判据与 `_task_abandoned` 同一套口径（任务标识 + 回合号连续）：换局、换任务
+    之后回合号跳变，`_TASK_WATCH` 里那条旧观察不该继续生效——否则新一局的第一
+    回合就会白跑一趟沙盒。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    payload = _rejected_answer_payload(
+        payload_factory, role_factory, phase_task, 11,
+    )
+    decide(payload)
+
+    # 同一份观察、但回合号跳到了另一局（不是上一回合的延续）
+    payload["roundNo"] = 40
+    assert not brain._task_submit_rejected(Turn.load(payload))
+
+    # 换了任务标识同理：另一个任务不该继承上一个任务的提交记录
+    other = Turn.load(_rejected_answer_payload(
+        payload_factory, role_factory, "请阅读task_2_shanghai.md，获取任务信息", 12,
+    ))
+    assert not brain._task_submit_rejected(other)
+
