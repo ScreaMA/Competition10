@@ -6094,3 +6094,153 @@ def test_executor_without_task_file_still_asks_with_the_task_query_word():
     exec(_executor_fetch_loop(), namespace)  # noqa: S102
 
     assert all(not url.endswith("selfEvolutionTask") for url in asked)
+
+
+# === 答案收窄与任务文件路径补全（S1/S2，PK591930）===
+
+
+def test_answer_value_takes_the_token_out_of_a_banner():
+    """输出里点名了答案时只交那个值（S1，PK591930 的 R14）
+
+    横幅与答案一起打出来是常态（`[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a`），
+    整行交上去 Judge 判 0：`TOKEN:` 后面那个值才是答案。
+    """
+    assert brain._answer_value(
+        "[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a",
+    ) == "fc1e78eb2a5a"
+    assert brain._answer_value("答案：北京故宫") == "北京故宫"
+    assert brain._answer_value("TOKEN='fc1e78eb2a5a'") == "fc1e78eb2a5a"
+
+
+def test_answer_value_keeps_answers_without_a_marker():
+    """没有答案标记的输出原样交（S1）：收窄只在输出自己点名答案时才动手
+
+    答案长什么样无法正面判定，所以除了那两种形态（有标记 / 纯状态行）之外
+    一概不动：正常的一段数据、带 `"token"` 键的 JSON（引号夹着的写法不认）、
+    以及 `access_token=` 这种"词尾恰好是 token"的写法都要原样放行。
+    """
+    assert brain._answer_value("北京故宫") == "北京故宫"
+    assert brain._answer_value('{"city": "北京", "count": 7}') == (
+        '{"city": "北京", "count": 7}'
+    )
+    assert brain._answer_value('{"token":"abc"}') == '{"token":"abc"}'
+    assert brain._answer_value("access_token=abc") == "access_token=abc"
+    # 空输出照旧没有答案
+    assert brain._answer_value("") == ""
+    assert brain._answer_value("   \n") == ""
+
+
+def test_answer_value_rejects_a_pure_harness_banner():
+    """整份输出都是脚本状态行时没有答案可交（S1，PK591930 的 R14）
+
+    自检横幅不是答案：交上去判 0，还白占一次提交额度（`TASK_SUBMIT_LIMIT`）。
+    只看"每一行都是状态行"，正常答案里夹一行状态行不受影响。
+    """
+    assert brain._answer_value("[ OK ] 全部通过 (6/6)") == ""
+    assert brain._answer_value("[FAIL] 3/6 用例未过") == ""
+    assert brain._answer_value("[ OK ] 全部通过 (6/6)\n[FAIL] 3/6 用例未过") == ""
+    # 夹了一行真数据的输出不算"只有状态行"
+    assert brain._answer_value("[ OK ] 全部通过 (6/6)\n北京故宫") == (
+        "[ OK ] 全部通过 (6/6)\n北京故宫"
+    )
+
+
+def test_task_answer_narrows_llm_command_output_to_the_token(
+    payload_factory, role_factory,
+):
+    """LLM 命令打回"横幅 + TOKEN"时提交的是那个 TOKEN（S1，PK591930 的 R14）
+
+    复盘里这一行被原样交了上去（`submitAnswer [ OK ] 全部通过 (6/6) | TOKEN:
+    fc1e78eb2a5a`），Judge 判 0 分；三座塔、一段墙、金币冻结的那一局正是从
+    这个任务失败开始崩的。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_alpha.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: python selfcheck.py"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        evidence="[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a\n",
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"]["action"] == "submitAnswer"
+    assert commands["10011"]["taskAnswer"] == "fc1e78eb2a5a"
+
+
+def test_task_answer_skips_a_pure_harness_banner(payload_factory, role_factory):
+    """LLM 命令只打了一行自检横幅时不交卷（S1，PK591930 的 R14）
+
+    没有答案可交的回合不提交：交一次判 0 分，还占掉一次提交额度，
+    宁可让它按取数连败走止损（`TASK_API_FAIL_LIMIT`）。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_alpha.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: python selfcheck.py"
+    decide(payload)
+    sandbox_command(payload)
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        evidence="[ OK ] 全部通过 (6/6)\n",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_absolute_paths_fills_in_a_bare_task_file_name():
+    """只在"裸文件名"那一处补路径（S2，PK591930 的 R16）
+
+    沙盒的工作目录是 `/`，`cat task_1_alpha.md` 只换来一行 `No such file or
+    directory`；上一回合的回读段（`[TASK_FILE]<路径>`）里有真实路径，照着补全。
+    已经是路径的写法、带 `./` 前缀的写法都不能再补一遍，没有回读段时原样返回。
+    """
+    path = f"{TASK_ROOTS[0]}/1-alpha/task_1_alpha.md"
+    result = f"{TASK_FILE_MARKER}{path}\n请查询 alpha 的文档\n{TASK_FILE_END}\n"
+
+    assert brain._absolute_paths("cat task_1_alpha.md", result) == f"cat {path}"
+    assert brain._absolute_paths("cat 'task_1_alpha.md'", result) == f"cat '{path}'"
+    # 已经带着目录的写法不碰（否则会补成 `/tmp/.../tmp/...`）
+    assert brain._absolute_paths(f"cat {path}", result) == f"cat {path}"
+    assert brain._absolute_paths("cat ./task_1_alpha.md", result) == (
+        "cat ./task_1_alpha.md"
+    )
+    # 不是任务文件的名字、以及还没有回读段的回合，都原样返回
+    assert brain._absolute_paths("cat other.md", result) == "cat other.md"
+    assert brain._absolute_paths("cat task_1_alpha.md", "") == "cat task_1_alpha.md"
+
+
+def test_llm_command_reads_the_task_file_by_its_sandbox_path(
+    payload_factory, role_factory,
+):
+    """LLM 用裸文件名读任务文件时，下发的命令里已经是绝对路径（S2）
+
+    回归：PK591930 的 R16 `cat: task_1_alpha.md: No such file or directory`
+    ——这条命令本身跑不通，一个任务回合白搭，LLM 还得再猜一次路径。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_alpha.md"
+    path = f"{TASK_ROOTS[0]}/1-alpha/task_1_alpha.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 12,
+        evidence=f"{TASK_FILE_MARKER}{path}\n请查询 alpha\n{TASK_FILE_END}\n",
+    )
+    payload["llmResp"] = "CMD: cat task_1_alpha.md"
+    decide(payload)
+
+    command = sandbox_command(payload)
+
+    assert f"cat {path}" in command
+    assert "cat task_1_alpha.md" not in command
+

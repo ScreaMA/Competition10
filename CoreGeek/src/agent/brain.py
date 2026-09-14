@@ -675,6 +675,25 @@ TASK_TEXT_HINT_MIN = 30  # 指纹短于这个长度不作数：太短的串容�
 TASK_DOC_HEAD = re.compile(r"^\s{0,3}#{1,6}\s")
 TASK_DOC_WORDS = ("参考文档", "接口文档", "API 文档", "使用说明", "文档版本", "版本历史")
 
+# 沙盒输出里"答案就在这里"的显式标记（S1）：自进化任务的沙盒里跑的是我们
+# （或 LLM）自己写的脚本，脚本把答案连同自检横幅一起打出来是常态。复盘
+# PK591930 的 R14 打出的就是 `[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a`，
+# 整行被原样当成答案交了上去，Judge 判 0 分、还占掉一次提交额度
+# （`TASK_SUBMIT_LIMIT`）——横幅里的那个 TOKEN 才是要交的东西。
+# `(?<![A-Za-z0-9_])` 是为了不认 `access_token=` 这类"词尾恰好是 token"的写法。
+TASK_ANSWER_VALUE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:TOKEN|答案|验证码)\s*[:：=]\s*[\"'`]?\s*([^\s\"'`,;|]+)",
+    re.IGNORECASE,
+)
+# 一眼就是"脚本状态行"的形态（`[ OK ] 全部通过 (6/6)`、`[FAIL] 3/6 用例未过`）：
+# 整份输出全是这种行时说明沙盒这一趟只打了个状态就收工，没有任何答案可交，
+# 交上去同样判 0（S1）。只在"每一行都是状态行"时才判定，答案里出现一行
+# `[OK] xxx` 不会被误伤。
+TASK_HARNESS_LINE = re.compile(
+    r"^\s*\[\s*(?:OK|PASS|FAIL|ERROR|WARN|DONE)\s*\]\s*[^\r\n]*$",
+    re.IGNORECASE,
+)
+
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
     "challenger": (CHALLENGER_TASK_1, CHALLENGER_TASK_2),
@@ -4023,6 +4042,60 @@ def _script_dir(command: str, script: str) -> str:
     return folder.rstrip("/") + "/" + script[2:]
 
 
+def _task_paths(result: str) -> dict[str, str]:
+    """沙盒里任务文件的真实路径表（文件名 -> 绝对路径）
+
+    取自回读段（`_task_dump` 打的 `[TASK_FILE]<路径>` 行）：那是沙盒里 `find`
+    的命中结果，是实打实的绝对路径，不是照任务描述猜的。只收绝对路径，
+    同名多份时取先命中的那一份。
+
+    参数:
+        result: 报文的 `lastCmdResult`（沙盒输出）
+
+    返回:
+        文件名到绝对路径的表；没有回读段时为空
+    """
+    paths: dict[str, str] = {}
+    for chunk in (result or "").split(TASK_FILE_MARKER)[1:]:
+        line = chunk.split("\n", 1)[0].strip().replace("\\", "/")
+        if not line.startswith("/") or TASK_FILE_END in line:
+            continue
+        name = line.rsplit("/", 1)[-1]
+        if name and name not in paths:
+            paths[name] = line
+    return paths
+
+
+def _absolute_paths(command: str, result: str) -> str:
+    """把命令里的裸任务文件名补成沙盒里的绝对路径（S2）
+
+    复盘 PK591930 的 R16：LLM 给的是 `cat task_1_alpha.md`，而沙盒的工作目录
+    是 `/`、任务文件在 `/tmp/selfEvolutionTask/.../` 下，这条命令只换来一行
+    `cat: task_1_alpha.md: No such file or directory`，一个任务回合白搭，LLM
+    还得再猜一次路径。上一回合的回读段里已经有这些文件的真实路径
+    （见 `_task_paths`），照着补全即可。
+
+    只替换"以裸文件名形式出现"的那一处：前面不能是路径分隔符/点/连字符
+    （`/x/task_1_alpha.md`、`./task_1_alpha.md` 因此不会被再补一遍），后面
+    不能是文件名字符或点（`task_1_alpha.md.bak` 不碰）。没有回读段
+    （还没跑过执行器的那几回合）时原样返回，行为与改造前一致。
+
+    参数:
+        command: LLM 给的沙盒命令（单行）
+        result: 报文的 `lastCmdResult`（回读段在其中）
+
+    返回:
+        补全过路径的命令；没有可补的文件名时原样返回
+    """
+    for name, path in _task_paths(result).items():
+        if name == path:
+            continue
+        command = re.sub(
+            rf"(?<![\w./-]){re.escape(name)}(?![\w.-])", path, command,
+        )
+    return command
+
+
 def _llm_task_command(turn: Turn) -> str:
     """把 LLM 给的取数命令包成一条沙盒命令（带任务标识，供下一回合取答案）
 
@@ -4031,6 +4104,10 @@ def _llm_task_command(turn: Turn) -> str:
 
     命令调的是沙盒里的脚本时先做一遍行尾归一化（S1，见 `_crlf_safe_command`）：
     CRLF 的脚本只会换来一行 `/bin/sh^M: bad interpreter`，一个任务回合白搭。
+
+    命令里的任务文件名先补成沙盒里的绝对路径（S2，见 `_absolute_paths`）：
+    沙盒的工作目录是 `/`，而 `cat task_1_alpha.md` 这样的裸文件名只在任务
+    目录里才找得到。
     """
     state = _task_llm_state(turn)
     command = str(state.get("pending_cmd") or "")
@@ -4038,6 +4115,7 @@ def _llm_task_command(turn: Turn) -> str:
         return ""
     state["pending_cmd"] = ""
     state["cmd_round"] = turn.round_no
+    command = _absolute_paths(command, turn.last_cmd_result)
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
     return (
         f'echo "{marker}"; {_crlf_safe_command(command)}\n'
@@ -4071,7 +4149,13 @@ def _llm_direct_answer(turn: Turn) -> str | None:
 
 
 def _llm_command_answer(turn: Turn, region: str) -> str | None:
-    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）"""
+    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）
+
+    输出先按 `_answer_value` 收一道（S1）：命令把答案和自检横幅一起打出来时
+    只交标记后的那个值，整份输出都是脚本状态行时这一回合不交卷——复盘
+    PK591930 的 R14 交的正是 `[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a`
+    这一整行，Judge 判 0 分还烧掉一次提交额度。
+    """
     if not turn.phase_task:
         return None
     state = _task_llm_state(turn)
@@ -4093,6 +4177,11 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None  # 命令把一份文档的正文打了出来（`cat 文档`），不是答案（S2）
     if _task_path_answer(answer):
         return None  # 命令只把任务文件的路径打了出来，不算取到数
+    # 闸门都过完之后才收成答案本体（S1，见 `_answer_value`）：命令把答案与
+    # 自检横幅一起打出来时只交标记后的那个值，整份输出都是脚本状态行时不交
+    answer = _answer_value(answer)
+    if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
+        return None
     return answer
 
 
@@ -4881,6 +4970,47 @@ def _task_token(phase_task: str) -> str:
     return re.sub(r"\W+", "", phase_task)[:16]
 
 
+def _task_harness_only(text: str) -> bool:
+    """输出是不是"只打了个状态就收工"（S1）
+
+    每一行都是 `[ OK ]` / `[FAIL]` 这类脚本状态行时，这一趟沙盒没有任何答案
+    可言（复盘 PK591930 的 R14：自检横幅被整行当成答案交了上去）。只看
+    "每一行都是"，正常答案里夹一行状态行不受影响。
+    """
+    lines = [line for line in text.splitlines() if line.strip()]
+    return bool(lines) and all(TASK_HARNESS_LINE.match(line) for line in lines)
+
+
+def _answer_value(text: str) -> str:
+    """把沙盒输出收成"答案本体"（S1）
+
+    自进化任务的按键脚本常把答案与自检横幅一起打出来，整份输出交上去 Judge
+    必然判 0（复盘 PK591930 的 R14：`[ OK ] 全部通过 (6/6) | TOKEN:
+    fc1e78eb2a5a` 原样提交）。这里按"输出里有没有点名答案的标记"收一道：
+
+        - 有 `TOKEN: <值>` / `答案：<值>` 这类显式标记时只交标记后的那个值；
+        - 整份输出都是脚本状态行（`_task_harness_only`）时没有答案可交，
+          返回空串（调用方据此不提交，省下一次提交额度与一个任务回合）；
+        - 其余情况原样返回，行为与改造前一致（答案长什么样无法正面判定，
+          不在这里猜）。
+
+    参数:
+        text: 待判定的答案原文
+
+    返回:
+        答案本体；没有答案可交时返回空串
+    """
+    body = text.strip()
+    if not body:
+        return ""
+    hit = TASK_ANSWER_VALUE.search(body)
+    if hit is not None:
+        return hit.group(1).strip().strip("\"'`")
+    if _task_harness_only(body):
+        return ""
+    return body
+
+
 def _task_answer(turn: Turn) -> str | None:
     """从上一回合的沙盒输出中解析当前任务的答案
 
@@ -4900,6 +5030,10 @@ def _task_answer(turn: Turn) -> str | None:
            R13 交的就是接口文档原文，它是"取数取到了文档页"而不是答案；
         5. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
            "该读哪个文件"当成了答案。
+    闸门都过完之后还要按 `_answer_value` 收一道（S1）：输出里点名了
+    `TOKEN:`/`答案：` 时只交标记后的那个值，整份输出都是脚本状态行时干脆不交
+    （PK591930 的 R14 把 `[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a` 整行
+    交了上去，Judge 判 0）。
     走 LLM 那条路时输出里没有文档指纹可比，另有一道按"文档长什么样"判定的
     闸门（`_task_doc_body`，PK590836 的 R15 交的是 API 文档正文）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
@@ -4918,7 +5052,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     `short_or_missing` / `echo_task_text`（答案就是任务原文）/
     `error_body`（答案是接口的错误响应体）/ `doc_text`（答案是沙盒里那份文档的
     原文）/ `path_answer`（答案是一条文件路径）/ `doc_body`（答案是 Markdown
-    文档的正文，见 `_task_doc_body`）。
+    文档的正文，见 `_task_doc_body`）/ `harness_only`（答案区里只有脚本状态行，
+    没有答案可交，见 `_answer_value`）。
     """
     if not turn.phase_task:
         return None, "no_task"
@@ -4960,6 +5095,13 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
         return None, "doc_body"  # 交上去的是一份 Markdown 文档的正文（S2）
     if _task_path_answer(answer):
         return None, "path_answer"  # 交上去的是一条路径：文件里问的答案还没拿到
+    # 闸门都过完之后才收成答案本体（S1，见 `_answer_value`）：收窄之后文档/
+    # 错误体/路径那几道就认不出来了，所以必须排在它们后面
+    answer = _answer_value(answer)
+    if not answer:
+        return None, "harness_only"  # 答案区里只有脚本状态行，没有答案可交
+    if len(answer) < TASK_ANSWER_MIN_LEN:
+        return None, "short_or_missing"
     return answer, "ok"
 
 
@@ -5190,7 +5332,9 @@ def _cached_answer(turn: Turn) -> str | None:
     `_task_doc_body` 三道闸门：缓存是在执行器输出上直接建的
     （`_remember_task_answers`），同一份"答案"从这里出去同样可能是一条文件
     路径、一段接口错误提示或者一份文档的正文——提交闸门只在 `_task_answer`
-    里拦一道的话，这条路就绕过去了。
+    里拦一道的话，这条路就绕过去了。三道闸门过完再按 `_answer_value` 收成
+    答案本体（S1）：`[ OK ] 全部通过 (6/6) | TOKEN: <值>` 这种"横幅 + 答案
+    标记"的一整段在新任务到手时会被秒交，Judge 判 0 还烧掉一次提交额度。
     """
     target = _task_file(turn.phase_task)
     if target is None:
@@ -5200,7 +5344,7 @@ def _cached_answer(turn: Turn) -> str | None:
         return None
     if _task_doc_body(answer):
         return None  # 缓存里那条"答案"是一份文档的正文，同样不能交（S2）
-    return answer
+    return _answer_value(answer) or None  # 只有脚本状态行时算没有答案（S1）
 
 
 def _go_mine(
