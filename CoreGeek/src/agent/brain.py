@@ -836,7 +836,9 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
         cache=hit      答案缓存里有没有当前任务文件的答案
         submit=rejected 交过一次而任务还在（Judge 没放行，见 `_task_submit_rejected`）：
                        这一回合会重新下发执行器取数，答卷本身照旧重试
-        llm=ask2/cmd   LLM 求助了几次 / 是否已拿到待执行命令或直接答案
+        llm=ask2/cmd   LLM 求助了几次 / 是否已拿到待执行命令（`/cmd`）或一份
+                       过得了闸门的直接答案（`/answer`；被判回的答案不挂这个
+                       标记，见 `_llm_direct_answer`）
 
     参数:
         turn: 当前回合信息
@@ -860,7 +862,10 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
     flags = ""
     if llm_state.get("pending_cmd"):
         flags += "/cmd"
-    if llm_state.get("answer"):
+    # 只有过得了闸门的那一份才算"手里有答案"（S1，与 `_task_prompt` 同一口径）：
+    # 被判回的那一份不会被交上去，日志上却挂着 `/answer`，看日志的人会以为
+    # 答案到手只是没交，与"还在等 LLM 重答"完全两回事（见 `_llm_direct_answer`）
+    if _llm_direct_answer(turn) is not None:
         flags += "/answer"
     # 提交闭环（S1，见 `_task_submit_rejected`）：交过一次而任务还在，说明
     # Judge 没放行——这一回合执行器会重新下发取数，答卷本身照旧重试。日志上
@@ -3864,9 +3869,11 @@ def _llm_command_round(turn: Turn, round_no: int) -> bool:
 def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
     """任务卡住时向 LLM 求助的 prompt（任务期间不占每日额度）
 
-    只在"接了任务、还没有答案或待执行命令、并且已经拿到沙盒输出"时发：
-    任务文件与接口文档要先从沙盒捞回来，LLM 才有东西可看。同一个任务最多问
-    `TASK_LLM_MAX_PROMPTS` 次——问不出结果就该止损，别把整个任务窗耗在提问上。
+    只在"接了任务、手里没有待执行命令、也没有一份过得了闸门的答案、并且已经
+    拿到沙盒输出"时发：任务文件与接口文档要先从沙盒捞回来，LLM 才有东西可看。
+    同一个任务最多问 `TASK_LLM_MAX_PROMPTS` 次——问不出结果就该止损，别把整个
+    任务窗耗在提问上。手里那份 `ANSWER:` 被判回时不算数（见 `_llm_direct_answer`
+    与下面的说明）：丢掉它、接着问，求助线不会被一份交不上去的答案掐死。
 
     参数:
         turn: 当前回合信息
@@ -3878,8 +3885,22 @@ def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
     if not turn.phase_task or _task_abandoned(turn):
         return ""
     state = _task_llm_state(turn)
-    if state["answer"] or state["pending_cmd"]:
+    if state["pending_cmd"]:
         return ""
+    # 手里那份答案过不了闸门时不算"已经拿到了答案"（S1）：`_consume_task_reply`
+    # 收到的 `ANSWER:` 只是 LLM 的一句话，是不是答案本体要由 `_llm_direct_answer`
+    # 那几道闸门说了算（复读任务原文、沙盒文档正文、接口错误体、文件路径、
+    # 取数失败回显、空结果集……）。旧写法只看"状态里有没有着落"——被判回的那
+    # 一份于是把求助线整段掐死：`state["answer"]` 一直留着，这里再也不问，而它
+    # 自己又永远交不上去，LLM 兜底这条线在这个任务上就彻底没了下文（任务窗口
+    # 只剩执行器一路空转刷 `state=no_api_data`，直到看门狗止损）。答案缓存那边
+    # 早有同样的处理（`_forget_rejected_answer`，S1）：判回就丢掉，下一回合照旧
+    # 把沙盒证据交给 LLM 重问，额度仍受 `TASK_LLM_MAX_PROMPTS` 约束。
+    if _llm_direct_answer(turn) is not None:
+        return ""
+    rejected = bool(str(state.get("answer") or "").strip())
+    if rejected:
+        state["answer"] = ""
     if state["prompts"] >= TASK_LLM_MAX_PROMPTS:
         return ""
 
@@ -3888,7 +3909,7 @@ def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
         return ""  # 沙盒还没吐回任务文件/接口文档，先让执行器去捞
 
     state["prompts"] += 1
-    return "\n".join([
+    lines = [
         "你在替我解一道《未来战争》的自进化类任务，你只能通过沙盒里的一条 shell 命令取数。",
         f"任务描述：{turn.phase_task}",
         "",
@@ -3899,10 +3920,20 @@ def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
         "接口要鉴权时，按接口文档里的写法带上请求头（如 Authorization: Bearer，"
         "Key 就在文档里）；返回 401/403 说明头没带对，别把错误信息当答案。",
         "一条命令限时 15 秒，一回合只能发一条命令，命令的 stdout 会原样回到我这里。",
+    ]
+    if rejected:
+        # 点一句"上一次没被采纳"：LLM 才知道要换一条路，不然它多半把同一句话
+        # 再回一遍，六次求助全砸在同一份交不上去的答案上
+        lines.append(
+            "上一轮你给的答案没被采纳（那不是接口取到的答案本体），这一轮换一条路："
+            "先用 CMD 真去把数取回来。"
+        )
+    lines += [
         "请只回一行，二选一：",
         "CMD: <一条能在沙盒里直接跑出答案的 shell 命令，只输出答案本身>",
         "ANSWER: <你已经能确定答案时，直接给答案>",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
