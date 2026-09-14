@@ -103,6 +103,11 @@ TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)  # 武器建造顺序（按射程由�
 STONE_BATCH = 3  # 工人采集石头的批次大小（越小围墙越早开工）
 WALL_BUILD_PRIORITY = 1000  # 围墙建造优先级
 SELL_BATCH = 10  # 卖给小贩的矿石批次大小
+# 石材的零散出售下限（S2）：围墙配额铺满、武器塔也建满之后，背包里的石材再攒
+# 批就没有意义了——攒着的结果是金币继续躺着（复盘里 stone 从 1 块堆到 3 块、
+# 金币从 R6 起恒 0 到 R17，工人背着石头空转）。这时攒够 SELL_THRESHOLD 块就
+# 顺路卖给小贩；还有塔/墙要建时石材照旧留给建造（见 `_build_backlog`）。
+SELL_THRESHOLD = 2
 # 纯收入矿石（铁/铜）的出售下限（S2）：铁/铜不参与砌墙，攒批没有任何好处，
 # 手里有一块就变现一块。石材另算——它既是收入也是围墙材料，攒够一批再卖
 # 更省回合（见 `_trade_logic`）。复盘里防守方的背包一直堆着 iron/copper、
@@ -160,11 +165,19 @@ MIN_WALLS_BEFORE_NIGHT = 2
 # 机器人直接贴脸打基地，而同一局的进攻方反倒把来路封得严严实实。
 # LLM 计划把墙压到 0 时防守方仍按下限留出石材（见 `_wall_target`）。
 DEFENDER_WALL_QUOTA = 1
-# 防守方开局动工第一段围墙的回合（S3，每个游戏日的第 1..WALL_FIRST_ROUND 个回合）：
-# 这段时间里分管经济的工人先跑"采石 -> 砌墙"这条线，塔由另一名工人照建。
-# 复盘里塔位优先的建造分支把工人一直占在基地旁等金币，首段围墙因此拖到
-# 金币花光才开工——PK589649 落到 R10、PK589653 全程一段都没有，防线整局不成型。
-WALL_FIRST_ROUND = 5
+# 防守方开局防线计划（S3，即复盘建议里的 WALL_PLAN）：每个游戏日的前
+# WALL_PLAN_ROUNDS 个回合里，分管经济的工人照着 `_calc_wall_order` 生成的防线
+# 坐标（先来敌方向、再上左下右）铺够 WALL_PLAN_SEGMENTS 段墙，塔由另一名工人
+# 照建。这段窗口里"砌墙"的优先级高于采石闲逛与凑批卖矿——围墙是防守方唯一的
+# 正面屏障，而复盘里塔位优先的建造分支把工人一直占在基地旁等金币，首段围墙
+# 因此拖到金币花光才开工（PK589649 落到 R10、PK589653 全程 0 段），PK589697
+# 更是拖到 R16 才立起第一段、全程只有 1 段，基地裸奔到终局。
+# 窗口取 10 个回合而不是 5：采石点离基地常有十来格，往返一趟就是好几回合，
+# 5 个回合里连第一段的料都攒不齐，防线自然一直不成型。
+WALL_PLAN_ROUNDS = 10
+WALL_PLAN_SEGMENTS = 4
+# 兼容旧名：测试与外部脚本仍按 `WALL_FIRST_ROUND` 引用（改名时漏改调用方）
+WALL_FIRST_ROUND = WALL_PLAN_ROUNDS
 WEAPON_UPGRADE_VOUCHER = "WeaponUpgradeVoucher1"  # 武器升级券（level1->level2）
 WEAPON_UPGRADE_VOUCHER2 = "WeaponUpgradeVoucher2"  # 武器升级券2（level2->level3）
 WALL_UPGRADE_VOUCHER = "WallUpgradeVoucher1"  # 围墙升级券（level1->level2）
@@ -266,6 +279,8 @@ TASK_FILE_MAX = 12
 TASK_SOLUTION_MARKER = "[SOLUTION]"  # 答案段落开头，后跟任务文件名
 TASK_SOLUTION_END = "[/SOLUTION]"
 TASK_DATA_MARKER = "[API]"  # 真实取数的证据：只有请求成功才会打印
+TASK_API_FAIL_MARKER = "[APIFAIL]"  # 取数失败也留一行诊断（URL + 异常类型）
+TASK_SCAN_MARKER = "[SCAN]"  # 沙盒里找到多少任务文件/接口文档/可用地址
 TASK_ANSWER_MIN_LEN = 4  # 答案最短长度（任务原文动辄几千字，这条挡住空答）
 TASK_ECHO_RUN = r"[一-鿿]{6,}"  # 任务描述里的中文长句（复读判定用）
 TASK_API_DEFAULT = "http://localhost:8899"  # 沙盒内的本地接口
@@ -287,9 +302,32 @@ TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过�
 # 这名劳动力也一起白搭。这里给任务两条止损线，到线就放弃任务、把开拓者还给
 # 战斗调度（见 `_task_abandoned`）：
 #   - 同一份沙盒输出连续出现 TASK_LOOP_LIMIT 次（读文件循环）
-#   - 任务已经占用开拓者 TASK_TIMEOUT 个回合（任务书：单个任务时限 15 回合）
+#   - 任务已经占用开拓者 TASK_TIMEOUT_ROUNDS 个回合（任务书：单个任务时限 15 回合）
+# 超时线取 10 而不是任务书的 15：真能解出答案的任务在收到第二条沙盒输出的
+# 回合就交卷了（答案缓存命中时更快），拖到第 10 个回合还交不上卷的任务，
+# 剩下的 5 个回合同样交不上，不如早点把开拓者还给战斗调度。
 TASK_LOOP_LIMIT = 3
-TASK_TIMEOUT = 15
+TASK_TIMEOUT_ROUNDS = 10
+# 兼容旧名：测试与外部脚本仍按 `TASK_TIMEOUT` 引用（改名时漏改调用方）
+TASK_TIMEOUT = TASK_TIMEOUT_ROUNDS
+
+# === LLM 解任务 ===
+# 沙盒里的接口只能靠"读文档 -> 拼地址"去猜，猜不中时答案区永远是空的，
+# 开拓者就卡在任务点耗到超时（复盘 #42：R12–R17 六次沙盒输出都是同一份
+# 任务文件、从未提交，任务分 0）。所以再加一条兜底：把**任务描述 + 沙盒里
+# 捞到的接口文档**交给 LLM，让它给出确切做法——
+#   接口文档：明确写着"自进化任务期间调用 LLM 不占用每个游戏日的 3 次额度"，
+#   这正是"用 Agent 自进化解题"这条路的正解。
+# 回复约定两个前缀（只认第一个命中的）：
+#   `CMD: <命令>`    -> 下一回合把这条命令原样丢进沙盒（15 秒限时）
+#   `ANSWER: <答案>` -> 直接交卷，不再绕沙盒
+TASK_LLM_CMD_PREFIX = "CMD:"
+TASK_LLM_ANSWER_PREFIX = "ANSWER:"
+TASK_LLM_MAX_PROMPTS = 6  # 同一个任务最多求助几次，避免整段任务都耗在提问上
+TASK_LLM_EVIDENCE_LIMIT = 3000  # 喂给 LLM 的沙盒输出上限（任务文件+接口文档）
+TASK_LLM_ANSWER_MIN_LEN = 2  # 比 `TASK_ANSWER_MIN_LEN` 更宽：LLM 可能只给一个数
+# 单个任务跨回合的 LLM 交互状态：token -> {prompts, pending_cmd, cmd_round, answer}
+_TASK_LLM_STATE: dict[str, dict[str, Any]] = {}
 
 # 任务答案缓存：任务文件名 -> 沙盒执行产出的答案（`[SOLUTION]` 段的内容）
 # 任务书5.3节要求"根据任务1探索的内容形成固定SOP或者SKILL，实现Agent自进化"，
@@ -392,6 +430,8 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     _watch_task(turn)
     # 上回合执行器解出来的任务答案按文件名缓存，后续任务一到手就能直接作答
     _remember_task_answers(turn.last_cmd_result)
+    # 上一回合 LLM 的回复：任务期间的 CMD/ANSWER 落进当前任务的状态
+    _consume_task_reply(turn, payload)
     # 上一回合的LLM建议解析成有界计划，和指令生成器共用（解析不出来时是默认计划）
     plan = _llm_plan(payload)
     commands: dict[int, dict[str, Any]] = {}
@@ -401,7 +441,9 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     else:
         _decide_night(turn, commands)
 
-    prompt = _generate_strategy_prompt(turn, payload, plan)
+    # 任务期间优先用"任务求助"prompt（接口文档：任务期的 LLM 调用不占每日额度），
+    # 没有任务或任务不需要求助时才是策略咨询
+    prompt = _task_prompt(turn, payload) or _generate_strategy_prompt(turn, payload, plan)
 
     # 转换key为字符串
     return {str(key): value for key, value in commands.items()}, prompt
@@ -655,16 +697,17 @@ def _worker_day_logic(
     # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"（防守方还有下限，见 `_wall_target`）
     wall_quota = len(turn.walls()) < _wall_target(turn, plan)
 
-    # 防守方的第一段围墙要在开局就动工（S3）：塔位优先的建造分支会把工人一直
-    # 占在基地旁等金币，首段围墙因此要等到金币花光（R8~R10）才开工，甚至整局
-    # 一段都没有。这里让分管经济的工人在开局窗口内先跑石材线，塔交给另一名
-    # 工人照建（只剩一名工人时不动——一双手还是先建塔）。
+    # 防守方的开局防线（S3）：塔位优先的建造分支会把工人一直占在基地旁等金币，
+    # 首段围墙因此要等到金币花光（R8~R10）才开工，甚至整局一段都没有。这里让
+    # 分管经济的工人在开局窗口内跑完整的防线计划——按 `_calc_wall_order` 给出的
+    # 坐标（先来敌方向）陆续铺到 `WALL_PLAN_SEGMENTS` 段，塔交给另一名工人照建
+    # （只剩一名工人时不动——一双手还是先建塔）。
     if (
         economy
         and len(turn.workers()) >= 2
         and turn.team_type == "defender"
-        and not turn.walls()
-        and _day_round(turn) < WALL_FIRST_ROUND
+        and len(turn.walls()) < WALL_PLAN_SEGMENTS
+        and _day_round(turn) < WALL_PLAN_ROUNDS
         and _early_wall(turn, worker, walls_missing, claimed, commands)
     ):
         return
@@ -783,6 +826,28 @@ def _gold_critical(turn: Turn) -> bool:
     return turn.gold < LOW_GOLD_THRESHOLD
 
 
+def _build_backlog(turn: Turn) -> bool:
+    """还有没有比"卖矿换金币"更优先的建造任务
+
+    武器塔没满编（一座 25 金）、或者防守方的围墙配额还没铺够时，石材与金币都
+    该留给建造：手里那几块石头是砌墙的料，卖了就得再去采一趟。两件事都做完
+    之后石材继续攒批就只是让金币躺着（S2：复盘里 stone 从 1 块堆到 3 块、
+    gold 从 R6 恒 0 到 R17），这时才按 `SELL_THRESHOLD` 零散变现。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        True 表示还有更优先的建造任务，石材不零散出售
+    """
+    if len(turn.weapons()) < LLM_MAX_TOWERS:
+        return True
+    return (
+        turn.team_type == "defender"
+        and len(turn.walls()) < DEFENDER_WALL_QUOTA
+    )
+
+
 def _wall_gap(turn: Turn, plan: LlmPlan) -> int:
     """围墙配额还欠几段（换算成石材块数，一段墙一块石头）
 
@@ -817,12 +882,17 @@ def _early_wall(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """防守方开局的第一段围墙：手里有石材就先砌墙，否则先去采石材（S3）
+    """防守方开局防线：手里有石材就先砌墙，否则先去采石材（S3）
 
-    只在"基地还没有任何围墙、且还在开局窗口内"时由分管经济的工人执行
-    （见 `_worker_day_logic`）。塔位优先的建造分支会让工人一直在基地旁等金币，
+    只在"防守方的开局防线还没铺够、且还在开局窗口内"时由分管经济的工人执行
+    （见 `_worker_day_logic`，窗口与段数见 `WALL_PLAN_ROUNDS`/
+    `WALL_PLAN_SEGMENTS`）。塔位优先的建造分支会让工人一直在基地旁等金币，
     首段围墙因此拖到金币花光才开工——复盘里 PK589649 的首段围墙落到 R10、
-    PK589653 全程 0 段，机器人直接贴脸打基地。
+    PK589653 全程 0 段、PK589697 拖到 R16 且只有 1 段，机器人直接贴脸打基地。
+
+    砌墙的位置取自 `_calc_wall_order`（即复盘建议里的 WALL_PLAN）：按基地坐标
+    生成、先封敌方来路，而不是"顺路在采石点旁随手砌一段"——复盘里
+    (32,12)/(33,12) 那两段正是贴着采石点砌的，来敌方向反而留了口子。
 
     参数:
         turn: 当前回合信息
@@ -981,13 +1051,14 @@ def _pioneer_day_logic(
 ) -> None:
     """开拓者白天逻辑
 
-    优先级: 维持进行中的任务（含提交答案，命中答案缓存时接取后即交卷）
+    优先级: 维持进行中的任务（含提交答案，命中答案缓存时接取后即交卷；
+            等答案期间也要有就地动作，见 `_task_wait_logic`）
             > 前往任务点领取任务（本回合走不动就原地等，不退回去跟随武器塔）
             > 守候正在冷却的任务点（白天守在下一个会开放的任务点旁，天黑前回防）
             > 跟随武器塔（只在没有任何任务点时，或者任务已被看门狗放弃时）
 
     任务止损（S1）：进行中的任务连续多回合没有任何进展（沙盒反复回读同一份
-    文件）或已经占满 `TASK_TIMEOUT` 个回合时，`_task_abandoned` 判定放弃，
+    文件）或已经占满 `TASK_TIMEOUT_ROUNDS` 个回合时，`_task_abandoned` 判定放弃，
     开拓者不再守任务点、`_sandbox_command` 也不再下发读文件命令，直接回基地
     跟队——离开任务点周围一格会让判题系统强制结束这个任务。
 
@@ -1037,6 +1108,10 @@ def _pioneer_day_logic(
             answer = _task_answer(turn) or _cached_answer(turn)
             if answer is not None:
                 commands[pioneer.unit_id] = submit_answer_command(answer)
+                return
+            # 还没等到答案：这一回合也得给开拓者一个就地动作，别让它零指令空转
+            # （S1：复盘里开拓者 R11-R17 一条指令都没有，idle_man 一路涨到 3）
+            _task_wait_logic(turn, pioneer, task_pos, claimed, commands)
             return
 
     # 2. 有可接取的任务: 按优先级依次尝试领取
@@ -1073,6 +1148,79 @@ def _pioneer_day_logic(
 
     # 4. 没有可接取的任务: 跟随武器塔,为夜晚操控武器做准备
     _pioneer_follow_weapons(turn, pioneer, wall_order, claimed, commands)
+
+
+def _task_wait_logic(
+    turn: Turn,
+    pioneer: Unit,
+    task_pos: Pos,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> None:
+    """任务进行中、答案还没到时的就地动作（S1）
+
+    自进化任务的答案要等下一回合的沙盒输出，而任务期间开拓者必须留在任务点
+    周围一格内（离开会强制结束任务），于是它常常整回合什么都不做——复盘里
+    "开拓者 20011 R11-R17 无任何指令、idle_man 升至 3"，一个可操控单位整段
+    白天白搭。这里给它安排两条就地能做的动作：
+
+        1. 身旁有矿就采一铲（采集不移动，任务照旧有效）
+        2. 否则在"仍然落在任务点周围一格内"的相邻格里挪一步，方向朝最近的
+           武器塔（不离开任务圈，顺带为夜晚操控武器省一段路）
+
+    两条都走不通时不下指令——原地待命比乱走安全（任务点的有效性只看距离），
+    但只要有一件事可做，这名角色就不会再零指令空转。
+
+    参数:
+        turn: 当前回合信息
+        pioneer: 当前决策的开拓者（此刻已在任务点周围一格内）
+        task_pos: 进行中任务的任务点坐标
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+    """
+    # 1. 旁边就有矿: 采一铲换资源（原地动作，不会离开任务圈）
+    if not pioneer.backpack_full:
+        for mine_type in SELLABLE_MINES:
+            mine = _adjacent_mine(turn, pioneer, mine_type)
+            if mine is not None and mine not in claimed:
+                commands[pioneer.unit_id] = collect_command(mine)
+                claimed.add(mine)
+                return
+
+    # 2. 没矿可采: 在任务圈内朝最近的武器塔挪一步
+    weapons = turn.weapons()
+    if not weapons:
+        return
+    nearest = min(
+        weapons,
+        key=lambda weapon: (
+            distance(pioneer.pos, weapon.pos), weapon.pos.x, weapon.pos.y,
+        ),
+    )
+    here = distance(pioneer.pos, nearest.pos)
+    build_sites = _reserved_build_sites(turn)
+    blocked = turn.blocked(pioneer)
+
+    best: Pos | None = None
+    for pos in get_neighbors(pioneer.pos):
+        if not turn.land(pos) or pos in blocked or pos in claimed:
+            continue
+        # 白天不占建造点：站上去会让那座塔/那段墙整局建不起来
+        if pos in build_sites:
+            continue
+        # 只在任务点周围一格内挪动，离开就会让任务强制结束
+        if _task_distance(turn, pos, task_pos) > 1:
+            continue
+        if distance(pos, nearest.pos) >= here:
+            continue
+        if best is None or (distance(pos, nearest.pos), pos.x, pos.y) < (
+            distance(best, nearest.pos), best.x, best.y,
+        ):
+            best = pos
+
+    if best is not None:
+        commands[pioneer.unit_id] = move_command(best)
+        claimed.add(best)
 
 
 def _pioneer_follow_weapons(
@@ -1228,6 +1376,7 @@ def _trade_logic(
     ——等凑够 `SELL_BATCH` 的话，这点矿石永远变不成钱，经济也就永远转不起来。
     铁/铜这类纯收入矿石同样不等攒批（`MINERAL_SELL_THRESHOLD`）：它们不参与
     砌墙，留在背包里只是占地方，金币没见底也该有几块卖几块。
+    石材在"建造线已经走完"时同样不等攒批（`SELL_THRESHOLD`，见 `_build_backlog`）。
 
     参数:
         turn: 当前回合信息
@@ -1254,11 +1403,15 @@ def _trade_logic(
     # 背包满了就卖一批腾地方,否则等攒够一批再卖；金币见底时有几块卖几块。
     # 铁/铜是纯收入矿石（不参与砌墙），攒批没有任何好处——有几块卖几块，
     # 每回合都能有一笔进账（S2：复盘里"只采不卖、金币冻结在 0"）。
+    # 石材另算：还有塔/墙要建时它留着砌墙（继续攒批），建造线走完之后攒批就
+    # 只是让金币接着躺着了，攒够 `SELL_THRESHOLD` 块就变现。
     batch = SELL_BATCH
     if worker.backpack_full or _gold_critical(turn):
         batch = 1
     elif mine_type in INCOME_MINES:
         batch = MINERAL_SELL_THRESHOLD
+    elif not _build_backlog(turn):
+        batch = SELL_THRESHOLD
     if amount < batch:
         return False
 
@@ -2021,8 +2174,8 @@ def _watch_task(turn: Turn) -> None:
 def _task_abandoned(turn: Turn) -> bool:
     """当前任务是不是已经被看门狗放弃（只读，不刷新观察值）
 
-    两条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT`）：同一份沙盒输出连续
-    出现了 `TASK_LOOP_LIMIT` 次，或者任务已经占用了 `TASK_TIMEOUT` 个回合。
+    两条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT_ROUNDS`）：同一份沙盒输出连续
+    出现了 `TASK_LOOP_LIMIT` 次，或者任务已经占用了 `TASK_TIMEOUT_ROUNDS` 个回合。
     复盘里开拓者就是被"每回合回读同一份任务文件"的死循环占死的（PK589649
     的 R11–R17、PK589653 的 R12–R17），任务分拿不到，这名劳动力也一起白搭。
 
@@ -2037,7 +2190,136 @@ def _task_abandoned(turn: Turn) -> bool:
         return False
     if turn.round_no not in (watch.round_no, watch.round_no + 1):
         return False
-    return watch.repeats >= TASK_LOOP_LIMIT or watch.rounds >= TASK_TIMEOUT
+    return watch.repeats >= TASK_LOOP_LIMIT or watch.rounds >= TASK_TIMEOUT_ROUNDS
+
+
+def _task_llm_state(turn: Turn) -> dict[str, Any]:
+    """当前任务的 LLM 交互状态（按任务标识存，跨回合保留）
+
+    键是任务标识（`_task_token`，含任务描述与序号），任务结束换新任务时
+    自然换一份状态，不会把上一个任务的答案带过来。
+    """
+    return _TASK_LLM_STATE.setdefault(
+        _task_token(turn.phase_task),
+        {"prompts": 0, "pending_cmd": "", "cmd_round": 0, "answer": ""},
+    )
+
+
+def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
+    """任务卡住时向 LLM 求助的 prompt（任务期间不占每日额度）
+
+    只在"接了任务、还没有答案或待执行命令、并且已经拿到沙盒输出"时发：
+    任务文件与接口文档要先从沙盒捞回来，LLM 才有东西可看。同一个任务最多问
+    `TASK_LLM_MAX_PROMPTS` 次——问不出结果就该止损，别把整个任务窗耗在提问上。
+
+    参数:
+        turn: 当前回合信息
+        payload: 原始请求（取沙盒输出等字段）
+
+    返回:
+        要提交给 LLM 的 prompt；本回合不需要求助时返回空串
+    """
+    if not turn.phase_task or _task_abandoned(turn):
+        return ""
+    state = _task_llm_state(turn)
+    if state["answer"] or state["pending_cmd"]:
+        return ""
+    if state["prompts"] >= TASK_LLM_MAX_PROMPTS:
+        return ""
+
+    evidence = (turn.last_cmd_result or "").strip()
+    if not evidence:
+        return ""  # 沙盒还没吐回任务文件/接口文档，先让执行器去捞
+
+    state["prompts"] += 1
+    return "\n".join([
+        "你在替我解一道《未来战争》的自进化类任务，你只能通过沙盒里的一条 shell 命令取数。",
+        f"任务描述：{turn.phase_task}",
+        "",
+        "沙盒已经捞回来的内容（任务文件、接口文档、目录清单）：",
+        evidence[:TASK_LLM_EVIDENCE_LIMIT],
+        "",
+        "约束：沙盒无法访问外网，本地接口在 http://localhost:8899；",
+        "一条命令限时 15 秒，一回合只能发一条命令，命令的 stdout 会原样回到我这里。",
+        "请只回一行，二选一：",
+        "CMD: <一条能在沙盒里直接跑出答案的 shell 命令，只输出答案本身>",
+        "ANSWER: <你已经能确定答案时，直接给答案>",
+    ])
+
+
+def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
+    """把上一回合 LLM 的回复（llmResp）落进当前任务的状态
+
+    只认 `CMD:` / `ANSWER:` 两个前缀；两条都出现时优先 `CMD`——真去沙盒取数
+    才算解出来，LLM 凭文档直接给的答案只当兜底。
+    """
+    reply = str(payload.get("llmResp") or "")
+    if not turn.phase_task or not reply:
+        return
+    state = _task_llm_state(turn)
+    for line in reply.splitlines():
+        text = line.strip()
+        if text.startswith(TASK_LLM_CMD_PREFIX):
+            command = text[len(TASK_LLM_CMD_PREFIX):].strip()
+            if command:
+                state["pending_cmd"] = command
+                return
+    for line in reply.splitlines():
+        text = line.strip()
+        if text.startswith(TASK_LLM_ANSWER_PREFIX):
+            answer = text[len(TASK_LLM_ANSWER_PREFIX):].strip()
+            if answer:
+                state["answer"] = answer
+                return
+
+
+def _llm_task_command(turn: Turn) -> str:
+    """把 LLM 给的取数命令包成一条沙盒命令（带任务标识，供下一回合取答案）
+
+    包装方式和执行器一致：`[TASK]<标识>` 与 `[TASK_END]` 之间是答案区，
+    末尾的 `:` 保证退出码为 0。
+    """
+    state = _task_llm_state(turn)
+    command = str(state.get("pending_cmd") or "")
+    if not command:
+        return ""
+    state["pending_cmd"] = ""
+    state["cmd_round"] = turn.round_no
+    marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
+    return (
+        f'echo "{marker}"; {command}\n'
+        f'echo "{TASK_END_MARKER}"; :'
+    )
+
+
+def _llm_direct_answer(turn: Turn) -> str | None:
+    """LLM 直接给出的答案（不需要沙盒，幂等：一直保留到任务结束）"""
+    if not turn.phase_task:
+        return None
+    answer = str(_task_llm_state(turn).get("answer") or "").strip()
+    if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
+        return None
+    if _task_echo(answer, turn.phase_task):
+        return None  # 把任务原文当答案交上去 = 又一次 0 分
+    return answer
+
+
+def _llm_command_answer(turn: Turn, region: str) -> str | None:
+    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）"""
+    if not turn.phase_task:
+        return None
+    state = _task_llm_state(turn)
+    sent_round = int(state.get("cmd_round") or 0)
+    if not sent_round or turn.round_no != sent_round + 1:
+        return None
+    answer = region.strip()
+    if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
+        return None
+    if any(bad in answer for bad in TASK_ERROR_MARKERS):
+        return None
+    if _task_echo(answer, turn.phase_task):
+        return None
+    return answer
 
 
 def _sandbox_command(turn: Turn) -> str:
@@ -2072,6 +2354,11 @@ def _sandbox_command(turn: Turn) -> str:
         or _task_abandoned(turn)
     ):
         return ""
+
+    # LLM 给了取数命令就优先跑它：一回合只能发一条命令，它比"继续猜地址"更准
+    llm_command = _llm_task_command(turn)
+    if llm_command:
+        return llm_command
 
     # 描述里没给文件名时，用上一回合的探测结果找；还没探过就先探一次
     target = _task_file(turn.phase_task) or _task_file(turn.last_cmd_result)
@@ -2120,6 +2407,8 @@ def _task_executor(task_path: str) -> str:
         .replace("__SOLUTION__", repr(TASK_SOLUTION_MARKER))
         .replace("__SOLUTION_END__", repr(TASK_SOLUTION_END))
         .replace("__DATA__", repr(TASK_DATA_MARKER))
+        .replace("__FAIL__", repr(TASK_API_FAIL_MARKER))
+        .replace("__SCAN__", repr(TASK_SCAN_MARKER))
     )
     # 沙盒的解释器叫 python3 或 python，挑一个能用的（挑不到时脚本不会执行，
     # 答案区为空 -> 这一回合不提交，下一回合重来）。
@@ -2156,6 +2445,8 @@ PRUNE = __PRUNE__
 SOLUTION = __SOLUTION__
 SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
+FAIL = __FAIL__
+SCAN = __SCAN__
 SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
 
 
@@ -2169,12 +2460,17 @@ def read(path):
 
 
 def fetch(url):
-    """调用接口并把响应体截断返回（失败返回空串，绝不抛异常打断整条命令）"""
+    """调用接口并把响应体截断返回（失败时打一行诊断，绝不抛异常打断整条命令）
+
+    失败诊断要留在输出里：复盘里沙盒"执行了但没答案"时，日志上看不到任何
+    原因（旧实现把异常吞掉、命令又带 `2>/dev/null`），只能靠猜。
+    """
     try:
         request = urllib.request.Request(url, headers={"Accept": "*/*"})
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             return response.read().decode("utf-8", "replace").strip()[:BODY_LIMIT]
-    except Exception:
+    except Exception as exc:
+        print(FAIL, url, type(exc).__name__)
         return ""
 
 
@@ -2277,13 +2573,16 @@ def candidates(text, name, urls):
     return out
 
 
-doc_text = "\\n".join(read(path) for path in find_files(DOC_NAMES, 6))
+files = task_files()
+doc_files = find_files(DOC_NAMES, 6)
+doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
+print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
 
 deadline = time.time() + TIME_BUDGET
 calls = 0
 solutions = []
-for path in task_files()[:SOLVE_MAX]:
+for path in files[:SOLVE_MAX]:
     name = os.path.basename(path)
     text = read(path)
     bodies = []
@@ -2427,12 +2726,23 @@ def _task_answer(turn: Turn) -> str | None:
     if not turn.phase_task:
         return None
 
+    # 1. LLM 已经直接给出答案（不用绕沙盒）
+    direct = _llm_direct_answer(turn)
+    if direct is not None:
+        return direct
+
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
     result = turn.last_cmd_result
     if marker not in result or "[exitCode:0]" not in result:
         return None
 
     region = result.split(marker, 1)[1].split(TASK_END_MARKER, 1)[0]
+
+    # 2. 上一回合跑的是 LLM 指定的取数命令：标记之间的输出本身就是答案
+    llm_output = _llm_command_answer(turn, region)
+    if llm_output is not None:
+        return llm_output
+
     if TASK_DATA_MARKER not in region:
         return None  # 没取到数据：沙盒里只有任务原文，不能当答案交上去
     if any(bad in region for bad in TASK_ERROR_MARKERS):
@@ -2494,15 +2804,23 @@ def _remember_task_answers(result: str) -> None:
 
     缓存只增不改（`setdefault`）：已经记下的答案不会被后来的输出覆盖。
 
+    只有"这一份之前出现过取数证据（`[API]`）"的答案才进缓存：执行器取不到数
+    时也会把任务文件打成 `[SOLUTION]` 段（沙盒里本来就有这份文件），
+    把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
+    ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
+
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
     """
-    for chunk in result.split(TASK_SOLUTION_MARKER)[1:]:
+    chunks = result.split(TASK_SOLUTION_MARKER)
+    evidence = chunks[0]
+    for chunk in chunks[1:]:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer:
+        if name and answer and TASK_DATA_MARKER in evidence:
             _TASK_ANSWER_CACHE.setdefault(name, answer)
+        evidence += TASK_SOLUTION_MARKER + chunk
 
 
 def _cached_answer(turn: Turn) -> str | None:
@@ -3079,16 +3397,15 @@ def _wall_side_order(turn: Turn) -> tuple[str, ...]:
     ))
 
 
-def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
-    """计算围墙建造顺序（基地周围第二圈）
+def _wall_ring(turn: Turn) -> dict[str, list[Pos]]:
+    """基地第二圈的四个方位格子表（即 WALL_PLAN 的坐标来源，S3）
 
-    按 `_wall_side_order` 给出的方位顺序（先敌方来路、其余上左下右）环绕基地
-    铺一圈围墙，并在右下角留一个入口供角色进出。超出地图或落在非陆地上的点
-    会被过滤掉。
+    同一格不会落在两条边上，所以四张表拼起来正好是环绕基地的一圈。
+    超出地图或落在非陆地上的格子由 `_calc_wall_order` 统一过滤。
     """
     station = turn.station()
     if station is None:
-        return ()
+        return {}
 
     footprint = station_footprint(station.pos)
     xs = [pos.x for pos in footprint]
@@ -3096,8 +3413,7 @@ def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
 
-    # 矩形四条边各自的格子（同一格不会落在两条边上）
-    by_side: dict[str, list[Pos]] = {
+    return {
         # 上边（从右到左）
         "up": [Pos(x, ymax + 2) for x in range(xmax + 2, xmin - 3, -1)],
         # 左边（从上到下）
@@ -3107,14 +3423,51 @@ def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
         # 右边（从下到上）
         "right": [Pos(xmax + 2, y) for y in range(ymin - 1, ymax + 2)],
     }
+
+
+def _wall_entrance(turn: Turn, by_side: dict[str, list[Pos]]) -> Pos | None:
+    """围墙入口：开在威胁最小那一侧的中间格
+
+    旧实现把入口写死在地图右下角，敌方从右侧/下侧来时，围墙正好在来敌方向留了
+    一个口子（复盘里"围墙留口/方向错位"）。入口跟着 `_wall_side_order` 的最后
+    一位走——那正是"最不可能来敌人"的那一侧，来敌方向的墙因此始终是封死的。
+
+    参数:
+        turn: 当前回合信息
+        by_side: `_wall_ring` 给出的四方位格子表
+
+    返回:
+        入口坐标；没有基地或该侧没有格子时返回 None（不开口子）
+    """
+    order = _wall_side_order(turn)
+    if not order:
+        return None
+    cells = by_side.get(order[-1]) or []
+    if not cells:
+        return None
+    return cells[len(cells) // 2]
+
+
+def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
+    """计算围墙建造顺序（基地周围第二圈，即复盘建议里的 WALL_PLAN）
+
+    按 `_wall_side_order` 给出的方位顺序（先敌方来路、其余上左下右）环绕基地
+    铺一圈围墙——坐标由基地位置现算（`_wall_ring`），因此来敌方向永远排在最
+    前面，而不是"顺路在采石点旁随手砌一段"（复盘里 (32,12)/(33,12) 那两段正是
+    贴着采石点砌的，来敌方向反而留了口子）。入口开在威胁最小的一侧
+    （`_wall_entrance`），超出地图或落在非陆地上的点会被过滤掉。
+    """
+    station = turn.station()
+    if station is None:
+        return ()
+
+    by_side = _wall_ring(turn)
     order = [
         pos
         for side in _wall_side_order(turn)
         for pos in by_side[side]
     ]
-
-    # 留一个入口（右下角）
-    entrance = Pos(xmax + 2, ymin - 1)
+    entrance = _wall_entrance(turn, by_side)
 
     return tuple(
         pos for pos in order

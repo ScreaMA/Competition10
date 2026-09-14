@@ -960,7 +960,12 @@ def test_idle_gather_keeps_pioneer_on_running_task(
     )
     commands, _ = decide(payload)
 
-    assert "10011" not in commands
+    # 任务期间可以在任务点周围一格内采一铲矿（S1），但绝不能被支走
+    command = commands.get("10011")
+    assert command is None or command["action"] in ("move", "collect")
+    if command is not None:
+        step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+        assert distance(step, Pos(14, 14)) <= 1
 
 
 def test_idle_gather_waits_for_night_instead_of_mining(
@@ -1522,8 +1527,10 @@ def test_task_cache_keeps_first_answer_per_task_file():
     """缓存按任务文件名记执行器解出来的答案，且不会被后来的输出覆盖"""
     brain._remember_task_answers(
         "[exitCode:0]\n[TASK]上一个任务\n"
+        "[API] http://localhost:8899/heritage?city=alpha => 12\n"
         "[SOLUTION]task_1_alpha.md\nalpha-answer\n[/SOLUTION]\n"
     )
+    # 没有取数证据的 `[SOLUTION]` 段不入缓存（那只是任务原文，不是答案）
     brain._remember_task_answers(
         "[SOLUTION]task_1_alpha.md\n乱码\n[/SOLUTION]\n"
     )
@@ -2906,7 +2913,12 @@ def test_task_loop_breaker_releases_pioneer_after_repeated_sandbox_output(
 
     # 还没到止损线时继续守在任务点上等答案：不提交任务原文，也不放弃任务
     for commands, payload in waiting:
-        assert "10011" not in commands
+        command = commands.get("10011")
+        # 等待期间不能交卷（沙盒没取到数）；但可以在任务圈内挪步或采一铲（S1）
+        assert command is None or command["action"] in ("move", "collect")
+        if command is not None and command["action"] == "move":
+            step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+            assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
         assert sandbox_command(payload) != ""
 
     # 第 TASK_LOOP_LIMIT 次读到同一份输出：放弃任务，开拓者回基地跟队
@@ -2951,8 +2963,14 @@ def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
             )
             assert distance(step, weapon) < distance(Pos(14, 14), weapon)
         else:
-            # 时限内继续守在任务点旁等答案
-            assert commands.get("10011") is None
+            # 时限内继续守在任务点旁等答案（可以在圈内挪步/采集，但不能交卷）
+            command = commands.get("10011")
+            assert command is None or command["action"] in ("move", "collect")
+            if command is not None and command["action"] == "move":
+                step = Pos(
+                    command["targetPos"][0]["x"], command["targetPos"][0]["y"],
+                )
+                assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
             assert sandbox_command(payload) != ""
 
 
@@ -2970,7 +2988,11 @@ def test_task_watchdog_starts_over_for_another_task(payload_factory, role_factor
     commands, _ = decide(payload)
 
     # 仍在任务点旁等答案，没有被上一个任务的计数带走
-    assert "10011" not in commands
+    command = commands.get("10011")
+    assert command is None or command["action"] in ("move", "collect")
+    if command is not None and command["action"] == "move":
+        step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+        assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
     assert sandbox_command(payload) != ""
 
 
@@ -3119,3 +3141,108 @@ def test_early_wall_keeps_single_worker_on_towers(payload_factory, role_factory)
         "targetPos": [{"x": 12, "y": 23}],
         "name": ROCKET,
     }
+
+
+# === 任务求助 LLM（任务期不占每日额度） ===
+
+
+def _llm_task_payload(payload_factory, role_factory, phase_task, round_no,
+                      evidence: str = "接口文档：GET http://localhost:8899/weather?city="):
+    """任务进行中、沙盒已吐回文档、但还没取到数的局面"""
+    payload = _stuck_task_payload(
+        payload_factory, role_factory, phase_task, round_no,
+    )
+    payload["lastCmdResult"] = _sandbox_result(phase_task, evidence)
+    return payload
+
+
+def test_task_prompt_carries_task_and_sandbox_evidence(payload_factory, role_factory):
+    """取不到数时把任务描述与沙盒证据交给 LLM，并要求 CMD/ANSWER 二选一"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京天气"
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    _, prompt = decide(payload)
+
+    assert "CMD:" in prompt and "ANSWER:" in prompt
+    assert phase_task in prompt
+    assert "localhost:8899" in prompt  # 沙盒证据要带上，LLM 才看得到接口
+
+
+def test_task_prompt_stops_after_limit(payload_factory, role_factory):
+    """同一个任务问满次数后不再继续问（别把任务窗都耗在提问上）"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+
+    for _ in range(brain.TASK_LLM_MAX_PROMPTS):
+        payload = _llm_task_payload(payload_factory, role_factory, phase_task, 11)
+        _, prompt = decide(payload)
+        assert prompt  # 前面几次都在问
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    _, prompt = decide(payload)
+    assert prompt == ""
+
+
+def test_llm_command_is_run_in_sandbox(payload_factory, role_factory):
+    """LLM 给的 CMD 下一回合作为沙盒命令下发（带任务标识，便于取答案）"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: curl -s http://localhost:8899/weather?city=beijing"
+    decide(payload)
+
+    command = sandbox_command(payload)
+    assert "curl -s http://localhost:8899/weather?city=beijing" in command
+    assert brain.TASK_MARKER in command  # 包装过，答案区能对上当前任务
+
+
+def test_task_answer_from_llm_command_output(payload_factory, role_factory):
+    """LLM 命令的输出在下一回合直接交卷"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: curl -s http://localhost:8899/weather?city=beijing"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13, evidence="晴，26℃",
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"]["action"] == "submitAnswer"
+    assert "晴" in commands["10011"]["taskAnswer"]
+
+
+def test_task_answer_from_llm_direct_answer(payload_factory, role_factory):
+    """LLM 直接给答案时不必绕沙盒，下一回合就交卷"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "ANSWER: beijing: 晴 26℃"
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": "beijing: 晴 26℃",
+    }
+
+
+def test_task_answer_ignores_task_echo_from_llm(payload_factory, role_factory):
+    """LLM 把任务原文当成答案返回时不能交（复读判定照样生效）"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，获取任务信息并作答"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = f"ANSWER: {phase_task}"
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
