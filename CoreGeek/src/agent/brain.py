@@ -8,7 +8,8 @@
           围墙建完后用富余资源换取金币和武器升级（金币阶梯：
           武器升级券 > 围墙升级券，不让金币在手里睡着）。
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
-          描述里没给文件名时先全盘探测沙盒，顺带把任务文件都读回来
+          描述里没给文件名时先在任务根目录里探测沙盒、认不出再退到全盘，
+          顺带把任务文件都读回来
           缓存备用，下一个任务点就能即时交卷），
           有任务在身时不退回基地，任务点冷却期间白天也守在下一个会开放的
           任务点旁等它开放（省掉"回基地再折返"的来回），天黑前再回防；
@@ -25,8 +26,9 @@
 建议与指令出自同一套决策函数。
 任务看门狗（`_TASK_WATCH`）同样只保留最近一回合的观察值（任务标识 + 回合号
 + 沙盒输出），回合号不连续就从头计数，因此它描述的是"当前这一局这个任务"；
-沙盒反复回读同一份文件或任务超时交不上卷时由它止损（见 `_task_abandoned`），
-不再让开拓者被一个拿不到答案的任务永久占死。
+沙盒反复回读同一份文件、任务超时交不上卷、或者同一份答案交满三次仍没被
+Judge 放行时由它止损（见 `_task_abandoned`），不再让开拓者被一个拿不到
+答案的任务永久占死。
 """
 
 import os
@@ -298,9 +300,30 @@ TASK_END_MARKER = "[TASK_END]"
 # 沙盒探测标记：任务描述里没给文件名时先探一次沙盒，这个标记下的输出
 # 只是文件路径清单，`_task_answer` 永远不会把它当成答案提交（见 `_sandbox_probe`）
 TASK_PROBE_MARKER = "[TASK_PROBE]"
+# 系统文档与库树（S2）：复盘 PK590252 的 R14/R16 两次读回来的
+# /usr/share/doc/uom-se-1.0.4/README.md 就在这里——探测命令放宽到 `*.md`
+# 之后，全盘 find 先命中的恰恰是这些库文档，任务正文一次都没读到。自进化
+# 任务的文件与接口文档都不在这些树里，找任务文件与找接口文档都不扫它们。
+TASK_SYSTEM_PRUNE = (
+    "/usr/share/doc", "/usr/share/man", "/usr/share/info", "/usr/share/sgml",
+    "/usr/lib", "/usr/include", "/usr/src",
+)
 # 沙盒里搜任务文件时跳过的虚拟目录：进程/内核/设备文件系统里不会有任务文件，
 # 却会让全盘 find 变慢并刷出一堆 Permission denied
-TASK_FIND_PRUNE = ("/proc", "/sys", "/dev")
+TASK_FIND_PRUNE = ("/proc", "/sys", "/dev") + TASK_SYSTEM_PRUNE
+# 任务根目录（S2）：自进化任务是按"步-接口"分目录摆的一套同构任务，任务文件
+# 与它自己的接口文档就在同一个目录树里。复盘 PK590252 里任务正文的真身是
+# /tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md，而全盘
+# 扫描（同一局的 R13 直接 `[TIMEOUT]`）既慢又要碰运气。探测、回读与执行器
+# 的搜索都先锚在这里，根目录里没有才退到全盘——沙盒版本不同、任务文件摆在
+# 别处时照样找得到。
+TASK_ROOTS = ("/tmp/selfEvolutionTask", "/tmp/selfEvolution")
+# 沙盒探测的次数上限（S2，敌方常量 max_probe_attempts=2）：只有任务描述里
+# 连文件名都没给时才探测。第一次探测没认出任务文件，说明根目录里那套命名
+# 对不上（或输出被截断），再探第二次；两次都没认出来就改用执行器按文件名
+# 特征自己找，不再反复扫根目录——复盘里 R12-R17 六回合的沙盒空转、R14/R16
+# 两次逐字相同的输出，都是"同一件事反复做"。
+TASK_PROBE_LIMIT = 2
 # 任务文件的文件名特征：描述里点名的那一份，以及任务目录里的同构任务
 # （任务书5.3节的例子是 task_1_beijing / task_2_shanghai 这一套）
 TASK_FILE_NAMES = ("task*", "spec*")
@@ -349,15 +372,22 @@ TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一�
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
+# 找接口文档时额外跳过的系统文档树（S2）：执行器要按"读文档 -> 拼地址"取数，
+# 而全盘捞回来的文档里最先命中的往往是库自带的说明（复盘 PK590252 的 R14/R16
+# 两次读回来的都是 /usr/share/doc/uom-se-1.0.4/README.md，两万三千多字符，
+# 与任务毫无关系），照着它拼出来的地址自然取不到数。任务根目录与任务文件
+# 所在目录优先，这些系统文档树直接不扫。
+TASK_DOC_PRUNE = TASK_EXEC_PRUNE + TASK_SYSTEM_PRUNE
 
 # 任务止损（S1）：自进化任务的闭环是"下发沙盒命令 -> 取数 -> submitAnswer"，
 # 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
 # 合不上。复盘里 PK589649/589653 的沙盒从 R11 起连续 6~7 个回合返回逐字相同
 # 的输出（exitCode:0 但没有取数证据），开拓者被读文件死循环占死，任务分丢光、
-# 这名劳动力也一起白搭。这里给任务两条止损线，到线就放弃任务、把开拓者还给
+# 这名劳动力也一起白搭。这里给任务三条止损线，到线就放弃任务、把开拓者还给
 # 战斗调度（见 `_task_abandoned`）：
 #   - 同一份沙盒输出连续出现 TASK_LOOP_LIMIT 次（读文件循环）
 #   - 任务已经占用开拓者 TASK_TIMEOUT_ROUNDS 个回合（任务书：单个任务时限 15 回合）
+#   - 同一份答案交满 TASK_SUBMIT_LIMIT 次仍没被放行（见下面的"提交闸门"）
 # 超时线取 10 而不是任务书的 15：真能解出答案的任务在收到第二条沙盒输出的
 # 回合就交卷了（答案缓存命中时更快），拖到第 10 个回合还交不上卷的任务，
 # 剩下的 5 个回合同样交不上，不如早点把开拓者还给战斗调度。
@@ -365,6 +395,17 @@ TASK_LOOP_LIMIT = 3
 TASK_TIMEOUT_ROUNDS = 10
 # 兼容旧名：测试与外部脚本仍按 `TASK_TIMEOUT` 引用（改名时漏改调用方）
 TASK_TIMEOUT = TASK_TIMEOUT_ROUNDS
+
+# 提交闸门（S1）：复盘 PK590252 的 R17 提交的是
+# "/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md"
+# ——开拓者把"该读哪个文件"当成了"文件里问的答案"，Judge 判 0 分，任务 2
+# 也跟着连锁未接。整个答案就是一条带文档扩展名的路径时一律不提交：按任务
+# 描述取数解出来的答案不会长成文件路径的样子（判定见 `_task_path_answer`）。
+# 同一份答案最多提交 TASK_SUBMIT_LIMIT 次（S1，敌方常量 max_submit_attempts=3）：
+# 交完卷任务还留在 phaseTask 里，说明 Judge 没放行；同一个答案再交第三遍
+# 同样放行不了，只会继续占着开拓者。到线就按止损处理（见 `_task_abandoned`），
+# 把开拓者还给战斗调度。
+TASK_SUBMIT_LIMIT = 3
 
 # === LLM 解任务 ===
 # 沙盒里的接口只能靠"读文档 -> 拼地址"去猜，猜不中时答案区永远是空的，
@@ -404,6 +445,8 @@ class TaskWatch:
         output: 当时那份属于本任务的沙盒输出（没有输出时为空串）
         rounds: 这个任务已经占用开拓者的回合数
         repeats: 当前这份输出已经连续出现了几次
+        probes: 到这个回合为止发出去的沙盒探测命令数（见 `TASK_PROBE_LIMIT`）
+        submits: 到这个回合为止打算交上去的答卷数（见 `TASK_SUBMIT_LIMIT`）
     """
 
     token: str
@@ -411,6 +454,8 @@ class TaskWatch:
     output: str
     rounds: int
     repeats: int
+    probes: int
+    submits: int
 
 
 # 任务看门狗（模块级单例，只存最近一回合的观察值）：每回合由 `decide` 用当前
@@ -2985,6 +3030,13 @@ def _watch_task(turn: Turn) -> None:
     最近一回合的观察值（`_TASK_WATCH`），并且只在回合号连续时往上累计：
     换任务、换局、回合号跳变都从这一回合重新计数，不会把别的一局的观察带进来。
 
+    两个计数（都从报文本身推出来，不额外存东西）:
+        - `probes`：上一回合的输出是探测输出（带 `TASK_PROBE_MARKER`），
+          说明那一次探测已经发出去过了（S2 的次数上限）。
+        - `submits`：这一回合手里有能交的答案，且是白天（夜里不交卷），
+          说明这一回合就会交一次卷（S1 的提交次数上限）。交完卷任务仍然
+          留在 `phaseTask` 里，下一回合就会再数一次。
+
     参数:
         turn: 当前回合信息
     """
@@ -2995,6 +3047,10 @@ def _watch_task(turn: Turn) -> None:
 
     token = _task_token(turn.phase_task)
     output = _task_output(turn)
+    probes = 1 if TASK_PROBE_MARKER in output else 0
+    submits = 1 if turn.is_day and (
+        _task_answer(turn) is not None or _cached_answer(turn) is not None
+    ) else 0
     previous = _TASK_WATCH
     if (
         previous is None
@@ -3002,7 +3058,9 @@ def _watch_task(turn: Turn) -> None:
         or turn.round_no != previous.round_no + 1
     ):
         # 新任务（或接不上上一回合的观察）：这一份输出算第 1 次出现
-        _TASK_WATCH = TaskWatch(token, turn.round_no, output, 1, 1 if output else 0)
+        _TASK_WATCH = TaskWatch(
+            token, turn.round_no, output, 1, 1 if output else 0, probes, submits,
+        )
         return
 
     # 又读到同一份输出说明这一回合没有任何进展，往上累计；换了新输出则重新数
@@ -3014,16 +3072,20 @@ def _watch_task(turn: Turn) -> None:
         repeats = 1
     _TASK_WATCH = TaskWatch(
         token, turn.round_no, output, previous.rounds + 1, repeats,
+        previous.probes + probes, previous.submits + submits,
     )
 
 
 def _task_abandoned(turn: Turn) -> bool:
     """当前任务是不是已经被看门狗放弃（只读，不刷新观察值）
 
-    两条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT_ROUNDS`）：同一份沙盒输出连续
-    出现了 `TASK_LOOP_LIMIT` 次，或者任务已经占用了 `TASK_TIMEOUT_ROUNDS` 个回合。
-    复盘里开拓者就是被"每回合回读同一份任务文件"的死循环占死的（PK589649
-    的 R11–R17、PK589653 的 R12–R17），任务分拿不到，这名劳动力也一起白搭。
+    三条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT_ROUNDS` /
+    `TASK_SUBMIT_LIMIT`）：同一份沙盒输出连续出现了 `TASK_LOOP_LIMIT` 次、
+    任务已经占用了 `TASK_TIMEOUT_ROUNDS` 个回合，或者同一份答案已经交满
+    `TASK_SUBMIT_LIMIT` 次还没被 Judge 放行。复盘里开拓者就是被"每回合回读
+    同一份任务文件"的死循环占死的（PK589649 的 R11–R17、PK589653 的 R12–R17），
+    上交的答案还可能是错的（PK590252 的 R17 交的是文件路径），任务分拿不到，
+    这名劳动力也一起白搭。
 
     观察值必须是本回合或上一回合记下的（`sandbox_command` 排在 `decide` 之前
     调用时，看到的是上一回合那条），回合号对不上就当作没有观察，免得把别的
@@ -3036,7 +3098,37 @@ def _task_abandoned(turn: Turn) -> bool:
         return False
     if turn.round_no not in (watch.round_no, watch.round_no + 1):
         return False
-    return watch.repeats >= TASK_LOOP_LIMIT or watch.rounds >= TASK_TIMEOUT_ROUNDS
+    return (
+        watch.repeats >= TASK_LOOP_LIMIT
+        or watch.rounds >= TASK_TIMEOUT_ROUNDS
+        # `submits` 把本回合这一次也算在内，所以第 TASK_SUBMIT_LIMIT+1 次
+        # 才止损——也就是最多交满 TASK_SUBMIT_LIMIT 次
+        or watch.submits > TASK_SUBMIT_LIMIT
+    )
+
+
+def _task_probe_done(turn: Turn) -> bool:
+    """当前任务的沙盒探测次数是不是已经用满（只读，见 `TASK_PROBE_LIMIT`）
+
+    探测只用来"描述里没给文件名时认一下沙盒里的任务文件叫什么"，认不出来
+    说明那套命名对不上，再扫一遍根目录只是把同一份输出再拿一次。用满次数
+    之后 `_sandbox_command` 直接把任务根目录交给执行器，由它按文件名特征
+    自己找（沙盒里真正干活的是执行器，探测只是给它指个路）。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        True 表示这个任务不再探测，直接执行
+    """
+    watch = _TASK_WATCH
+    if watch is None or not turn.phase_task:
+        return False
+    if watch.token != _task_token(turn.phase_task):
+        return False
+    if turn.round_no not in (watch.round_no, watch.round_no + 1):
+        return False
+    return watch.probes >= TASK_PROBE_LIMIT
 
 
 def _task_llm_state(turn: Turn) -> dict[str, Any]:
@@ -3147,6 +3239,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
+    if _task_path_answer(answer):
+        return None  # "ANSWER: <任务文件的路径>" 同样不是答案（S1）
     return answer
 
 
@@ -3165,6 +3259,8 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None
+    if _task_path_answer(answer):
+        return None  # 命令只把任务文件的路径打了出来，不算取到数
     return answer
 
 
@@ -3184,7 +3280,8 @@ def _sandbox_command(turn: Turn) -> str:
 
     描述里连文件名都没有时（"请按沙盒里的任务说明作答"这类），先按
     `_sandbox_probe` 探一次沙盒，下一回合从探测结果里认出文件名再走上面的
-    读文件流程。
+    读文件流程；探到 `TASK_PROBE_LIMIT` 次还没认出文件就改用执行器，把任务
+    根目录（`TASK_ROOTS`）交给它自己找——不再反复扫同一棵目录树。
 
     答案区之后依次是工作目录诊断与任务文件回读（`[TASK_FILE]` 分段，供
     `_task_file` 认出沙盒里的真实文件名、给执行器圈定候选任务文件）。
@@ -3208,8 +3305,14 @@ def _sandbox_command(turn: Turn) -> str:
 
     # 描述里没给文件名时，用上一回合的探测结果找；还没探过就先探一次
     target = _task_file(turn.phase_task) or _task_file(turn.last_cmd_result)
-    if target is None:
+    if target is None and not _task_probe_done(turn):
         return _sandbox_probe(turn)
+    if target is None:
+        # 探测次数已经用满（见 `TASK_PROBE_LIMIT`）：把任务根目录直接交给执行器，
+        # 由它在里面按文件名特征找任务文件与接口文档。再探一次只是把同一份
+        # 路径清单再拿一遍（复盘里 R14/R16 两次输出逐字相同就是这么来的），
+        # 而执行器本来就有"找文件 + 读文档 + 取数"的完整流程。
+        target = TASK_ROOTS[0]
 
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
     scan = "pwd; ls -a -- . 2>&1 | head -40"
@@ -3250,6 +3353,8 @@ def _task_executor(task_path: str) -> str:
         .replace("__DOC_NAMES__", repr(TASK_API_DOC_NAMES))
         .replace("__SUFFIXES__", repr(TASK_API_PATH_SUFFIXES))
         .replace("__PRUNE__", repr(TASK_EXEC_PRUNE))
+        .replace("__ROOTS__", repr(TASK_ROOTS))
+        .replace("__DOC_PRUNE__", repr(TASK_DOC_PRUNE))
         .replace("__SOLUTION__", repr(TASK_SOLUTION_MARKER))
         .replace("__SOLUTION_END__", repr(TASK_SOLUTION_END))
         .replace("__DATA__", repr(TASK_DATA_MARKER))
@@ -3288,6 +3393,8 @@ SOLVE_MAX = __SOLVE_MAX__
 DOC_NAMES = __DOC_NAMES__
 SUFFIXES = __SUFFIXES__
 PRUNE = __PRUNE__
+ROOTS = __ROOTS__
+DOC_PRUNE = __DOC_PRUNE__
 SOLUTION = __SOLUTION__
 SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
@@ -3320,31 +3427,45 @@ def fetch(url):
         return ""
 
 
-def find_files(patterns, limit):
+def find_files(patterns, limit, roots=ROOTS, prune=PRUNE):
     """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
 
-    全盘 walk 是这里最慢的一步，所以两个上限都要兜住：找到够数就停，
-    进的目录太多也停（沙盒命令整体限时 15 秒，宁可少找几个也不能超时）。
+    搜索默认锚在任务根目录（S2）：任务文件与它自己的接口文档就摆在同一棵
+    目录树里，而全盘 walk 是这里最慢的一步——复盘 PK590252 的 R13 整条命令
+    就是被它拖到 `[TIMEOUT]` 的。根目录里一个都没找到时，调用方拿同一套
+    上限退到全盘（`roots=("/",)`），沙盒版本不同也照样找得到。
+
+    两个上限都要兜住：找到够数就停，进的目录太多也停（沙盒命令整体限时
+    15 秒，宁可少找几个也不能超时）。
     """
     found = []
     seen = set()
     visited = 0
-    for root, dirs, files in os.walk("/"):
-        visited += 1
-        if visited > DIR_BUDGET:
-            break
-        dirs[:] = [d for d in dirs if os.path.join(root, d) not in PRUNE]
-        for name in files:
-            path = os.path.join(root, name)
-            if path in seen:
-                continue
-            if not any(re.search(pattern, name, re.I) for pattern in patterns):
-                continue
-            seen.add(path)
-            found.append(path)
-            if len(found) >= limit:
+    for start in roots:
+        if not os.path.isdir(start):
+            continue
+        for root, dirs, files in os.walk(start):
+            visited += 1
+            if visited > DIR_BUDGET:
                 return found
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in prune]
+            for name in files:
+                path = os.path.join(root, name)
+                if path in seen:
+                    continue
+                if not any(re.search(pattern, name, re.I) for pattern in patterns):
+                    continue
+                seen.add(path)
+                found.append(path)
+                if len(found) >= limit:
+                    return found
     return found
+
+
+def task_docs(roots):
+    """沙盒里文件名像任务文件的那些（先看任务根目录，再退到全盘）"""
+    patterns = (r"^(task|spec).*\\.(md|txt|json)$",)
+    return find_files(patterns, 24, roots, PRUNE)
 
 
 def task_files():
@@ -3352,7 +3473,7 @@ def task_files():
     wanted = os.path.basename(TASK_PATH) if TASK_PATH else ""
     named = []
     others = []
-    for path in find_files((r"^(task|spec).*\\.(md|txt|json)$",), 24):
+    for path in task_docs(ROOTS) or task_docs(("/",)):
         if wanted and os.path.basename(path) == wanted:
             named.append(path)
         else:
@@ -3420,7 +3541,18 @@ def candidates(text, name, urls):
 
 
 files = task_files()
-doc_files = find_files(DOC_NAMES, 6)
+# 接口文档的搜索范围（S2）：任务根目录与各任务文件所在目录优先，系统文档树
+# （/usr/share/doc 这类）整段跳过——复盘 PK590252 的 R14/R16 两次读回来的
+# /usr/share/doc/uom-se-1.0.4/README.md 就是从那里捞的，照着它拼地址自然
+# 取不到数。根目录里一份文档都没有时才退到全盘（仍然带着 DOC_PRUNE）。
+doc_roots = list(ROOTS)
+for path in files[:SOLVE_MAX]:
+    folder = os.path.dirname(path)
+    if folder and folder not in doc_roots:
+        doc_roots.append(folder)
+doc_files = find_files(DOC_NAMES, 6, doc_roots, DOC_PRUNE)
+if not doc_files:
+    doc_files = find_files(DOC_NAMES, 6, ("/",), DOC_PRUNE)
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
 print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
@@ -3455,15 +3587,17 @@ def _sandbox_find(
     names: tuple[str, ...],
     action: str,
     exts: tuple[str, ...] = TASK_FILE_EXTS,
+    root: str = "/",
 ) -> str:
-    """沙盒里按文件名全盘查找的 find 片段
+    """沙盒里按文件名查找的 find 片段（默认从根目录起全盘找）
 
     复盘里沙盒的工作目录就是 `/`，`ls -a -- .` 只有 bin/dev/etc/home/lib/
     lib64/proc/sbin/tmp/usr，而任务文件并不在 `/` 的前三层里：旧实现把搜索
     限定在 `find . -maxdepth 3` 加两个猜出来的目录（`/tmp/selfEvolutionTask`、
     `/tmp/selfEvolution`），任务文件一次都没被找到，开拓者整个任务周期
-    卡在任务点。这里改成从根目录起全盘按文件名找，只跳过 `TASK_FIND_PRUNE`
-    里的虚拟目录，读不到文件的目录由 `2>/dev/null` 静音。
+    卡在任务点。这里按文件名全盘找，只跳过 `TASK_FIND_PRUNE` 里的虚拟目录，
+    读不到文件的目录由 `2>/dev/null` 静音；`root` 用来把搜索锚到任务根目录
+    （S2，见 `_sandbox_find_first`）。
 
     命中还要过一道扩展名闸门（`exts`）：只有"名字像任务文件、且扩展名是
     文档"的才算任务文件，`task.xsl` 这类同名样式表被挡在外面（见
@@ -3473,6 +3607,7 @@ def _sandbox_find(
         names: 文件名通配（如 `task*`），多个通配之间是"或"关系
         action: 命中后执行的动作（`TASK_FIND_PRINT` 只列路径，内容由调用方按需读取）
         exts: 扩展名白名单，命中文件必须以后缀之一结尾
+        root: 搜索起点（默认全盘；任务根目录见 `TASK_ROOTS`）
 
     返回:
         可直接拼进沙盒命令的 find 片段
@@ -3481,8 +3616,42 @@ def _sandbox_find(
     wanted = " -o ".join(f'-name "{name}"' for name in names)
     docs = " -o ".join(f'-name "*{ext}"' for ext in exts)
     return (
-        f'find / \\( {prune} \\) -prune -o -type f \\( {wanted} \\)'
+        f'find {root} \\( {prune} \\) -prune -o -type f \\( {wanted} \\)'
         f" -a \\( {docs} \\) {action} 2>/dev/null"
+    )
+
+
+def _sandbox_find_first(
+    names: tuple[str, ...],
+    action: str,
+    limit: int,
+    exts: tuple[str, ...] = TASK_FILE_EXTS,
+) -> str:
+    """先在任务根目录里找，找不到才退到全盘（S2）
+
+    任务文件与它自己的接口文档就摆在 `TASK_ROOTS` 那棵目录树里，而全盘 find
+    是沙盒命令里最慢的一步——复盘 PK590252 的 R13 整条命令直接 `[TIMEOUT]`，
+    R14/R16 两次又把 `/usr/share/doc` 下的库文档当成任务文件读了回来。这里
+    把根目录里的命中当成主路径，只有那里一个都没找到（沙盒版本不同、任务
+    文件摆在别处）才扫全盘，既快又不会先捞到无关文件。
+
+    参数:
+        names: 文件名通配（如 `task*`）
+        action: 命中后执行的动作（通常只列路径）
+        limit: 最多带回几条（防止一条命令的输出把响应体撑大）
+        exts: 扩展名白名单
+
+    返回:
+        可直接拼进沙盒命令的 shell 片段（输出与单条 find 一致：一行一个路径）
+    """
+    near = "; ".join(
+        _sandbox_find(names, action, exts, root=path) for path in TASK_ROOTS
+    )
+    far = _sandbox_find(names, action, exts)
+    return (
+        f"found=$({{ {near}; }} | head -{limit}); "
+        f'if [ -z "$found" ]; then found=$({far} | head -{limit}); fi; '
+        f'echo "$found"'
     )
 
 
@@ -3509,8 +3678,7 @@ def _task_dump(turn: Turn) -> str:
     if turn.last_cmd_result and TASK_FILE_MARKER not in turn.last_cmd_result:
         names = TASK_PROBE_NAMES
     return (
-        f'for f in $({_sandbox_find(names, TASK_FIND_PRINT)}'
-        f" | head -{TASK_FILE_MAX});"
+        f"for f in $({_sandbox_find_first(names, TASK_FIND_PRINT, TASK_FILE_MAX)});"
         f' do echo "{TASK_FILE_MARKER}$f";'
         f' cat -- "$f" 2>/dev/null | head -{TASK_FILE_LIMIT};'
         f' echo "{TASK_FILE_END}"; done'
@@ -3526,6 +3694,10 @@ def _sandbox_probe(turn: Turn) -> str:
     所以文件路径清单永远不会被当成答案提交；工作目录与目录列表排在
     路径清单之后，只作诊断线索。
 
+    搜索先用任务根目录（`_sandbox_find_first`）：任务文件就在那里时不必扫全盘，
+    一条命令的 15 秒限时因此不会耗在无谓的 walk 上（复盘 PK590252 的 R13
+    整条命令就是被全盘 find 拖到 `[TIMEOUT]` 的）。
+
     参数:
         turn: 当前回合信息
 
@@ -3537,7 +3709,7 @@ def _sandbox_probe(turn: Turn) -> str:
     # 任何文档都可能是任务说明，但沙盒里的其他内容不该被当成任务文件读回来
     return (
         f'echo "{TASK_PROBE_MARKER}{token}"; '
-        f"{_sandbox_find(TASK_PROBE_NAMES, TASK_FIND_PRINT)} | head -40; "
+        f"{_sandbox_find_first(TASK_PROBE_NAMES, TASK_FIND_PRINT, 40)}; "
         f"pwd; ls -a -- . 2>&1 | head -40; "
         f'echo "{TASK_END_MARKER}"; :'
     )
@@ -3561,11 +3733,13 @@ def _task_answer(turn: Turn) -> str | None:
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
     答案取任务标识到 `TASK_END_MARKER` 之间、`[SOLUTION]` 段里的内容。
 
-    两道闸门保证交上去的不是任务原文（复盘里 4 次 submitAnswer 交的全是
-    任务描述，Judge 一次都没放行）：
+    三道闸门保证交上去的是答案本体（复盘里 4 次 submitAnswer 交的全是
+    任务描述、PK590252 的 R17 交的又是文件路径，Judge 一次都没放行）：
         1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
            执行器取不到数据时答案区是空的，这一回合就不提交；
-        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
+        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）；
+        3. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
+           "该读哪个文件"当成了答案。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
@@ -3599,7 +3773,29 @@ def _task_answer(turn: Turn) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None
+    if _task_path_answer(answer):
+        return None  # 交上去的是一条路径：文件里问的答案还没拿到
     return answer
+
+
+def _task_path_answer(answer: str) -> bool:
+    """答案是不是一条文件路径（S1：交文件路径 = 又一次 0 分）
+
+    复盘 PK590252 的 R17 提交的正是
+    "/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md"
+    ——开拓者找到了任务文件，却把"该读哪个文件"当成了答案交上去。整个答案
+    就是一条带文档扩展名的路径（`TASK_FILE_PATTERN` 的全匹配）时才判定命中：
+    "查询北京文化遗产"这类任务解出来的答案是一段数据，不会长成路径的样子，
+    而多行/带空格的答案天然不会全匹配。
+
+    参数:
+        answer: 待提交的答案内容
+
+    返回:
+        True 表示这条答案看着就是文件路径，不能提交
+    """
+    text = answer.strip()
+    return "\n" not in text and TASK_FILE_PATTERN.fullmatch(text) is not None
 
 
 def _solution_answer(region: str, turn: Turn) -> str | None:
@@ -3679,11 +3875,18 @@ def _cached_answer(turn: Turn) -> str | None:
 
     任务描述里没点名文件时返回 None：探测出来的文件名与任务描述的对应关系
     不确定，宁可多花一个来回执行一次，也不拿别的任务的答案去作答。
+
+    缓存里那条答案本身也要过 `_task_path_answer` 的闸门：缓存是在执行器输出
+    上直接建的（`_remember_task_answers`），同一份"答案"从这里出去同样可能
+    是一条文件路径——提交闸门只在 `_task_answer` 里拦一道的话，这条路就绕过去了。
     """
     target = _task_file(turn.phase_task)
     if target is None:
         return None
-    return _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
+    answer = _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
+    if answer is None or _task_path_answer(answer):
+        return None
+    return answer
 
 
 def _go_mine(
