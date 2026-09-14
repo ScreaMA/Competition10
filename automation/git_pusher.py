@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from dispatcher import Task
@@ -34,6 +36,10 @@ class GitResult:
 
 class GitPusher:
     """封装仓库上的git操作与PR创建"""
+
+    # 回收站目录名：失败任务的未跟踪文件移到这里而不是删除
+    # （见 discard_changes / _quarantine 的说明）
+    TRASH_DIR = ".claude"
 
     def __init__(
         self,
@@ -122,6 +128,11 @@ class GitPusher:
 
         必须用 strip=False 的原始输出：` M path`（未暂存改动）的前导空格是
         状态列的一部分，裁掉它会把路径首字符一起切掉。
+
+        回收站目录（`TRASH_DIR`）被排除在外：它是 `discard_changes` 自己建的，
+        若算作脏文件，回收完工作区依然不干净（实测会让上一条命令刚清干净、
+        下一条命令又发现新残留）。不能依赖 .gitignore——测试仓库是临时目录，
+        不带项目的忽略规则，只能在这里硬性排除。
         """
         result = self._git("status", "--porcelain", strip=False)
         paths: list[str] = []
@@ -135,8 +146,12 @@ class GitPusher:
             # 含特殊字符时git会给路径加引号
             if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
                 path = path[1:-1]
-            if path:
-                paths.append(path)
+            if not path:
+                continue
+            # 回收站本身不算脏（含其下的所有内容）
+            if path == self.TRASH_DIR or path.startswith(f"{self.TRASH_DIR}/"):
+                continue
+            paths.append(path)
         return paths
 
     def has_changes(self) -> bool:
@@ -264,8 +279,14 @@ class GitPusher:
         会被下一个任务当成“任务前就存在的脏文件”而被排除，导致后续任务
         明明改了代码却提交不上去（实测 #15 超时后，#14 因此被记成 no_change）。
 
-        只处理任务开始后才变脏的文件：已跟踪的还原到 HEAD，未跟踪的删除；
-        任务开始前就存在的未提交文件（他人WIP）保持不动。
+        只处理任务开始后才变脏的文件：已跟踪的还原到 HEAD（内容在 git 里，
+        随时可取回），未跟踪的**移到回收站而不是删除**。
+
+        为什么未跟踪文件不能删：从 git 的角度，“Claude 跑崩留下的半成品”与
+        “用户在任务执行期间放进来的新素材”完全无法区分。实测一次
+        `git clean -f` 连带清掉了用户手工放入的聊天记录 eml、几张布局截图
+        和一份三百多行的分析文档——这些内容从未进过 git，删掉即永久丢失。
+        移到回收站同样能让工作区变干净（原始问题得以解决），但数据可恢复。
 
         返回:
             实际被丢弃的文件列表
@@ -286,10 +307,32 @@ class GitPusher:
         if tracked:
             self._git("checkout", "--", *tracked)
         if untracked:
-            # 只删除本次新产生的未跟踪文件/目录
-            self._git("clean", "-f", "--", *untracked)
+            self._quarantine(untracked)
         LOGGER.warning("已回收本次任务的残留改动：%s", ", ".join(todo))
         return todo
+
+    def _quarantine(self, paths: list[str]) -> Path:
+        """把未跟踪文件移到带时间戳的回收站目录（不删除，便于事后取回）
+
+        回收站位于 `<TRASH_DIR>/discarded/<时间戳>/`，保留原有的目录层级。
+        该目录由 `_porcelain_paths` 硬性排除，不会反过来变成新的残留。
+
+        移动失败只记日志、不抛异常：回收是收尾动作，不该让整个任务失败。
+        """
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        trash = self.repo_dir / self.TRASH_DIR / "discarded" / stamp
+        for path in paths:
+            source = self.repo_dir / path
+            if not source.exists():
+                continue
+            target = trash / path
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(target))
+            except OSError as exc:
+                LOGGER.error("回收 %s 失败（文件保留在原处）：%s", path, exc)
+        LOGGER.warning("未跟踪文件已移至回收站 %s，如需取回请从该目录复制", trash)
+        return trash
 
     # === 与远端同步 ===
 

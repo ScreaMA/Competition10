@@ -595,7 +595,13 @@ def test_discard_changes_reclaims_failed_task_leftovers(repo_pair):
 
     assert sorted(discarded) == ["code.txt", "new_file.txt"]
     assert (repo_pair / "code.txt").read_text(encoding="utf-8") == "v1\n"  # 已还原
-    assert not (repo_pair / "new_file.txt").exists()                       # 已删除
+    # 未跟踪文件是“移走”而不是“删除”：工作区看不到，但内容还在回收站里
+    # （回归：曾经用 git clean -f 直接删掉，连带清掉了用户手工放入、
+    #   从未进过 git 的素材，删掉即永久丢失）
+    assert not (repo_pair / "new_file.txt").exists()
+    quarantined = list((repo_pair / ".claude" / "discarded").rglob("new_file.txt"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "claude new\n"
     assert (repo_pair / "wip.txt").read_text(encoding="utf-8") == "other session WIP\n"
     assert pusher.dirty_paths() == pre_dirty
 

@@ -3,6 +3,11 @@ debug.log
 *.log
 **/.processed_issues.json
 
+# 自动化系统回收站（失败任务的未跟踪文件存放处，见 git_pusher._quarantine）
+# 忽略整个 .claude/：git 对未跟踪目录只报目录名不递归，
+# 写成 .claude/discarded/ 匹配不到
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]
