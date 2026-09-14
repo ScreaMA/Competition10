@@ -398,8 +398,14 @@ TASK_DOC_WIDE_NAMES = (
 # 就照旧裸请求——多带一个头不影响本就无需鉴权的接口，少带一个头则必然 401。
 TASK_API_KEY_MIN_LEN = 6  # Key 至少这么长：更短的串多半是行文里的词，不是 Key
 TASK_API_KEY_PATTERNS = (
-    # `Authorization: Bearer <key>` / `Authorization=<key>`（`Bearer` 可有可无）
-    r"authorization[\"']?\s*[:=：]\s*[\"'`\s]*(?:bearer\s+)?"
+    # `Authorization: Bearer <key>` / `Authorization=<key>`（`Bearer` 可有可无）。
+    # 分隔符里带上 `|`：接口文档常把请求头写成表格的一行
+    # （`| Authorization | Bearer sk-xxx |`），只认 `:`/`=` 时这一行整个漏掉，
+    # Key 抠不出来 -> `[SCAN] ... key=no` -> 裸请求 -> 401 缺 Authorization 头。
+    # `Bearer` 两边的引号/反引号一并吃掉：文档写成 ``Bearer `sk-xxx` ``
+    # （markdown 行内代码）时，值前面还挂着一个反引号，旧写法从反引号起头、
+    # 匹配不上捕获组。
+    r"authorization[\"']?\s*[:=：|]\s*[\"'`\s]*(?:bearer\s+)?[\"'`\s]*"
     r"([A-Za-z0-9._~+/=\-]{%d,})" % TASK_API_KEY_MIN_LEN,
     # `X-API-Key: <key>` / `api_key=<key>` / `token：<key>` / 表格里的 `| API Key | <key> |`
     r"(?:x-api-key|api[-_ ]?key|apikey|access[-_ ]?token|token)[\"']?\s*[:=：|]\s*[\"'`\s]*"
@@ -3708,6 +3714,11 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
     的命令；状态里没落下命令时 `_task_prompt` 下一回合会再问一次，问到
     `TASK_LLM_MAX_PROMPTS` 次为止（复盘 PK590881 的 R14 就是被一条引号不配对
     的命令耗掉了一个回合，PK591011 的 R13/R16 则是被 heredoc 耗掉的）。
+
+    体检之后还有一道鉴权闸门（`_task_command_auth_ok`，S1）：接口已经回过
+    "缺 Authorization 头"（复盘 PK591784 的 R16 401）而命令里一点鉴权材料都
+    没有时同样丢掉——执行器的请求会带上文档里的 Key，比这条必然 401 的命令
+    更接近答案。
     """
     reply = str(payload.get("llmResp") or "")
     if not turn.phase_task or not reply:
@@ -3717,7 +3728,11 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
         text = line.strip()
         if text.startswith(TASK_LLM_CMD_PREFIX):
             command = text[len(TASK_LLM_CMD_PREFIX):].strip()
-            if command and _shell_command_ok(command):
+            if (
+                command
+                and _shell_command_ok(command)
+                and _task_command_auth_ok(command, turn.last_cmd_result or "")
+            ):
                 state["pending_cmd"] = command
                 return
     for line in reply.splitlines():
@@ -3772,6 +3787,72 @@ def _shell_command_ok(command: str) -> bool:
     if LLM_HEREDOC_PATTERN.search(command):
         return False
     return all(command.count(quote) % 2 == 0 for quote in ('"', "'"))
+
+
+# 命令里"带了鉴权材料"的样子（S1，见 `_task_command_auth_ok`）：执行器发的是
+# `Authorization` / `X-API-Key` 两个头，文档里常见的还有 `Bearer <key>`、
+# `api_key=<key>`、`token=<key>`，以及把 Key 直接拼进查询串的写法（`?key=`）。
+TASK_AUTH_REQUEST_PATTERN = re.compile(
+    r"authorization|x-api-key|api[-_]?key|access[-_]?token|\btoken\b|\bbearer\b|[?&]key=",
+    re.I,
+)
+# 命令里出现本地接口的形态（沙盒里的接口就在 `TASK_API_DEFAULT` 那个主机上）：
+# 带不带 `http://` 前缀、带不带端口都算。
+TASK_LOCAL_API_PATTERN = re.compile(
+    r"(?:https?://)?(?:localhost|127\.0\.0\.1)(?::\d+)?",
+    re.I,
+)
+# 沙盒证据里"这个接口要 Authorization 头、而刚才没带"的证词（S1）：接口在
+# 401/403 的正文里点名自己要哪个头——复盘 PK591784 的 R16 回的就是
+# `[APIFAIL] ... HTTPError 401 => {"error":"Authentication failed: Missing
+# 'Authorization' header"}`。头名与状态码要落在同一行（诊断行就是这么打的），
+# 免得把文档里两处不相干的说法拼成一句。没有这份证词时无从知道接口要不要
+# 鉴权，命令照原样放行。
+TASK_AUTH_DEMAND_PATTERN = re.compile(
+    r"(?:authorization|x-api-key)[^\n]{0,80}?(?:\b40[13]\b|missing|required|invalid)"
+    r"|(?:\b40[13]\b|missing|required|invalid)[^\n]{0,80}?(?:authorization|x-api-key)",
+    re.I,
+)
+
+
+def _task_command_auth_ok(command: str, evidence: str) -> bool:
+    """LLM 给的取数命令会不会"没带鉴权就去调接口"（S1）
+
+    执行器发出的每个请求都按文档里的写法带上了鉴权头（`api_key` +
+    `request_headers`），而 LLM 给的 `CMD:` 是原样下发的：它见过接口文档
+    （`_task_prompt` 把沙盒证据一并喂过去，也提醒过"401/403 是头没带对"），
+    却未必会把头抄进命令里。这种命令必然换来一句
+    `401 ... Missing 'Authorization' header`（复盘 PK591784 的 R16），答案拿
+    不到，这一个任务回合也白搭。
+
+    判死要同时满足三件事，缺一不可：
+        - 命令确实在调本地接口（`TASK_LOCAL_API_PATTERN`）——读文件、跑校验
+          脚本这类不碰接口的命令与鉴权无关；
+        - 命令里一点认证材料都没有（`TASK_AUTH_REQUEST_PATTERN`）——照文档
+          抄了 `Bearer` / `api_key=` / `token=` 的都算带了，带得对不对由接口
+          说了算，这里不判；
+        - 沙盒证据里有"这个接口要 Authorization 头"的证词
+          （`TASK_AUTH_DEMAND_PATTERN`）——接口自己说了要头，才谈得上"没带
+          必然 401"。
+
+    三条都中的命令丢掉（与 `_shell_command_ok` 同一个取舍：宁可漏放一条，
+    也不拿一个回合去赌一条注定失败的请求），本回合改走执行器兜底
+    （`_sandbox_command`）——执行器会按文档把 Key 抠出来带上、并轮转候选地址，
+    比再发一条注定 401 的请求更接近答案。`_task_prompt` 下一回合还会再问一次，
+    次数照旧受 `TASK_LLM_MAX_PROMPTS` 约束。
+
+    参数:
+        command: LLM 给的取数命令（已过 `_shell_command_ok` 体检）
+        evidence: 上一回合的沙盒输出（接口文档与 `[APIFAIL]` 诊断都在里面）
+
+    返回:
+        True 表示这条命令可以下发
+    """
+    if not TASK_LOCAL_API_PATTERN.search(command):
+        return True  # 不碰接口的命令与鉴权无关
+    if TASK_AUTH_REQUEST_PATTERN.search(command):
+        return True  # 带过鉴权材料，放行给接口判
+    return TASK_AUTH_DEMAND_PATTERN.search(evidence) is None
 
 
 # 沙盒里被调用的脚本可能是 CRLF 行尾（S1）：任务自带的校验脚本按 Windows 换行

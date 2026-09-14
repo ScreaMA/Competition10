@@ -4278,6 +4278,85 @@ def test_shell_command_check_rejects_heredoc():
     assert brain._shell_command_ok('curl -s http://localhost:8899/w <<< "x"')
 
 
+# 接口回过"缺 Authorization 头"的沙盒证据（PK591784 的 R16 就是这句）
+_AUTH_DEMAND = (
+    "[APIFAIL] http://localhost:8899/weather 401 => "
+    "Authentication failed: Missing 'Authorization' header"
+)
+
+
+def test_task_command_auth_ok_rejects_headerless_api_calls():
+    """接口已回过"缺 Authorization 头"时，没带鉴权的取数命令不下发（S1）
+
+    复盘 PK591784 的 R16：LLM 给的 `CMD:` 原样下发，请求里没有 Authorization
+    头，接口回 `401 Authentication failed: Missing 'Authorization' header`——
+    答案拿不到，这一个任务回合也白搭。执行器的请求会按文档把 Key 抠出来带上
+    （见 `test_executor_api_key_follows_document_headers`），这条命令丢掉、
+    改走执行器兜底，比再发一条注定 401 的请求更接近答案。
+    """
+    # 调本地接口又一无所带：丢掉
+    assert not brain._task_command_auth_ok(
+        "curl -s http://localhost:8899/weather?city=beijing", _AUTH_DEMAND,
+    )
+    # 照文档抄了鉴权材料的照旧放行：头 / Bearer / api_key / token 都算带了
+    for command in (
+        'curl -s -H "Authorization: Bearer sk-x" http://localhost:8899/weather',
+        "curl -s -H 'X-API-Key: sk-x' http://localhost:8899/weather",
+        "curl -s http://localhost:8899/weather?api_key=sk-x",
+        "curl -s http://localhost:8899/weather?key=sk-x&city=beijing",
+        "curl -s http://localhost:8899/weather?city=beijing -H 'token: sk-x'",
+    ):
+        assert brain._task_command_auth_ok(command, _AUTH_DEMAND), command
+
+
+def test_task_command_auth_ok_needs_a_reason_and_a_local_call():
+    """判死这条命令要三件事齐全：调本地接口、没带鉴权、接口说了要头
+
+    少任何一件都放行——读文件/跑校验脚本的命令与鉴权无关；接口没说过要头时
+    无从判定；沙盒证据里没有 401/403 这类证词时同理（地址猜错的 404 不该被
+    当成鉴权问题）。
+    """
+    # 不碰接口的命令与鉴权无关
+    assert brain._task_command_auth_ok("cat task_1_beijing.md", _AUTH_DEMAND)
+    assert brain._task_command_auth_ok("./check --round 3", _AUTH_DEMAND)
+    # 接口没说过的：文档只给了地址，没有要鉴权的说法
+    assert brain._task_command_auth_ok(
+        "curl -s http://localhost:8899/weather?city=beijing",
+        "接口文档：GET http://localhost:8899/weather?city=",
+    )
+    # 404 是地址不对，不是没带鉴权
+    assert brain._task_command_auth_ok(
+        "curl -s http://localhost:8899/weather?city=beijing",
+        "[APIFAIL] http://localhost:8899/weather 404 => not found",
+    )
+
+
+def test_llm_command_without_auth_falls_back_to_the_executor(
+    payload_factory, role_factory,
+):
+    """没带鉴权的 LLM 命令不落进任务状态，这一回合改走执行器（S1）
+
+    状态里没落下命令时 `_sandbox_command` 走执行器兜底：它会按文档把 Key 抠
+    出来带上、并轮转候选地址。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 12, evidence=_AUTH_DEMAND,
+    )
+    payload["llmResp"] = "CMD: curl -s http://localhost:8899/weather?city=beijing"
+    decide(payload)
+
+    assert not any(
+        state.get("pending_cmd") for state in brain._TASK_LLM_STATE.values()
+    )
+    command = sandbox_command(payload)
+    assert "curl -s http://localhost:8899/weather?city=beijing" not in command
+    assert brain.TASK_SCAN_MARKER in command  # 走的是执行器
+
+
 def test_script_in_command_finds_the_script_not_its_arguments():
     """`_script_in_command` 认的是"要跑的脚本"，不是解释器/参数/地址（S1）"""
     assert brain._script_in_command("./check") == "./check"
@@ -5671,6 +5750,27 @@ def test_executor_api_key_skips_document_prose():
     # `Bearer` 后面直接换行、下一行是地址：那不是 Key
     assert key("Authorization: Bearer\nhttp://localhost:8899/x") == ""
     assert key("请阅读 task_1_beijing.md，获取任务信息") == ""
+
+
+def test_executor_api_key_reads_the_authorization_row_of_a_table():
+    """请求头写成表格的一行时也要抠得出 Key（S1，PK591784 的 R16 401）
+
+    接口文档常把请求头列成表格（`| Authorization | Bearer sk-xxx |`），旧写法
+    只认 `Authorization:` / `Authorization=`，`|` 分隔的那一行整个漏掉：Key 抠
+    不出来 -> `[SCAN] ... key=no` -> 请求里只剩 `Accept` -> 接口回一句
+    `401 Authentication failed: Missing 'Authorization' header`（PK591784 的
+    R16），任务分继续挂零。`Bearer` 的值用行内代码包起来（`` `sk-xxx` ``）时
+    同理，反引号要一并吃掉。
+    """
+    key, _ = _executor_auth()
+
+    assert key("| Authorization | Bearer sk-abc123456 |") == "sk-abc123456"
+    assert key("| Authorization | sk-abc123456 |") == "sk-abc123456"
+    assert key("Authorization: Bearer `sk-abc123456`") == "sk-abc123456"
+    assert key("| authorization | `Bearer sk-abc123456` |") == "sk-abc123456"
+    # 表格里的说明文字照旧不当 Key（占位词与中文都挡在外面）
+    assert key("| Authorization | Bearer | 必填 |") == ""
+    assert key("| Authorization | 用于鉴权 |") == ""
 
 
 def test_executor_request_headers_add_bearer_and_key():
