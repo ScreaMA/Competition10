@@ -4238,6 +4238,44 @@ def test_task_prompt_stops_after_limit(payload_factory, role_factory):
     assert prompt == ""
 
 
+def test_rejected_llm_answer_keeps_the_questions_coming(
+    payload_factory, role_factory,
+):
+    """LLM 给的答案被判回后照旧能继续求助（S1）
+
+    `_consume_task_reply` 收到的 `ANSWER:` 要过 `_llm_direct_answer` 的闸门才算
+    答案：复读任务原文、沙盒文档正文、接口错误体、文件路径都会被判回。旧写法
+    只看"状态里有没有答案"，被判回的那一份于是把求助线整段掐死——`_task_prompt`
+    再也不问，而它自己又永远交不上去，LLM 兜底这条线在这个任务上就没了下文
+    （任务窗口只剩执行器一路空转刷 `state=no_api_data`，直到看门狗止损）。
+    判回的那一份要丢掉，下一回合照旧把沙盒证据交给 LLM 重问。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京天气"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = f"ANSWER: {phase_task}"  # 复读任务原文，闸门判回
+    _, prompt = decide(payload)
+
+    assert phase_task in prompt  # 问的还是"任务求助"那条线，不是策略咨询
+    assert "CMD:" in prompt
+    assert "没被采纳" in prompt  # 上一次被判回这件事要告诉 LLM
+
+
+def test_accepted_llm_answer_stops_the_questions(payload_factory, role_factory):
+    """手里已经有一份过得了闸门的答案时不再重复求助（额度别浪费在提问上）"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京天气"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "ANSWER: beijing: 晴 26℃"
+    _, prompt = decide(payload)
+
+    assert prompt == ""
+
+
 def test_llm_command_is_run_in_sandbox(payload_factory, role_factory):
     """LLM 给的 CMD 下一回合作为沙盒命令下发（带任务标识，便于取答案）"""
     brain._TASK_LLM_STATE.clear()
