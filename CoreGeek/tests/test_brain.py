@@ -32,6 +32,8 @@ from agent.brain import (
     STONE_BATCH,
     STONE_PLAN_MAX,
     STONE_RESERVE_MIN,
+    TASK_API_FAIL_LIMIT,
+    TASK_API_FAIL_MARKER,
     TASK_DATA_MARKER,
     TASK_DOC_MARKER,
     TASK_END_MARKER,
@@ -3368,8 +3370,10 @@ def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
 ):
     """沙盒一直解不出答案时按任务时限止损：占满 TASK_TIMEOUT 个回合就放弃
 
-    每回合的输出都不一样（不是死循环，没触发读文件熔断），但始终取不到数据，
-    这时按回合数兜底——开拓者不再被一个拿不到答案的任务永久占死。
+    每回合的输出都不一样（不是死循环，没触发读文件熔断），而且取数是成功的
+    （`[API]` 证据在，取数连败那条线同样不触发），只是答案区始终拼不出能过
+    提交闸门的内容，这时按回合数兜底——开拓者不再被一个拿不到答案的任务
+    永久占死。
     """
     phase_task = "请阅读task_1_beijing.md"
     weapon = Pos(9, 24)
@@ -3378,9 +3382,11 @@ def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
         payload = _stuck_task_payload(
             payload_factory, role_factory, phase_task, 11 + offset,
         )
-        # 每回合的输出都不一样：有进展，但始终没解出答案
+        # 每回合的输出都不一样：取到数了，但没拼出答案段（`[SOLUTION]` 为空）
         payload["lastCmdResult"] = _sandbox_result(
-            phase_task, f"第 {offset} 次搜索，仍无任务文件\n",
+            phase_task,
+            f"{TASK_DATA_MARKER} http://localhost:8899/heritage => 12 "
+            f"（第 {offset} 次取数）\n",
         )
         commands, _ = decide(payload)
 
@@ -3402,6 +3408,85 @@ def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
                 )
                 assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
             assert sandbox_command(payload) != ""
+
+
+def test_task_fail_limit_releases_pioneer_after_repeated_api_failures(
+    payload_factory, role_factory,
+):
+    """沙盒连续几回合取数全失败时止损：到 TASK_API_FAIL_LIMIT 就放弃任务
+
+    回归：PK590916/PK591014 里开拓者 R10 接了自进化任务后，沙盒每回合换一批
+    `[APIFAIL] ... HTTPError 404` 的地址（一条命令 8 次机会全打光），输出既不
+    重样（`repeats` 到不了 `TASK_LOOP_LIMIT`）也取不到数，只能一路拖到
+    `TASK_TIMEOUT_ROUNDS`，整段任务窗都白等在任务点上。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    weapon = Pos(9, 24)
+
+    for offset in range(TASK_API_FAIL_LIMIT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        # 每回合猜的地址都不一样：不是读文件死循环，但同样没取到数
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task,
+            f"{TASK_API_FAIL_MARKER} http://localhost:8899/guess{offset}"
+            " HTTPError 404 => {\"status\":\"error\",\"code\":404}\n",
+        )
+        commands, _ = decide(payload)
+
+        if offset == TASK_API_FAIL_LIMIT - 1:
+            # 到取数连败止损线：放弃任务，开拓者回基地跟队
+            assert sandbox_command(payload) == ""
+            assert commands["10011"]["action"] == "move"
+            step = Pos(
+                commands["10011"]["targetPos"][0]["x"],
+                commands["10011"]["targetPos"][0]["y"],
+            )
+            assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+        else:
+            # 还没到止损线：继续守在任务点旁等答案，但不交卷（沙盒没取到数）
+            command = commands.get("10011")
+            assert command is None or command["action"] == "move"
+            if command is not None and command["action"] == "move":
+                step = Pos(
+                    command["targetPos"][0]["x"], command["targetPos"][0]["y"],
+                )
+                assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
+            assert sandbox_command(payload) != ""
+
+
+def test_task_fail_streak_resets_when_data_comes_back(payload_factory, role_factory):
+    """取数连败是"连续"计数：中间取到一次数就从头数，不会误伤到线的任务
+
+    连撞几回合 404 之后有一回合取到了数（`[API]` 证据在），前面那几回合不该
+    再算数；否则一个只是"前几回合运气不好"的任务会被提前放弃。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+
+    for offset in range(TASK_API_FAIL_LIMIT - 1):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task,
+            f"{TASK_API_FAIL_MARKER} http://localhost:8899/guess{offset}"
+            " HTTPError 404\n",
+        )
+        decide(payload)
+        assert brain._TASK_WATCH is not None
+        assert brain._TASK_WATCH.fails == offset + 1  # 还差一回合才到止损线
+
+    # 再一回合取到了数：连败计数清零，任务不该被放弃
+    ok = _stuck_task_payload(
+        payload_factory, role_factory, phase_task, 11 + TASK_API_FAIL_LIMIT - 1,
+    )
+    ok["lastCmdResult"] = _solution_result(phase_task, "task_1_beijing.md", "北京")
+    commands, _ = decide(ok)
+
+    assert brain._TASK_WATCH is not None
+    assert brain._TASK_WATCH.fails == 0
+    assert sandbox_command(ok) != ""  # 任务还在做，没有被止损掉
 
 
 def test_task_watchdog_starts_over_for_another_task(payload_factory, role_factory):
