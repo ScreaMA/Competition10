@@ -38,6 +38,7 @@ from agent.brain import (
     _plan_summary,
     _reserved_build_sites,
     _task_token,
+    _tower_site_brief,
     _valid_stand_cells,
     decide,
     sandbox_command,
@@ -985,13 +986,45 @@ def test_pioneer_returns_to_task_point_when_task_running(payload_factory, role_f
     assert distance(step, Pos(14, 14)) < distance(before, Pos(14, 14))
 
 
-def test_pioneer_falls_back_to_weapon(payload_factory, role_factory):
-    """任务都在冷却中且短期不会开放时跟随武器塔"""
+def test_pioneer_waits_at_cooling_task_point(payload_factory, role_factory):
+    """任务冷却期间白天守在任务点旁，不再回基地再折返
+
+    回归：旧实现只在冷却剩 3 回合时才往外走，其余回合掉头回基地跟随武器塔
+    （`test_pioneer_returns_to_weapon_before_night` 覆盖天黑前那一段）。
+    任务点离基地十几格，一天来回一趟就是二十多个回合，两处任务点因此常常
+    只赶得上一个——复盘里敌方 r14 交完第一个任务、r17 立刻接上第二个。
+    """
     before = Pos(11, 22)
-    weapon_pos = Pos(9, 24)
     task_pos = Pos(14, 14)
     payload = payload_factory(
         round_no=1,
+        gold=0,
+        roles=[
+            role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+        tasks=[(task_pos.x, task_pos.y, {"isValid": False, "coldDownRounds": 20})],
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10011"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    # 走向冷却中的任务点守候，而不是朝基地里的武器塔移动
+    assert distance(step, task_pos) < distance(before, task_pos)
+
+
+def test_pioneer_returns_to_weapon_before_night(payload_factory, role_factory):
+    """天黑前按返程路费提前退回基地：守任务点不能把夜晚的火力搭进去
+
+    任务书4.4节：武器要有角色操控才会开火。任务点离基地 10 格时，
+    最后 15 回合（路费 + 提前回防量）就不再往外守，直接回防。
+    """
+    before = Pos(14, 14)
+    weapon_pos = Pos(9, 24)
+    task_pos = Pos(14, 14)
+    payload = payload_factory(
+        round_no=DAY_ROUNDS - 2,  # 距天黑 3 回合，不够从任务点走回基地
         gold=0,
         roles=[
             role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40),
@@ -1004,9 +1037,35 @@ def test_pioneer_falls_back_to_weapon(payload_factory, role_factory):
     command = commands["10011"]
     assert command["action"] == "move"
     step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
-    # 走向武器塔备战，而不是跑去冷却中的任务点
+    # 走向武器塔备战，而不是继续守在冷却中的任务点旁
     assert distance(step, weapon_pos) <= distance(before, weapon_pos)
     assert distance(step, task_pos) >= distance(before, task_pos)
+
+
+def test_pioneer_waits_at_task_point_opening_soonest(payload_factory, role_factory):
+    """两个任务点都在冷却时，守在更早开放的那一个旁边
+
+    守错任务点会白白错过另一个先开放的任务点（复盘里两个任务点合计
+    160分+160金币，只守一个等于把另一个让给对手）。
+    """
+    before = Pos(10, 12)
+    late_task = Pos(10, 14)  # 近，但要 30 回合后才开放
+    soon_task = Pos(20, 14)  # 远，2 回合后就开放
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40)],
+        tasks=[
+            (late_task.x, late_task.y, {"isValid": False, "coldDownRounds": 30}),
+            (soon_task.x, soon_task.y, {"isValid": False, "coldDownRounds": 2}),
+        ],
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10011"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    assert distance(step, soon_task) < distance(before, soon_task)
 
 
 def test_pioneer_prefers_task_closer_to_timeout(payload_factory, role_factory):
@@ -2116,6 +2175,117 @@ def test_strategy_prompt_states_tasks_and_gold_ownership(
 
     assert "不需要建议放弃任务" in prompt
     assert "不存金币" in prompt
+
+
+# === 塔位占用校验与布防方位（issue #29） ===
+
+
+def test_prompt_lists_only_pending_tower_sites(payload_factory, role_factory):
+    """prompt 的塔位清单只列还没建成的塔位，并单列已有塔位
+
+    回归：塔位清单以前把已建成的塔位一起列出来，LLM 照着陈旧坐标反复建议
+    "再建一座火箭炮于(29,9)"，而那一格上一回合就已经建成了同款武器
+    （586439 复盘："建议层未校验塔位占用，提示词缺乏当前已有塔清单"）。
+    """
+    sites = _calc_tower_sites(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=2,
+        roles=[
+            role_factory(
+                10020, ROCKET, sites[0].x, sites[0].y, attackRange=10,
+            ),
+        ],
+    )
+    turn = Turn.load(payload)
+
+    # 已有的塔位单独报，待建清单里不再出现它
+    assert _tower_site_brief(turn, LLM_PLAN_DEFAULT) == (
+        f"railgun({sites[1].x},{sites[1].y})、gatling({sites[2].x},{sites[2].y})"
+    )
+    summary = _plan_summary(turn, LLM_PLAN_DEFAULT)
+    assert f"现有 1 座：rocket({sites[0].x},{sites[0].y})" in summary
+    assert "待建塔位 railgun" in summary
+
+
+def test_prompt_reports_no_pending_site_when_all_built(
+    payload_factory, role_factory,
+):
+    """三座塔都建成后塔位清单给出说明，不再重复报出已建成的坐标"""
+    sites = _calc_tower_sites(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=2,
+        roles=[
+            role_factory(10020 + index, kind, site.x, site.y, attackRange=4)
+            for index, (kind, site) in enumerate(zip(TOWER_LOADOUT, sites))
+        ],
+    )
+    turn = Turn.load(payload)
+
+    assert _tower_site_brief(turn, LLM_PLAN_DEFAULT) == "暂无可用塔位"
+    assert "待建塔位 暂无可用塔位" in _plan_summary(turn, LLM_PLAN_DEFAULT)
+
+
+def test_build_skips_site_occupied_by_robot(
+    payload_factory, role_factory, robot_factory,
+):
+    """下发建造指令前校验占用：塔位被机器人踩住时改去下一座
+
+    回归：`occupied_cells()` 只统计我方单位，机器人站在塔位上时建造指令照样
+    下发、结算时判失败，这一回合的金币与施工都白费（复盘建议"下发前校验占用
+    并自动改最近空位"）。
+    """
+    sites = _calc_tower_sites(Turn.load(payload_factory()))
+    start = Pos(sites[0].x + 1, sites[0].y)  # 紧挨第 1 座塔位，本来会直接开工
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST,
+        roles=[role_factory(10010, WORKER, start.x, start.y, backPackCapability=100)],
+        robots=[
+            robot_factory(30001, sites[0].x, sites[0].y, targetTeam="challenger"),
+        ],
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10010"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    # 改去下一座塔位（railgun 位），而不是硬往被机器人踩住的那一格建
+    assert distance(step, sites[1]) < distance(start, sites[1])
+
+
+def test_llm_defend_yields_to_enemy_side(payload_factory, role_factory, monkeypatch):
+    """敌方来路已知时按敌我坐标布防，LLM 猜的方位让位
+
+    回归：复盘里计划一路写死 `defend=up`，敌方基地却在我方左（下）方，
+    第一座塔因此压在没人来的那一侧（586440："defend 方位按敌我坐标推算，
+    替换写死的 defend=up"）。看不到敌方单位时 `defend` 照旧生效。
+    """
+    monkeypatch.setattr(brain, "LLM_PROMPT_ENABLED", True)
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST,
+        roles=[role_factory(10010, WORKER, 8, 23, backPackCapability=100)],
+        enemies=[role_factory(20010, WORKER, 3, 25)],  # 敌方单位在基地左侧
+    )
+    payload["llmResp"] = "PLAN: defend=up"
+    turn = Turn.load(payload)
+
+    # 敌方来路在左侧：第 1 座塔落在左侧，而不是计划里的 up
+    assert _calc_tower_sites(turn, "up")[0] == Pos(9, 23)
+    # 看不到敌方单位时 defend 照旧优先（与 issue #14 的行为一致）
+    assert _calc_tower_sites(
+        Turn.load(payload_factory(round_no=1)), "up",
+    )[0] == Pos(10, 25)
+
+    commands, prompt = decide(payload)
+    # 工人站在左侧塔位旁，按敌方来路直接开工
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 9, "y": 23}],
+        "name": ROCKET,
+    }
+    # prompt 报出的布防方位与执行层同一套判定（建议与指令同源）
+    assert "布防方位 敌方来路 up/left" in prompt
 
 
 # === 鲁棒性 ===

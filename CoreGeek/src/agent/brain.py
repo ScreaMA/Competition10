@@ -10,8 +10,10 @@
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
           描述里没给文件名时先探测沙盒任务目录，顺带把任务文件读回来
           缓存备用，下一个任务点就能即时交卷），
-          有任务在身时不退回基地；天黑前工人回防到武器旁，
-          但火力/围墙不达标时先抢建，角色不会整回合空转。
+          有任务在身时不退回基地，任务点冷却期间白天也守在下一个会开放的
+          任务点旁等它开放（省掉"回基地再折返"的来回），天黑前再回防；
+          天黑前工人回防到武器旁，但火力/围墙不达标时先抢建，
+          角色不会整回合空转。
     夜晚：每个角色操控一座武器攻击机器人，优先攻击威胁最高的目标。
 
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
@@ -141,8 +143,6 @@ ECONOMY_MINE_ORDER = (IRON_MINE, COPPER_MINE, STONE_MINE)
 
 # 任务点排序权重：报文缺少 timeoutRounds 时用最大值，不抢占"临期优先"
 TASK_TIMEOUT_UNKNOWN = 10 ** 9
-# 任务冷却剩余回合不超过该值时，开拓者提前到任务点旁待命
-TASK_WAIT_ROUNDS = 3
 
 # 基地四个方位（用于让武器塔分散布防，顺序仅用于同分时的稳定排序）
 TOWER_SIDES = ("up", "left", "down", "right")
@@ -306,9 +306,9 @@ def _decide_day(
     towers_missing = [pos for pos in tower_sites if pos not in standing_towers]
     walls_missing = [pos for pos in wall_order if pos not in standing_walls]
 
-    # 过滤掉已被占据的位置
-    free_towers = [pos for pos in towers_missing if pos not in occupied]
-    free_walls = [pos for pos in walls_missing if pos not in occupied]
+    # 过滤掉这一回合不能施工的位置（己方单位之外，敌方单位与机器人也算占用）
+    free_towers = _buildable_sites(turn, towers_missing, occupied)
+    free_walls = _buildable_sites(turn, walls_missing, occupied)
 
     # 已分配的位置（防止多个角色走向同一位置）
     claimed: set[Pos] = set()
@@ -341,6 +341,36 @@ def _decide_day(
     if not dusk:
         for unit in turn.controllable():
             _idle_gather(turn, unit, claimed, commands)
+
+
+def _buildable_sites(
+    turn: Turn,
+    sites: list[Pos],
+    occupied: frozenset[Pos],
+) -> list[Pos]:
+    """筛掉这一回合不能施工的格子（下发建造指令前校验占用）
+
+    建造指令落在被占住的格子上会直接判失败（任务书4.5.4节），这一回合的
+    金币与施工都白费。己方单位之外还要避开敌方单位与机器人：`occupied_cells`
+    只统计我方单位，机器人踩在塔位/墙位上时同样建不起来（复盘建议的
+    "下发前校验占用并自动改最近空位"）。
+
+    参数:
+        turn: 当前回合信息
+        sites: 待建的塔位或围墙位（已按优先级排序）
+        occupied: 己方单位占据的格子
+
+    返回:
+        这一回合真正可以施工的位置（保持原有先后顺序）
+    """
+    blocked = set(occupied)
+    for enemy in turn.enemies:
+        if enemy.is_alive:
+            blocked.update(turn.footprint(enemy))
+    for robot in turn.robots:
+        if robot.is_alive:
+            blocked.add(robot.pos)
+    return [pos for pos in sites if pos not in blocked]
 
 
 def _idle_gather(
@@ -645,7 +675,8 @@ def _pioneer_day_logic(
 
     优先级: 维持进行中的任务（含提交答案，命中答案缓存时接取后即交卷）
             > 前往任务点领取任务（本回合走不动就原地等，不退回去跟随武器塔）
-            > 跟随武器塔（只在没有任何可接任务时才做）
+            > 守候正在冷却的任务点（白天守在下一个会开放的任务点旁，天黑前回防）
+            > 跟随武器塔（只在没有任何任务点时才做）
 
     任务规则（任务书5章）:
         - 开拓者需在己方任务点周围一格内领取任务
@@ -658,6 +689,9 @@ def _pioneer_day_logic(
     任务点的选择是"临期优先、其次就近"：单个任务只有 15 回合时限，
     先去快过期的那个才能把两个任务的分数都拿到手。两个任务点会按这个
     顺序依次尝试，最优先的那个走不通时退而先去下一个，不会整局放弃任务。
+    两个任务点都在冷却时，开拓者守在"下一个会开放的那个"旁边等它开放
+    （`_next_task_position`），天黑前按返程路费提前退回基地操控武器
+    （`_task_wait_margin`）——任务分是主要得分来源，守点比回基地待命划算。
 
     参数:
         turn: 当前回合信息
@@ -704,9 +738,13 @@ def _pioneer_day_logic(
         # 从未靠近任务点"，两处任务点合计160分+160金币一直没人领）
         return
 
-    # 3. 任务点都在冷却中: 冷却快结束时提前到任务点旁待命，任务一开放就能接
-    if _rounds_until_task(turn) <= TASK_WAIT_ROUNDS:
-        task_pos = _nearest_task_position(turn, pioneer.pos)
+    # 3. 任务点都在冷却中: 白天守在下一个会开放的任务点旁等它开放，天黑前再退回基地
+    #    （复盘里敌方 r14 交完第一个任务、r17 就接上第二个：任务点冷却结束即可续做。
+    #      旧实现只在冷却剩 3 回合时才往外走，其余回合先回基地跟随武器塔——
+    #      任务点离基地十几格，一天来回一趟就是二十多个回合，两个任务点
+    #      因此常常只赶得上一个）
+    if _rounds_to_night(turn) > _task_wait_margin(turn, pioneer):
+        task_pos = _next_task_position(turn, pioneer.pos)
         if task_pos is not None and _head_to_task(
             turn, pioneer, task_pos, claimed, commands,
         ):
@@ -793,15 +831,37 @@ def _nearest_task_cell(turn: Turn, origin: Pos, task_pos: Pos) -> Pos:
     )
 
 
-def _rounds_until_task(turn: Turn) -> int:
-    """己方任务点里最早可以再接任务的剩余冷却回合数
+def _next_task_position(turn: Turn, origin: Pos) -> Pos | None:
+    """下一个会开放的任务点坐标（冷却剩余最少，其次就近）
 
-    任务点数据缺失（报文没有 playerTasks）时返回 0：此时按地图上的任务点
-    直接前往，到点后下一回合再领取，避免整局都不去任务点。
+    任务点冷却期间开拓者守在它旁边等开放（见 `_pioneer_day_logic`），
+    守错任务点会白白错过另一个更早开放的任务点。报文没有 playerTasks 时
+    退回地图上的己方任务点（`_nearest_task_position`）。
     """
     if not turn.player_tasks:
-        return 0
-    return min(task.cold_down_rounds for task in turn.player_tasks)
+        return _nearest_task_position(turn, origin)
+    return min(
+        turn.player_tasks,
+        key=lambda task: (
+            task.cold_down_rounds,
+            distance(origin, task.task_position),
+            task.task_position.x,
+            task.task_position.y,
+        ),
+    ).task_position
+
+
+def _task_wait_margin(turn: Turn, pioneer: Unit) -> int:
+    """开拓者守在任务点旁时，天黑前要留出的返程回合数
+
+    任务点离基地十几格，按"回基地的路费 + 提前回防的回合数"留足返程时间，
+    否则只顾守任务点会让夜晚的武器没人操控（任务书4.4节：武器要有角色
+    操控才会开火）。开拓者本来就在基地旁守点时，退化成 `DUSK_ROUNDS`。
+    """
+    station = turn.station()
+    if station is None:
+        return DUSK_ROUNDS
+    return distance(pioneer.pos, station.pos) + DUSK_ROUNDS
 
 
 def _trade_logic(
@@ -1820,10 +1880,17 @@ def _side_priority(
     enemy_sides: frozenset[str],
     preferred: str | None,
 ) -> int:
-    """塔位排序的第一权重：LLM 指定 > 朝敌方来路 > 其他"""
-    if preferred is not None and side == preferred:
-        return 0
+    """塔位排序的第一权重：朝敌方来路 > LLM 指定 > 其他
+
+    敌方来路是实打实的坐标推算（`_enemy_sides`：可见的敌方基地，看不到基地
+    时取最近的敌方单位），LLM 的 `defend` 只是照着局面猜的方位。复盘里计划
+    一路写死 `defend=up`，敌方基地却在我方左下方，第一座塔因此压在没人来的
+    那一侧（"defend 方位按敌我坐标推算，替换写死的 defend=up"）。看不到敌方
+    单位时 `enemy_sides` 为空，LLM 指定的方位照旧优先。
+    """
     if side in enemy_sides:
+        return 0
+    if preferred is not None and side == preferred:
         return 1
     return 2
 
@@ -2045,27 +2112,71 @@ def _tower_target(turn: Turn, plan: LlmPlan) -> int:
     return plan.tower
 
 
-def _tower_site_brief(turn: Turn, plan: LlmPlan) -> str:
-    """本回合前几座塔的坐标与对应武器（写进 prompt 的"最近可建位"）
+def _pending_tower_sites(turn: Turn, plan: LlmPlan) -> list[tuple[int, Pos]]:
+    """执行层这一回合真正还要建的塔位（下标 -> 坐标，保持建造顺序）
 
-    塔型由 `TOWER_LOADOUT` 与塔位下标绑定，这里把执行层真正要建的
-    "坐标 -> 武器"直接摊给 LLM 看：建议里的布防方位因此有具体坐标可对，
-    也让复盘里"LLM 说补建第 2 座高伤塔、实际建的却是另一种武器"这类
-    "说的与做的对不上"不会再发生（塔型不受 LLM 文字左右，只会被照实告知）。
+    判定与 `_decide_day` 完全一致：`_calc_tower_sites` 规划的位置，去掉已经
+    建成的塔、再去掉这一回合被占住的格子（`_buildable_sites`）。下标是塔位在
+    完整规划里的序号——武器类型由 `TOWER_LOADOUT` 与下标绑定（见
+    `_worker_day_logic`），带上序号才能把"要建哪座塔"与"建的是哪种武器"对上。
 
     参数:
         turn: 当前回合信息
         plan: 本回合的LLM计划
 
     返回:
-        形如 "rocket(12,23)、railgun(10,22)" 的塔位清单；没有可用塔位时给出说明
+        (塔位下标, 坐标) 列表；没有待建塔位时为空
     """
     sites = _calc_tower_sites(turn, plan.defend)[:_tower_target(turn, plan)]
-    if not sites:
+    built = {unit.pos for unit in turn.weapons()}
+    buildable = set(_buildable_sites(
+        turn,
+        [site for site in sites if site not in built],
+        turn.occupied_cells(),
+    ))
+    return [
+        (index, site)
+        for index, site in enumerate(sites)
+        if site in buildable
+    ]
+
+
+def _tower_site_brief(turn: Turn, plan: LlmPlan) -> str:
+    """本回合还要建的塔位坐标与对应武器（写进 prompt 的"最近可建位"）
+
+    塔型由 `TOWER_LOADOUT` 与塔位下标绑定，这里把执行层真正要建的
+    "坐标 -> 武器"直接摊给 LLM 看：建议里的布防方位因此有具体坐标可对，
+    也让复盘里"LLM 说补建第 2 座高伤塔、实际建的却是另一种武器"这类
+    "说的与做的对不上"不会再发生（塔型不受 LLM 文字左右，只会被照实告知）。
+
+    已经建成的塔位不再出现在清单里（`_pending_tower_sites`）：复盘里 LLM
+    照着一份陈旧的塔位清单反复建议"再建一座火箭炮于(29,9)"，而那一格上一个
+    回合就已经建成了同款武器——塔位清单必须以执行层的当前状态为准。
+
+    参数:
+        turn: 当前回合信息
+        plan: 本回合的LLM计划
+
+    返回:
+        形如 "rocket(12,23)、railgun(10,22)" 的待建塔位清单；
+        没有待建塔位时给出说明
+    """
+    pending = _pending_tower_sites(turn, plan)
+    if not pending:
         return "暂无可用塔位"
     return "、".join(
         f"{TOWER_LOADOUT[index % len(TOWER_LOADOUT)]}({site.x},{site.y})"
-        for index, site in enumerate(sites)
+        for index, site in pending
+    )
+
+
+def _tower_built_brief(turn: Turn) -> str:
+    """已经建成的武器塔清单（写进 prompt，杜绝"重复建议已建成的塔位"）"""
+    weapons = turn.weapons()
+    if not weapons:
+        return "暂无"
+    return "、".join(
+        f"{weapon.kind}({weapon.pos.x},{weapon.pos.y})" for weapon in weapons
     )
 
 
@@ -2075,16 +2186,18 @@ def _plan_summary(turn: Turn, plan: LlmPlan) -> str:
     计划出自 `_calc_tower_sites`/任务排序等同一套决策函数，LLM 因此可以对
     具体数字提意见，而不是和指令生成器各说各话。塔数与围墙段数报的是
     `_tower_target`/`_wall_target`（含金币闲置熔断、开局下限与防守方下限），
-    塔位清单也来自同一套 `_calc_tower_sites`，所以 LLM 看到的就是执行层
-    真正要建的座数/段数/坐标——复盘建议的"prompt 注入最近可建位坐标，
-    消除'先移动、下回合再建'的一回合延迟"。
+    塔位清单也来自同一套 `_calc_tower_sites`（且只列还没建成的塔位，
+    见 `_pending_tower_sites`），布防方位由 `_defend_brief` 按同一套方位判定
+    给出，所以 LLM 看到的就是执行层真正要建的座数/段数/坐标——复盘建议的
+    "prompt 注入最近可建位坐标，消除'先移动、下回合再建'的一回合延迟"。
     """
     return (
-        f"武器目标 {_tower_target(turn, plan)} 座（现有 {len(turn.weapons())} 座）；"
-        f"塔位 {_tower_site_brief(turn, plan)}；"
+        f"武器目标 {_tower_target(turn, plan)} 座（现有 {len(turn.weapons())} 座："
+        f"{_tower_built_brief(turn)}）；"
+        f"待建塔位 {_tower_site_brief(turn, plan)}；"
         f"优先铺围墙 {_wall_target(turn, plan)} 段（现有 {len(turn.walls())} 段）；"
         f"富余金币 {_gold_brief(plan)}；"
-        f"布防方位 {plan.defend or _enemy_brief(turn)}"
+        f"布防方位 {_defend_brief(turn, plan)}"
     )
 
 
@@ -2136,12 +2249,22 @@ def _wall_target(turn: Turn, plan: LlmPlan) -> int:
     return plan.wall
 
 
-def _enemy_brief(turn: Turn) -> str:
-    """敌我相对方位，看不到敌方单位时说明塔位是按地图空间选的"""
-    sides = _enemy_sides(turn)
-    if not sides:
-        return "按地图内侧空间选择（当前看不到敌方单位）"
-    return "敌方来路 " + "/".join(side for side in TOWER_SIDES if side in sides)
+def _defend_brief(turn: Turn, plan: LlmPlan) -> str:
+    """本回合实际优先布防的方位（与 `_side_priority` 用同一套判定）
+
+    敌方来路已知时以它为准，计划里的 `defend` 只在看不到敌方单位时才生效，
+    这样 prompt 报出去的方位就是执行层真正会用的顺序——复盘里"prompt 说布防
+    up、塔却按别的方位排"这类建议与执行脱节不会再出现。
+    """
+    sides = [side for side in TOWER_SIDES if side in _enemy_sides(turn)]
+    if sides:
+        brief = "敌方来路 " + "/".join(sides)
+        if plan.defend is not None and plan.defend not in sides:
+            brief += f"（计划里的 {plan.defend} 不在来路上，不采用）"
+        return brief
+    if plan.defend is not None:
+        return f"{plan.defend}（按计划，当前看不到敌方单位）"
+    return "按地图内侧空间选择（当前看不到敌方单位）"
 
 
 def _task_brief(turn: Turn) -> str:
