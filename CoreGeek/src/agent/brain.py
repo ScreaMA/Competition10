@@ -19,7 +19,9 @@
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
 不依赖任何跨回合的战场状态，可自动适应矿区刷新、单位移动与视野变化。
 任务答案同理，只认执行器按任务描述在沙盒里取到的数据（`[SOLUTION]` 段，
-见 `_task_answer`），取不到数据就不提交；解析不到时再退到纯缓存
+见 `_task_answer`），取不到数据就不提交；接口文档原文与任务原文一样不许交
+（`_doc_answer`），地址一律先清洗成合法 URL 再请求（`clean_url`），上一回合
+取数失败过就换一条路走而不是原样重试（`_task_retry`）；解析不到时再退到纯缓存
 `_TASK_ANSWER_CACHE`（内容全部来自执行器的产出），未命中就走原来的
 执行流程；LLM 建议也从请求里的 `llmResp` 现解析成有界计划（`_llm_plan`），
 建议与指令出自同一套决策函数。
@@ -349,6 +351,31 @@ TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一�
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
+# 取到的响应体是"接口文档原文"时的诊断标记：文档不是数据，只留一行诊断，
+# 既不进 `[SOLUTION]` 段也不打 `TASK_DATA_MARKER`（见执行器的 `is_doc_body`）
+TASK_DOC_MARKER = "[DOC]"
+# 接口文档的正文特征词：沙盒里的接口文档与本地接口同在一台机器上，URL 试错时
+# 很容易请求到文档本身（BASE + "/docs"、文档里给的外链）。命中两个以上才算
+# "这是文档不是数据"——单个词（如"版本"）在正常数据里也可能出现。
+TASK_DOC_MARKERS = (
+    "API 参考文档", "API参考文档", "接口文档", "接口说明", "接口列表",
+    "认证方式", "请求参数", "请求示例", "响应示例", "调用示例", "文档版本",
+)
+TASK_DOC_MIN_HITS = 2
+# 从接口文档里抓地址用的模式与"句读尾巴"：只认 URL 合法字符（RFC 3986 的
+# unreserved + gen-delims + sub-delims），反引号、中文标点、空白一律不在其中，
+# 抓地址时遇到第一个非法字符就截断（见执行器的 `clean_url`）。模式放在这里
+# 而不是执行器源码里，是为了能用原始字符串写清楚、不用在模板里堆反斜杠。
+TASK_URL_PATTERN = r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"
+# 地址结尾常见的句读：合法但几乎不会是 URL 的一部分，去掉
+TASK_URL_TAIL = ".,;:!?')]}>"
+# 行尾归一化的范围：沙盒自带的判题脚本常是 CRLF 行尾，直接执行会报
+# `./check: /bin/sh^M: bad interpreter`（复盘 PK590407 R16），脚本一次都跑不起来。
+# 归一到 `check` 前缀与 `*.sh` 这两类文件（见执行器的 `normalize_scripts`），
+# 下面是单文件大小上限与单目录最多看几个文件——沙盒命令整体限时 15 秒，
+# 这一步必须快且可失败。
+TASK_SCRIPT_SIZE_MAX = 1 << 20
+TASK_SCRIPT_SCAN_MAX = 200
 
 # 任务止损（S1）：自进化任务的闭环是"下发沙盒命令 -> 取数 -> submitAnswer"，
 # 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
@@ -3145,8 +3172,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
     answer = str(_task_llm_state(turn).get("answer") or "").strip()
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
-    if _task_echo(answer, turn.phase_task):
-        return None  # 把任务原文当答案交上去 = 又一次 0 分
+    if _task_echo(answer, turn.phase_task) or _doc_answer(answer):
+        return None  # 把任务原文/接口文档当答案交上去 = 又一次 0 分
     return answer
 
 
@@ -3163,9 +3190,27 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None
     if any(bad in answer for bad in TASK_ERROR_MARKERS):
         return None
-    if _task_echo(answer, turn.phase_task):
+    if _task_echo(answer, turn.phase_task) or _doc_answer(answer):
         return None
     return answer
+
+
+def _task_retry(turn: Turn) -> bool:
+    """上一回合的沙盒输出是不是一次失败（取数没成功 / 命令报错）
+
+    任务是"下发沙盒命令 -> 取数 -> submitAnswer"的闭环，同一个请求原样重试
+    多少次都不会变。复盘 PK590403 的 R12–R18 就是同一发坏请求刷了 6 个回合
+    （URL 里带着反引号与中文标点，`InvalidURL` 循环），任务分 0。失败过就换
+    策略：执行器不再照文档里的地址猜，只请求固定的本地接口根地址
+    （见 `_task_executor` 的 `retry`）。看门狗（`_task_abandoned`）负责兜底：
+    换了策略还是失败、或者输出逐字相同地重复，就把开拓者还给战斗调度。
+    """
+    result = _task_output(turn)
+    if not result:
+        return False
+    return TASK_API_FAIL_MARKER in result or any(
+        bad in result for bad in TASK_ERROR_MARKERS
+    )
 
 
 def _sandbox_command(turn: Turn) -> str:
@@ -3192,6 +3237,10 @@ def _sandbox_command(turn: Turn) -> str:
 
     任务已经被看门狗放弃（读文件死循环 / 超时）时返回空串：继续下发读文件
     命令只会把同一个循环再跑一遍，开拓者却已经被放回去干别的了。
+
+    上一回合取数失败时（`_task_retry`）下发的执行器换一条路走：只请求固定
+    的本地接口根地址，不再照文档里抓到的地址猜——失败的原样重试是复盘里
+    `InvalidURL` 刷满 6 个回合的直接原因。
     """
     if (
         not turn.phase_task
@@ -3217,26 +3266,27 @@ def _sandbox_command(turn: Turn) -> str:
     # 末尾的 `:` 保证整条命令的退出码为 0：输出带 `[exitCode:0]` 才会被
     # `_task_answer` 采纳，而执行器里的取数失败时退出码可能是非 0 的
     return (
-        f'echo "{marker}"; {_task_executor(target)}'
+        f'echo "{marker}"; {_task_executor(target, _task_retry(turn))}'
         f'\necho "{TASK_END_MARKER}"; {scan};'
         f' {_task_dump(turn)}; :'
     )
 
 
-def _task_executor(task_path: str) -> str:
-    """在沙盒里执行自进化任务的命令片段（读任务文件 -> 调接口取数 -> 打答案）
+def _task_executor_lib(task_path: str, retry: bool = False) -> str:
+    """填好占位符的执行器"纯函数段"（找文件 / 清洗地址 / 取数 / 判文档）
 
-    沙盒里只有基础 shell 与 python，命令一回合只能下一发、限时 15 秒，
-    所以取数脚本一次跑完：找任务文件与接口文档、按文档里的样例地址调用
-    本地接口、把响应体打成 `[SOLUTION]` 段。
+    单独拆出来是为了让测试能直接执行这一段：里面全是纯函数，执行一遍不会
+    真的去全盘找文件、也不会发请求（驱动段见 `TASK_EXECUTOR_DRIVER`，
+    由 `_task_executor_source` 拼上）。
 
     参数:
         task_path: 任务描述里点名的任务文件（沙盒路径或文件名）
+        retry: 上一回合的取数是不是失败了（见 `_task_retry`）
 
     返回:
-        可直接拼进沙盒命令的 shell 片段
+        可直接交给 python 执行的脚本源码（不含驱动段）
     """
-    script = (
+    return (
         TASK_EXECUTOR
         .replace("__TASK_PATH__", repr(task_path))
         .replace("__BASE__", repr(TASK_API_DEFAULT))
@@ -3254,8 +3304,48 @@ def _task_executor(task_path: str) -> str:
         .replace("__SOLUTION_END__", repr(TASK_SOLUTION_END))
         .replace("__DATA__", repr(TASK_DATA_MARKER))
         .replace("__FAIL__", repr(TASK_API_FAIL_MARKER))
+        .replace("__DOC__", repr(TASK_DOC_MARKER))
+        .replace("__DOC_WORDS__", repr(TASK_DOC_MARKERS))
+        .replace("__DOC_MIN_HITS__", str(TASK_DOC_MIN_HITS))
+        .replace("__URL_PATTERN__", repr(TASK_URL_PATTERN))
+        .replace("__URL_TAIL__", repr(TASK_URL_TAIL))
+        .replace("__SCRIPT_SCAN_MAX__", str(TASK_SCRIPT_SCAN_MAX))
+        .replace("__SCRIPT_SIZE_MAX__", str(TASK_SCRIPT_SIZE_MAX))
         .replace("__SCAN__", repr(TASK_SCAN_MARKER))
+        .replace("__RETRY__", repr(bool(retry)))
     )
+
+
+def _task_executor_source(task_path: str, retry: bool = False) -> str:
+    """交给沙盒里 python 执行的完整脚本（纯函数段 + 驱动段）
+
+    参数:
+        task_path: 任务描述里点名的任务文件（沙盒路径或文件名）
+        retry: 上一回合的取数是不是失败了（见 `_task_retry`）
+
+    返回:
+        可直接交给 python 执行的脚本源码
+    """
+    return _task_executor_lib(task_path, retry) + TASK_EXECUTOR_DRIVER
+
+
+def _task_executor(task_path: str, retry: bool = False) -> str:
+    """在沙盒里执行自进化任务的命令片段（读任务文件 -> 调接口取数 -> 打答案）
+
+    沙盒里只有基础 shell 与 python，命令一回合只能下一发、限时 15 秒，
+    所以取数脚本一次跑完：找任务文件与接口文档、按文档里的样例地址调用
+    本地接口、把响应体打成 `[SOLUTION]` 段。
+
+    参数:
+        task_path: 任务描述里点名的任务文件（沙盒路径或文件名）
+        retry: 上一回合的取数是不是失败了（见 `_task_retry`）。为 True 时
+               执行器只请求固定的本地接口根地址，不再照文档里的地址猜——
+               那些地址正是上一回合失败的来源，原样重试只会把失败再来一遍
+
+    返回:
+        可直接拼进沙盒命令的 shell 片段
+    """
+    script = _task_executor_source(task_path, retry)
     # 沙盒的解释器叫 python3 或 python，挑一个能用的（挑不到时脚本不会执行，
     # 答案区为空 -> 这一回合不提交，下一回合重来）。
     # 片段以 heredoc 结束符收尾且不带换行：调用方必须换行后再接别的命令
@@ -3266,7 +3356,7 @@ def _task_executor(task_path: str) -> str:
     )
 
 
-# 沙盒执行器：占位符由 `_task_executor` 按当前任务填好。
+# 沙盒执行器的纯函数段：占位符由 `_task_executor_lib` 按当前任务填好。
 # 之所以要"执行"而不是"读文件"，是因为任务文件里写的是任务要求（"查询北京
 # 文化遗产"），答案在文档给出的本地接口里；直接把任务文件的内容交上去
 # 等于答非所问（复盘里就是这么丢掉全部任务分的）。
@@ -3292,7 +3382,15 @@ SOLUTION = __SOLUTION__
 SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
 FAIL = __FAIL__
+DOC = __DOC__
+DOC_WORDS = __DOC_WORDS__
+DOC_MIN_HITS = __DOC_MIN_HITS__
+URL_PATTERN = __URL_PATTERN__
+URL_TAIL = __URL_TAIL__
+SCRIPT_SCAN_MAX = __SCRIPT_SCAN_MAX__
+SCRIPT_SIZE_MAX = __SCRIPT_SIZE_MAX__
 SCAN = __SCAN__
+RETRY = __RETRY__
 SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
 
 
@@ -3303,6 +3401,70 @@ def read(path):
             return handle.read()
     except OSError:
         return ""
+
+
+def clean_url(raw):
+    """把文档里抓到的地址清理成能直接请求的 URL
+
+    文档里的地址常被 markdown 反引号或中文标点包着，例如
+    `` `http://localhost:8899`），API ``。旧实现按"非空白"抓取，反引号与中文
+    标点一起进了 URL，请求直接抛 InvalidURL（实测报文里就是
+    `http://localhost:8899`），API InvalidURL` 反复刷屏，整整 6 个回合的取数
+    全部作废，任务分 0（复盘 PK590403 R12/R13/R17）。这里只保留 URL 合法字符，
+    遇到第一个非法字符就截断，再去掉结尾的句读。
+    """
+    match = URL_PATTERN.search(raw or "")
+    if not match:
+        return ""
+    return match.group(0).rstrip(URL_TAIL)
+
+
+def is_doc_body(body):
+    """响应体是不是"接口文档原文"，而不是要取的数据
+
+    沙盒里的接口文档与本地接口同在一台机器上，URL 试错（BASE + "/docs"、文档里
+    抓到的外链）很容易请求到文档本身。把文档原文当答案交上去就是 0 分——复盘
+    PK590403 R14 就是这么把"API 参考文档"全文 submitAnswer 出去的。命中两个
+    以上文档特征词（或者文档标题那种 markdown 小标题 + 一个特征词）就算文档。
+    """
+    hits = sum(1 for word in DOC_WORDS if word in body)
+    if hits >= DOC_MIN_HITS:
+        return True
+    return hits > 0 and body.lstrip().startswith("#")
+
+
+def normalize_scripts(paths):
+    """把任务目录里脚本的行尾统一成 LF（沙盒自带的 check 脚本常是 CRLF）
+
+    `./check: /bin/sh^M: bad interpreter` —— 沙盒里的判题脚本是 CRLF 行尾，
+    解释器路径被读成 "/bin/sh" 加一个回车，脚本一次都跑不起来（复盘 PK590407
+    R16）。这里在读任务文件的同时把同目录的脚本行尾改掉，之后无论谁执行
+    `./check` 都正常。改不动（只读挂载、没权限）就跳过，绝不打断整条命令，
+    也不打印任何东西——答案区里多一行诊断就可能被当成取数证据。
+    """
+    for path in list(paths) + ["."]:
+        directory = os.path.dirname(path) or "."
+        try:
+            names = os.listdir(directory)[:SCRIPT_SCAN_MAX]
+        except OSError:
+            continue
+        for name in names:
+            if not (name.startswith("check") or name.endswith(".sh")):
+                continue
+            target = os.path.join(directory, name)
+            try:
+                if not os.path.isfile(target):
+                    continue
+                if os.path.getsize(target) > SCRIPT_SIZE_MAX:
+                    continue
+                with open(target, "rb") as handle:
+                    data = handle.read()
+                if b"\\r\\n" not in data:
+                    continue
+                with open(target, "wb") as handle:
+                    handle.write(data.replace(b"\\r\\n", b"\\n"))
+            except OSError:
+                continue
 
 
 def fetch(url):
@@ -3370,15 +3532,20 @@ def endpoints(doc_text):
     MAX_CALLS 被这些在无网沙盒里调不通的地址耗光，真正能取数的本地接口
     一次都没被请求到，答案区永远是空的——三场复盘里"沙盒执行了（exitCode:0）
     却拿不到答案"就是这么来的。
+
+    地址一律过 `clean_url`：文档里的反引号与中文标点混进 URL 会让请求直接
+    InvalidURL（复盘 PK590403 R12/R13/R17），清洗后这些地址才真的能请求。
+    上一回合取数失败过（RETRY）时不再照文档里的地址猜——那些地址正是失败的
+    来源——只请求固定的本地接口根地址，换一条路而不是把同一个请求原样重试。
     """
     urls = []
-    for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
-        raw = raw.strip().strip("\\"'").rstrip(".,;:!?、。）])")
-        if raw and raw not in urls:
-            urls.append(raw)
+    for raw in URL_PATTERN.findall(doc_text):
+        url = clean_url(raw)
+        if url and url not in urls:
+            urls.append(url)
     local = [url for url in urls if "localhost" in url or "127.0.0.1" in url]
     picked = local or [BASE] + [url for url in urls if url != BASE]
-    return picked
+    return [BASE] if RETRY else picked
 
 
 def queries(text, name):
@@ -3417,9 +3584,17 @@ def candidates(text, name, urls):
         if variant not in out:
             out.append(variant)
     return out
+'''
 
 
+# 沙盒执行器的驱动段：接在纯函数段之后（见 `_task_executor_source`）。
+# 这一段会全盘找文件、真的发请求，只有沙盒里才该跑，所以与纯函数段分开，
+# 测试可以直接执行上面那段纯函数（`_task_executor_lib`）。
+TASK_EXECUTOR_DRIVER = '''\
 files = task_files()
+# 沙盒里的判题脚本常是 CRLF 行尾，谁执行 `./check` 都会撞上
+# "bad interpreter"；读任务文件的同时把它改成 LF（失败就跳过）
+normalize_scripts(files)
 doc_files = find_files(DOC_NAMES, 6)
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
@@ -3437,9 +3612,14 @@ for path in files[:SOLVE_MAX]:
             break
         calls += 1
         body = fetch(url)
-        if body:
-            print(DATA, url, "=>", len(body))
-            bodies.append(body)
+        if not body:
+            continue
+        if is_doc_body(body):
+            # 请求到的是接口文档本身：文档不是数据，交上去就是 0 分
+            print(DOC, url)
+            continue
+        print(DATA, url, "=>", len(body))
+        bodies.append(body)
     if bodies:
         solutions.append((name, bodies))
 
@@ -3561,11 +3741,14 @@ def _task_answer(turn: Turn) -> str | None:
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
     答案取任务标识到 `TASK_END_MARKER` 之间、`[SOLUTION]` 段里的内容。
 
-    两道闸门保证交上去的不是任务原文（复盘里 4 次 submitAnswer 交的全是
+    三道闸门保证交上去的不是任务原文（复盘里 4 次 submitAnswer 交的全是
     任务描述，Judge 一次都没放行）：
         1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
            执行器取不到数据时答案区是空的，这一回合就不提交；
-        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
+        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）；
+        3. 答案里不能是接口文档原文（`_doc_answer`）——请求到文档本身时
+           执行器会把它打成 `[SOLUTION]`，交上去同样是 0 分
+           （复盘 PK590403 R14 交的就是"API 参考文档"全文）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
@@ -3597,7 +3780,7 @@ def _task_answer(turn: Turn) -> str | None:
     answer = _solution_answer(region, turn)
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
         return None
-    if _task_echo(answer, turn.phase_task):
+    if _task_echo(answer, turn.phase_task) or _doc_answer(answer):
         return None
     return answer
 
@@ -3630,6 +3813,23 @@ def _solution_answer(region: str, turn: Turn) -> str | None:
     return next(iter(blocks.values()), None)
 
 
+def _doc_answer(answer: str) -> bool:
+    """答案是不是"接口文档原文"（而不是取到的数据）
+
+    与执行器里的 `is_doc_body` 同一套判据，放在这里做最后一道闸门：无论答案
+    来自沙盒执行器还是 LLM 直接给的 `ANSWER:`，文档原文都不许提交。复盘
+    PK590403 R14 提交的正是"API 参考文档"全文（标题 + 正文原样），Judge 判 0，
+    整个任务分与任务金币一起丢掉。
+
+    判据是"命中两个以上文档特征词"（`TASK_DOC_MIN_HITS`）或者"markdown 小标题
+    + 一个特征词"：单个词（如"版本"）在正常数据里也会出现，不能一概而论。
+    """
+    hits = sum(1 for word in TASK_DOC_MARKERS if word in answer)
+    if hits >= TASK_DOC_MIN_HITS:
+        return True
+    return hits > 0 and answer.lstrip().startswith("#")
+
+
 def _task_echo(answer: str, phase_task: str) -> bool:
     """答案是不是在复读任务原文
 
@@ -3654,6 +3854,7 @@ def _remember_task_answers(result: str) -> None:
     时也会把任务文件打成 `[SOLUTION]` 段（沙盒里本来就有这份文件），
     把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
     ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
+    带文档特征的答案（`_doc_answer`，如"API 参考文档"全文）同样不进缓存。
 
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
@@ -3664,7 +3865,7 @@ def _remember_task_answers(result: str) -> None:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and TASK_DATA_MARKER in evidence:
+        if name and answer and TASK_DATA_MARKER in evidence and not _doc_answer(answer):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
 

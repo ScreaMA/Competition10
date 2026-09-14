@@ -31,6 +31,7 @@ from agent.brain import (
     STONE_BATCH,
     STONE_PLAN_MAX,
     STONE_RESERVE_MIN,
+    TASK_API_FAIL_MARKER,
     TASK_DATA_MARKER,
     TASK_END_MARKER,
     TASK_FILE_END,
@@ -3820,3 +3821,151 @@ def test_day_plan_makes_room_for_selling_when_backpack_full(
     assert len(_day_plan(loaded, stone_loaded).queue) <= len(
         _day_plan(empty, stone_empty).queue
     )
+
+
+# === 沙盒：地址清洗 / 文档原文拦截 / 行尾归一化（S1） ===
+
+
+def _executor_namespace() -> dict:
+    """把沙盒执行器的纯函数段当模块加载，取出 `clean_url` 等纯函数
+
+    执行器源码分成"纯函数段"（`TASK_EXECUTOR`，占位符由 `_task_executor_lib`
+    填好）与"驱动段"（`TASK_EXECUTOR_DRIVER`，会全盘找文件、真的发请求）。
+    这里只执行前者，所以不会碰到沙盒之外的任何文件。
+    """
+    namespace: dict = {"__name__": __name__}
+    exec(brain._task_executor_lib("task_1_beijing.md"), namespace)
+    return namespace
+
+
+def test_clean_url_strips_markdown_and_cjk_punctuation():
+    """文档里抓到的地址先清洗再请求：反引号与中文标点不能进 URL
+
+    回归 PK590403：R12/R13/R17 的沙盒输出里是
+    "http://localhost:8899`），API InvalidURL" —— 旧实现按"非空白"抓地址，
+    markdown 反引号与中文标点一起进了 URL，请求直接抛 InvalidURL，连续
+    6 个回合的取数全部作废，任务分 0。
+    """
+    clean_url = _executor_namespace()["clean_url"]
+
+    # 反引号与中文标点被截断，地址本身完整保留
+    assert clean_url("`http://localhost:8899`），API") == "http://localhost:8899"
+    # 结尾的句号是句读，不属于地址
+    assert clean_url("http://localhost:8899/api?city=beijing。") == (
+        "http://localhost:8899/api?city=beijing"
+    )
+    assert clean_url("见 http://127.0.0.1:8899/docs)") == "http://127.0.0.1:8899/docs"
+    # 不是地址的字符串清洗成空串：宁可少试一个地址，也不发 InvalidURL 请求
+    assert clean_url("没有地址") == ""
+    assert clean_url("") == ""
+
+
+def test_executor_treats_api_doc_as_doc_not_data():
+    """响应体是"接口文档原文"时不算取到的数据
+
+    回归 PK590403 R14：请求到的是接口文档本身，把"API 参考文档"全文
+    submitAnswer 出去，Judge 判 0。
+    """
+    is_doc_body = _executor_namespace()["is_doc_body"]
+
+    doc = (
+        "# 自进化接口 API 参考文档\n"
+        "## 认证方式\n"
+        "请求参数 city\n"
+        '响应示例 {"count": 7}\n'
+    )
+    assert is_doc_body(doc) is True
+
+    # 真正的取数结果不受影响
+    assert is_doc_body('{"city": "北京", "count": 7}') is False
+    # 只命中一个特征词不算文档：正常数据里也可能出现"版本"这类词
+    assert is_doc_body('{"version": "1.0", "接口文档": false}') is False
+
+
+def test_executor_normalizes_crlf_check_script(tmp_path, monkeypatch):
+    """沙盒里的判题脚本先改成 LF 行尾，谁执行 `./check` 都不会再报错
+
+    回归 PK590407 R16：`./check: /bin/sh^M: bad interpreter` —— CRLF 行尾的
+    判题脚本一次都跑不起来（解释器被读成 "/bin/sh" 加一个回车）。
+    """
+    monkeypatch.chdir(tmp_path)
+    script = tmp_path / "check"
+    script.write_bytes(b"#!/bin/sh\r\necho ok\r\n")
+    shell = tmp_path / "helper.sh"
+    shell.write_bytes(b"echo hi\n")  # 已经是 LF：内容不变
+    other = tmp_path / "readme.md"
+    other.write_bytes(b"a\r\nb\r\n")  # 不是脚本：不碰
+
+    _executor_namespace()["normalize_scripts"](
+        [str(tmp_path / "task_1_beijing.md")],
+    )
+
+    assert script.read_bytes() == b"#!/bin/sh\necho ok\n"
+    assert shell.read_bytes() == b"echo hi\n"
+    assert other.read_bytes() == b"a\r\nb\r\n"
+
+
+def test_sandbox_switches_strategy_after_failed_fetch(
+    payload_factory, role_factory,
+):
+    """上一回合取数失败后换一条路走，不把同一个请求原样重试
+
+    回归 PK590403 R12–R18：同一发坏请求（URL 里带反引号与中文标点）刷了
+    6 个回合。失败过就不再照文档里的地址猜，只请求固定的本地接口根地址。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    # 还没失败过：照文档里的地址猜
+    assert "RETRY = False" in sandbox_command(payload)
+
+    # 上一回合的沙盒输出带着取数失败诊断：这一回合只请求本地接口根地址
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task,
+        f"{TASK_API_FAIL_MARKER} `http://localhost:8899`），API InvalidURL\n"
+        f"{TASK_END_MARKER}\n",
+    )
+    assert "RETRY = True" in sandbox_command(payload)
+
+
+def test_task_answer_rejects_api_doc_text(payload_factory, role_factory):
+    """接口文档全文不会被当成答案提交（哪怕执行器把它打成了 `[SOLUTION]`）"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _solution_result(
+        phase_task,
+        "task_1_beijing.md",
+        '# API 参考文档\n## 认证方式\n请求参数 city，响应示例 {"count": 7}',
+    )
+    commands, _ = decide(payload)
+
+    assert commands.get("10011", {}).get("action") != "submitAnswer"
+
+
+def test_task_answer_rejects_llm_doc_answer(payload_factory, role_factory):
+    """LLM 直接给的答案同样要过文档闸门：文档原文不提交"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _sandbox_result(phase_task, "沙盒输出\n")
+    payload["llmResp"] = "ANSWER: # API 参考文档 ## 认证方式 请求参数 city"
+
+    commands, _ = decide(payload)
+
+    assert commands.get("10011", {}).get("action") != "submitAnswer"
