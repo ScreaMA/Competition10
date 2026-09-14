@@ -31,6 +31,11 @@
 沙盒反复回读同一份文件、任务超时交不上卷、同一份答案交满三次仍没被
 Judge 放行、或者连续几个回合取数全失败（404 循环）时由它止损
 （见 `_task_abandoned`），不再让开拓者被一个拿不到答案的任务永久占死。
+同一份观察值还喂给提交闭环（见 `_task_submit_rejected`）：交完卷任务仍留在
+`phaseTask` 里就是被打回，这一回合改由执行器重新取数（`_sandbox_command`），
+交满额度之后那份答案再从缓存里删掉（`_forget_rejected_answer`）——不然执行器
+解出一次答案就再没跑过，任务线只剩"复读同一个答案直到额度烧完"这一种结局
+（PK592108 的 R15–R17）。
 """
 
 import os
@@ -503,6 +508,20 @@ TASK_EXEC_RETRY_DIR_BUDGET = 400
 # 同样放行不了，只会继续占着开拓者。到线就按止损处理（见 `_task_abandoned`），
 # 把开拓者还给战斗调度。
 TASK_SUBMIT_LIMIT = 3
+# 提交闭环（S1）：判题系统不回任务状态，"交上去的答卷有没有被放行"只能从
+# 报文里现成的观察推——交完卷任务仍留在 `phaseTask` 里，说明那一份没被放行
+# （见 `_task_submit_rejected`）。这时做两件事，都不动上面那条"同一份最多交
+# `TASK_SUBMIT_LIMIT` 次"的重试策略（它留给"答案没错、只是这一回合没被放行"
+# 的情况，复盘 PK592108 的 R14 交的 TOKEN 正属此类，不能把重试掐掉）：
+#   1. 这一回合重新下发执行器（`_sandbox_command`）——旧实现里执行器一旦解出
+#      答案就再没跑过（`_task_answer` 一直非空），任务线只剩"复读手里的答案
+#      直到额度烧完"一条路；执行器每回合按 `rotate` 换一批候选地址，多跑几趟
+#      才可能解出另一份答案（PK592108 的 R15–R17：`state=no_marker` 恒不变，
+#      每回合复读同一份答卷，执行器一次都没再跑过）。
+#   2. 额度交满之后把这份答案从缓存里删掉（`_forget_rejected_answer`）——
+#      不然下一个领到同一份任务文件的回合接取后就会秒交同一个 0 分答案。
+# 报告 P0-1 要的就是这两条："提交后校验、未确认成功才允许重试"与"失败后清
+# 缓存重读重提"。
 
 # === LLM 解任务 ===
 # 沙盒里的接口只能靠"读文档 -> 拼地址"去猜，猜不中时答案区永远是空的，
@@ -779,6 +798,8 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     _watch_task(turn)
     # 上回合执行器解出来的任务答案按文件名缓存，后续任务一到手就能直接作答
     _remember_task_answers(turn.last_cmd_result)
+    # 交过一次而任务还在：那一份答卷已经被 Judge 打回，从缓存里删掉（S1，提交闭环）
+    _forget_rejected_answer(turn)
     # 上一回合 LLM 的回复：任务期间的 CMD/ANSWER 落进当前任务的状态
     _consume_task_reply(turn, payload)
     # 上一回合的LLM建议解析成有界计划，和指令生成器共用（解析不出来时是默认计划）
@@ -813,6 +834,8 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
                        只取回空结果集的 `[EMPTY]`）次数
         solution=yes   输出里有没有 `[SOLUTION]` 段
         cache=hit      答案缓存里有没有当前任务文件的答案
+        submit=rejected 交过一次而任务还在（Judge 没放行，见 `_task_submit_rejected`）：
+                       这一回合会重新下发执行器取数，答卷本身照旧重试
         llm=ask2/cmd   LLM 求助了几次 / 是否已拿到待执行命令或直接答案
 
     参数:
@@ -839,6 +862,9 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
         flags += "/cmd"
     if llm_state.get("answer"):
         flags += "/answer"
+    # 提交闭环（S1，见 `_task_submit_rejected`）：交过一次而任务还在，说明
+    # Judge 没放行——这一回合执行器会重新下发取数，答卷本身照旧重试。日志上
+    # `state=ok` 却又发了一条沙盒命令，靠这个字段解释
     return (
         f'phase="{phase}" state={reason} watch=r{repeats}/t{rounds}/f{fails} '
         f"abandoned={'yes' if _task_abandoned(turn) else 'no'} "
@@ -849,6 +875,7 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
         f"fail={result.count(TASK_API_FAIL_MARKER) + result.count(TASK_EMPTY_MARKER)} "
         f"solution={'yes' if TASK_SOLUTION_MARKER in result else 'no'} "
         f"cache={'hit' if _cached_answer(turn) is not None else 'miss'} "
+        f"submit={'rejected' if _task_submit_rejected(turn) else '-'} "
         f"llm=ask{int(llm_state.get('prompts') or 0)}{flags}"
     )
 
@@ -3698,6 +3725,45 @@ def _task_abandoned(turn: Turn) -> bool:
     )
 
 
+def _task_submit_rejected(turn: Turn) -> bool:
+    """交上去的那份答卷是不是已经被 Judge 打回（只读，S1，提交闭环）
+
+    判题系统不回任务状态，"这一份过了没有"只能从看门狗里现成的观察推：
+    `submits` 把本回合这一次也算在内（见 `_watch_task`），所以它 >= 2 意味着
+    上一回合已经交过一份答卷、而这一回合任务仍留在 `phaseTask` 里——那一份
+    没被放行。
+
+    两个用途，都不改答卷本身的提交策略（同一份最多交 `TASK_SUBMIT_LIMIT` 次，
+    见那里的说明）：
+
+        - `_sandbox_command`：被打回时不再因为"手里有答案"而整段不下发命令，
+          这一回合留给执行器重新取数。旧实现里执行器一旦解出答案就再没跑过
+          （`_task_answer` 一直非空），任务线只剩"复读手里的答案直到额度烧完"
+          一条路；执行器每回合按 `rotate` 换一批候选地址，多跑几趟才可能解出
+          另一份答案（复盘 PK592108 的 R15–R17：`state=no_marker` 恒不变、
+          每回合复读同一份答卷，R19 敌方都还没 ready，我方先把自己耗死了）。
+        - `task_brief`：日志上把这一回合标出来，`state=ok` 却还在发沙盒命令
+          才有解释。
+
+    判据与 `_task_abandoned` 用同一套口径（任务标识 + 回合号连续），回合号
+    对不上就当作没有观察，免得把别的一局的观察套到当前任务上。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        True 表示交过一次而任务还在，那一份没被放行
+    """
+    watch = _TASK_WATCH
+    if watch is None or not turn.phase_task:
+        return False
+    if watch.token != _task_token(turn.phase_task):
+        return False
+    if turn.round_no not in (watch.round_no, watch.round_no + 1):
+        return False
+    return watch.submits >= 2
+
+
 def _task_probe_done(turn: Turn) -> bool:
     """当前任务的沙盒探测次数是不是已经用满（只读，见 `TASK_PROBE_LIMIT`）
 
@@ -4396,12 +4462,23 @@ def _sandbox_command(turn: Turn) -> str:
 
     任务已经被看门狗放弃（读文件死循环 / 超时）时返回空串：继续下发读文件
     命令只会把同一个循环再跑一遍，开拓者却已经被放回去干别的了。
+
+    手里那份答卷已经交过、又被 Judge 打回时（S1，见 `_task_submit_rejected`）
+    不再提前返回空串：这一回合重新下发执行器，换一批轮转过的候选地址去取数。
+    答卷本身照旧按 `TASK_SUBMIT_LIMIT` 重试——重试留给"答案没错、只是这一回合
+    没被放行"的情况，重新取数则让"答错了"的那一份有机会被另一份替换掉，两条
+    路各管一种失败。旧实现只有前一条：执行器一旦解出答案就再没跑过
+    （`_task_answer` 一直非空），任务线只剩复读同一个答案直到额度烧完。
     """
+    if not turn.phase_task or _task_abandoned(turn):
+        return ""
+    # 已经有答案就不必再跑沙盒（下一回合直接交卷）——除非那一份已经被打回
     if (
-        not turn.phase_task
-        or _task_answer(turn) is not None
-        or _cached_answer(turn) is not None
-        or _task_abandoned(turn)
+        not _task_submit_rejected(turn)
+        and (
+            _task_answer(turn) is not None
+            or _cached_answer(turn) is not None
+        )
     ):
         return ""
 
@@ -5764,6 +5841,43 @@ def _cached_answer(turn: Turn) -> str | None:
     if _task_empty_answer(answer):
         return None  # 缓存里那条"答案"是一段零条记录的 JSON（S1）
     return _answer_value(answer) or None  # 只有脚本状态行时算没有答案（S1）
+
+
+def _forget_rejected_answer(turn: Turn) -> None:
+    """把交满提交额度仍没被放行的答案从缓存里删掉（S1，提交闭环）
+
+    缓存是"只增不改"的（`_remember_task_answers` 用 `setdefault`），一份交满
+    `TASK_SUBMIT_LIMIT` 次都没被 Judge 放行的答案留在里面，下一个领到同一份
+    任务文件的回合（任务点冷却结束再接、或者另一个任务点引用同一份文件）
+    接取后就会立刻秒交（`_cached_answer`），连重新取数的机会都没有——同一个
+    0 分答案再送一遍，白占一个任务窗口。报告 P0-1 的原话就是"失败后清缓存
+    重读重提"。
+
+    触发线放在"额度已经交满"（`watch.submits > TASK_SUBMIT_LIMIT`，与
+    `_task_abandoned` 判死同一条件）而不是第一次被打回：`TASK_SUBMIT_LIMIT`
+    本身就是留给"答案没错、只是这一回合没被放行"的重试窗口（复盘 PK592108
+    的 R14 交的 TOKEN 就是提交后没等到确认），重试期间缓存必须留着。交满
+    之后这份答案才确定是死的，此时删掉最合适。
+
+    调用点排在 `_remember_task_answers` 之后（见 `decide`）：那份被打回的答案
+    可能还留在本回合的沙盒输出里，先建缓存再删才删得干净。
+
+    参数:
+        turn: 当前回合信息
+    """
+    watch = _TASK_WATCH
+    if watch is None or not turn.phase_task:
+        return
+    if watch.token != _task_token(turn.phase_task):
+        return
+    if turn.round_no not in (watch.round_no, watch.round_no + 1):
+        return
+    if watch.submits <= TASK_SUBMIT_LIMIT:
+        return
+    target = _task_file(turn.phase_task)
+    if target is None:
+        return
+    _TASK_ANSWER_CACHE.pop(target.replace("\\", "/").rsplit("/", 1)[-1], None)
 
 
 def _go_mine(
