@@ -3468,11 +3468,12 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
     只认 `CMD:` / `ANSWER:` 两个前缀；两条都出现时优先 `CMD`——真去沙盒取数
     才算解出来，LLM 凭文档直接给的答案只当兜底。
 
-    `CMD:` 给的命令先过一道 `_shell_command_ok` 的体检（引号成对、单行）：
-    拼不出合法命令的回复直接丢掉，本回合改走执行器自己取数（`_sandbox_command`
-    的兜底路径），而不是拿一整个回合去换一条注定报语法错的命令；状态里没落下
-    命令时 `_task_prompt` 下一回合会再问一次，问到 `TASK_LLM_MAX_PROMPTS`
-    次为止（复盘 PK590881 的 R14 就是被一条引号不配对的命令耗掉了一个回合）。
+    `CMD:` 给的命令先过一道 `_shell_command_ok` 的体检（引号成对、单行、
+    不带 heredoc）：拼不出合法命令的回复直接丢掉，本回合改走执行器自己取数
+    （`_sandbox_command` 的兜底路径），而不是拿一整个回合去换一条注定报语法错
+    的命令；状态里没落下命令时 `_task_prompt` 下一回合会再问一次，问到
+    `TASK_LLM_MAX_PROMPTS` 次为止（复盘 PK590881 的 R14 就是被一条引号不配对
+    的命令耗掉了一个回合，PK591011 的 R13/R16 则是被 heredoc 耗掉的）。
     """
     reply = str(payload.get("llmResp") or "")
     if not turn.phase_task or not reply:
@@ -3494,21 +3495,37 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
                 return
 
 
+# heredoc 在"一回合一条命令"里永远收不了尾（S2，复盘 PK591011 的 R13/R16）。
+# heredoc 的结束符必须独占一行，而 `CMD:` 只给得出一行命令：包装时另起一行
+# 接上去的 `echo "[TASK_END]"` 与末尾的 `:` 会被当成 heredoc 正文一起吞掉，
+# bash 只回一句 `here-document at line 0 delimited by end-of-file (wanted
+# 'EOF')`（PK591011 的 R16 就是这条）。更糟的是这行报错出在解析阶段，整条
+# 命令一个字都不会执行——连开头的任务标识都没打印，`_task_answer` 只能判
+# `no_marker`（同一场的 R13：sandbox=发送但 state=no_marker），这一个任务回合
+# 连同那一次的提交机会一起白费。`<<<`（here-string）是另一回事：它当场就有
+# 内容，单行也跑得起来，照旧放行（`(?<!<)` 挡住的是 `<<<` 里从第二个 `<`
+# 起算的那一对，否则 here-string 会被误判成 heredoc）。
+LLM_HEREDOC_PATTERN = re.compile(r"(?<!<)<<(?![<=])")
+
+
 def _shell_command_ok(command: str) -> bool:
-    """LLM 给的沙盒命令能不能直接交给 bash 跑（引号成对、单行）
+    """LLM 给的沙盒命令能不能直接交给 bash 跑（引号成对、单行、不带 heredoc）
 
     LLM 的回复是一行 `CMD: <命令>`，会被原样拼进沙盒命令里。少一个配对的
     引号时 bash 整条报 `unexpected EOF while looking for matching '"'`：
     复盘 PK590881 的 R14 就是这么白丢一个回合的——沙盒输出里连任务标识都
     没有，`_task_answer` 只能判 `no_marker`，下一回合从头再来。
 
-    体检只看两件事：
+    体检看三件事：
         - 单/双引号各自成对（不区分转义）
         - 不含换行（换行会把命令拆成多行，末尾的 `[TASK_END]` 会被卷进命令体）
+        - 不含 heredoc 重定向（结束符独占一行，单行命令里收不了尾，末标记
+          与退出码一起被吞掉，见 `LLM_HEREDOC_PATTERN`）
 
-    成对性不看转义，`echo "a\\"b"` 这类合法写法会被一并挡掉：宁可漏放一条，
-    交给执行器自己去取数（`_sandbox_command` 的兜底路径），也不拿一个回合去
-    赌一条可能跑不起来的命令。
+    成对性不看转义，`echo "a\\"b"` 这类合法写法会被一并挡掉；heredoc 也一样，
+    `grep -o 'a<<b' file` 这类把 `<<` 当数据的命令会被误伤。两者都按同一个
+    取舍办：宁可漏放一条，交给执行器自己去取数（`_sandbox_command` 的兜底
+    路径），也不拿一个回合去赌一条可能跑不起来的命令。
 
     参数:
         command: LLM 给的取数命令（单行）
@@ -3517,6 +3534,8 @@ def _shell_command_ok(command: str) -> bool:
         True 表示这条命令可以拼进沙盒命令
     """
     if not command or "\n" in command or "\r" in command:
+        return False
+    if LLM_HEREDOC_PATTERN.search(command):
         return False
     return all(command.count(quote) % 2 == 0 for quote in ('"', "'"))
 
