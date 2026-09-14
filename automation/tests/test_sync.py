@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from automation_main import Automation, pull_number
 from dispatcher import Task
-from executor import ExecResult
+from executor import ClaudeExecutor, ExecResult
 from git_pusher import GitPusher
 from issue_monitor import Issue, ProcessedStore
 
@@ -96,12 +97,19 @@ class FakePusher:
         self.comments: list[tuple[int, str]] = []
         self.dirty: list[str] = []
         self.published_pre_dirty: list[str] = []
+        self.branch_merged: bool | None = None
+        self.discarded = False
 
     def sync_main(self, main_branch: str, merged_branch: str = "",
                   delete_remote_branch: bool = False,
-                  strategy: str = "rebase") -> bool:
+                  strategy: str = "rebase", branch_merged: bool = False) -> bool:
         self.calls.append((main_branch, merged_branch, delete_remote_branch, strategy))
+        self.branch_merged = branch_merged
         return self.result
+
+    def discard_changes(self, pre_dirty=None) -> list[str]:
+        self.discarded = True
+        return []
 
     def dirty_paths(self) -> list[str]:
         return list(self.dirty)
@@ -564,3 +572,70 @@ def test_commit_all_accepts_modified_tracked_file(repo_pair):
     committed = _git(repo_pair, "show", "--name-only", "--format=", "HEAD").split()
     assert committed == ["code.txt"]
     assert pusher.has_changes() is False
+
+
+# === 失败任务的收尾与超时 ===
+
+
+def test_discard_changes_reclaims_failed_task_leftovers(repo_pair):
+    """失败任务的残留改动被回收，他人WIP原样保留
+
+    回归：#15 超时后把半成品留在工作区，下一个任务把它当作“任务前的脏文件”
+    排除，导致改了代码却提交不上去（#14 因此被记成 no_change）。
+    """
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "wip.txt").write_text("other session WIP\n", encoding="utf-8")
+    pre_dirty = pusher.dirty_paths()
+
+    # 模拟一次超时任务：改了已跟踪文件、还新建了文件
+    (repo_pair / "code.txt").write_text("claude edit\n", encoding="utf-8")
+    (repo_pair / "new_file.txt").write_text("claude new\n", encoding="utf-8")
+
+    discarded = pusher.discard_changes(pre_dirty)
+
+    assert sorted(discarded) == ["code.txt", "new_file.txt"]
+    assert (repo_pair / "code.txt").read_text(encoding="utf-8") == "v1\n"  # 已还原
+    assert not (repo_pair / "new_file.txt").exists()                       # 已删除
+    assert (repo_pair / "wip.txt").read_text(encoding="utf-8") == "other session WIP\n"
+    assert pusher.dirty_paths() == pre_dirty
+
+
+def test_discard_changes_noop_when_clean(repo_pair):
+    """工作区没有本次任务的残留时不做任何事"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    assert pusher.discard_changes([]) == []
+
+
+def test_sync_main_force_deletes_branch_when_told_merged(repo_pair):
+    """已知PR已合并（squash合并）时用 -D 强制清理分支；未告知时保守保留"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    _git(repo_pair, "checkout", "-b", "squashed-work")
+    (repo_pair / "wip.txt").write_text("wip\n", encoding="utf-8")
+    _git(repo_pair, "add", "-A")
+    _git(repo_pair, "commit", "-m", "wip")
+    _git(repo_pair, "checkout", "main")
+
+    # 默认：安全删除，未合并的分支保留
+    assert pusher.sync_main("main", "squashed-work") is True
+    assert "squashed-work" in _git(repo_pair, "branch", "--format=%(refname:short)").split()
+
+    # 明确告知已合并：强制清理
+    assert pusher.sync_main("main", "squashed-work", branch_merged=True) is True
+    assert "squashed-work" not in _git(repo_pair, "branch", "--format=%(refname:short)").split()
+
+
+def test_executor_enforces_timeout(tmp_path):
+    """超时必须真正掐断进程（曾出现 timeout=600s 实际跑 1111s）"""
+    executor = ClaudeExecutor(
+        executable=sys.executable,
+        timeout=2,
+        extra_args=["-c", "import time; time.sleep(60)"],
+    )
+    executor.work_dir = str(tmp_path)
+    task = Task(1, "t", "b", "branch", "prompt", "msg", "now")
+
+    result = executor.run(task)
+
+    assert result.ok is False
+    assert "timeout" in result.error
+    assert result.duration < 30  # 远小于 sleep 的 60 秒，说明确实被掐断了

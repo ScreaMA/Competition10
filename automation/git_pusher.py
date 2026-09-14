@@ -257,11 +257,46 @@ class GitPusher:
         self._git("checkout", original_branch)
         self._git("branch", "-D", branch_name)
 
+    def discard_changes(self, pre_dirty: list[str] | None = None) -> list[str]:
+        """丢弃本次任务留下的改动，恢复到任务开始前的状态
+
+        用于 Claude 超时/失败后的收尾：残留的半成品如果留在工作区，
+        会被下一个任务当成“任务前就存在的脏文件”而被排除，导致后续任务
+        明明改了代码却提交不上去（实测 #15 超时后，#14 因此被记成 no_change）。
+
+        只处理任务开始后才变脏的文件：已跟踪的还原到 HEAD，未跟踪的删除；
+        任务开始前就存在的未提交文件（他人WIP）保持不动。
+
+        返回:
+            实际被丢弃的文件列表
+        """
+        excluded = set(pre_dirty or ())
+        todo = [path for path in self._porcelain_paths() if path not in excluded]
+        if not todo:
+            return []
+
+        tracked: list[str] = []
+        untracked: list[str] = []
+        for path in todo:
+            if self._git("ls-files", "--error-unmatch", "--", path).ok:
+                tracked.append(path)
+            else:
+                untracked.append(path)
+
+        if tracked:
+            self._git("checkout", "--", *tracked)
+        if untracked:
+            # 只删除本次新产生的未跟踪文件/目录
+            self._git("clean", "-f", "--", *untracked)
+        LOGGER.warning("已回收本次任务的残留改动：%s", ", ".join(todo))
+        return todo
+
     # === 与远端同步 ===
 
     def sync_main(self, main_branch: str, merged_branch: str = "",
                   delete_remote_branch: bool = False,
-                  strategy: str = "rebase") -> bool:
+                  strategy: str = "rebase",
+                  branch_merged: bool = False) -> bool:
         """把本地主干同步到远端最新（PR合并后调用）
 
         参数:
@@ -272,6 +307,7 @@ class GitPusher:
                 - "rebase": 把本地提交重放到远端之上（默认，保持线性历史）
                 - "merge": 生成一个合并提交
                 - "ff-only": 只允许快进，分叉时保持现状
+            branch_merged: 调用方是否已确认该PR被合并（squash合并时用 -D 清理分支）
 
         返回:
             True 表示本地已与远端主干一致（前进了，或本来就一致）
@@ -331,8 +367,12 @@ class GitPusher:
         # 无论本次是否产生新提交，都要清理传入的已合并分支：
         # 连续两个PR都合并时，第二个PR进来时主干可能已经是最新（前一次已同步过）
         if merged_branch and merged_branch != main_branch:
-            # 用 -d（安全删除）：只有确实已并入主干才会删除，否则保留并告警
-            removed = self._git("branch", "-d", merged_branch)
+            # branch_merged=True 表示调用方已确认该PR被合并：
+            # squash/rebase 合并时GitHub生成的是新提交，原分支提交不是主干的祖先，
+            # `-d` 会以“not fully merged”拒绝删除，此时用 `-D` 是安全的（内容已进主干）。
+            # 未确认合并时仍用 `-d`（安全删除），未合并的分支会拒绝删除。
+            flag = "-D" if branch_merged else "-d"
+            removed = self._git("branch", flag, merged_branch)
             if removed.ok:
                 LOGGER.info("已清理本地分支 %s", merged_branch)
             else:

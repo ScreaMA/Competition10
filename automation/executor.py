@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -96,6 +97,24 @@ class ClaudeExecutor:
                        "/".join(PRINT_MODE_FLAGS))
         return [*command, _single_line(task.prompt)], None
 
+    def _kill_tree(self, process: subprocess.Popen) -> None:
+        """终止整个进程树
+
+        Windows 上 `claude` 解析到的是 npm 生成的 .cmd 垫片，直接 kill 只会杀掉
+        cmd.exe，真正在跑的 node 子进程会继续运行（实测 timeout=600s 的任务跑了
+        1111s 才结束）。必须用 taskkill /T 连子孙进程一起杀。
+        """
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True, check=False,
+            )
+            return
+        try:
+            process.kill()
+        except OSError:
+            LOGGER.exception("failed to kill claude process")
+
     def run(self, task: Task) -> ExecResult:
         """执行任务，返回执行结果"""
         command, stdin_text = self._build_invocation(task)
@@ -108,26 +127,15 @@ class ClaudeExecutor:
 
         started = time.time()
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                input=stdin_text,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=self.work_dir,
-                capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self.timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            duration = time.time() - started
-            LOGGER.error("claude timed out after %.1fs", duration)
-            return ExecResult(
-                ok=False,
-                returncode=-1,
-                output=(exc.stdout or "") if isinstance(exc.stdout, str) else "",
-                duration=duration,
-                error=f"timeout after {self.timeout}s",
             )
         except OSError as exc:
             duration = time.time() - started
@@ -136,13 +144,34 @@ class ClaudeExecutor:
                 ok=False, returncode=-1, output="", duration=duration, error=str(exc),
             )
 
+        timed_out = False
+        try:
+            stdout_text, stderr_text = process.communicate(
+                input=stdin_text, timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._kill_tree(process)
+            try:
+                stdout_text, stderr_text = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                stdout_text, stderr_text = "", ""
+
         duration = time.time() - started
-        output = (completed.stdout or "").strip()
-        error = (completed.stderr or "").strip()
-        ok = completed.returncode == 0
+        output = (stdout_text or "").strip()
+        error = (stderr_text or "").strip()
+
+        if timed_out:
+            LOGGER.error("claude timed out after %.1fs", duration)
+            return ExecResult(
+                ok=False, returncode=-1, output=output, duration=duration,
+                error=f"timeout after {self.timeout}s",
+            )
+
+        ok = process.returncode == 0
         LOGGER.info(
-            "claude finished: rc=%d ok=%s duration=%.1fs output=%d chars",
-            completed.returncode, ok, duration, len(output),
+            "claude finished: rc=%s ok=%s duration=%.1fs output=%d chars",
+            process.returncode, ok, duration, len(output),
         )
         if output:
             # 把 Claude 的结论记入日志，便于复盘“为什么这样改/为什么没改”
@@ -152,7 +181,7 @@ class ClaudeExecutor:
             LOGGER.warning("claude stderr: %s", _shorten(error))
         return ExecResult(
             ok=ok,
-            returncode=completed.returncode,
+            returncode=process.returncode if process.returncode is not None else -1,
             output=output,
             duration=duration,
             error=error,

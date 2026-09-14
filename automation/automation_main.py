@@ -137,6 +137,8 @@ class Automation:
         if not result.ok:
             LOGGER.error("claude execution failed for issue #%d: %s",
                          issue.number, result.error or f"rc={result.returncode}")
+            # 回收本次任务的残留改动，否则会被下一个任务当作“任务前的脏文件”排除
+            self.pusher.discard_changes(pre_dirty)
             self.monitor.mark_processed(issue.number, "exec_failed", result.error)
             if self.comment_on_issue:
                 self.pusher.comment_issue(
@@ -216,7 +218,7 @@ class Automation:
                             number, issue_number, self.main_branch())
                 if self.pusher.sync_main(self.main_branch(), branch,
                                          self.delete_remote_branch,
-                                         self.sync_strategy):
+                                         self.sync_strategy, branch_merged=True):
                     self.monitor.mark_synced(issue_number, f"PR #{number} merged")
                     synced += 1
                 else:
@@ -285,7 +287,8 @@ class Automation:
             return True
 
         if self.pusher.sync_main(self.main_branch(), branch,
-                                 self.delete_remote_branch, self.sync_strategy):
+                                 self.delete_remote_branch, self.sync_strategy,
+                                 branch_merged=True):
             self.monitor.mark_synced(issue_number, f"PR #{number} auto-merged")
             if self.comment_on_issue:
                 self.pusher.comment_issue(
