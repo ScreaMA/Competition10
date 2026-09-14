@@ -1707,6 +1707,151 @@ def test_pioneer_skips_sandbox_error_output(payload_factory, role_factory):
     assert "10011" not in commands
 
 
+# === issue #77：接口把错误包成 200 时不能当答案交上去（S2） ===
+
+
+def test_sandbox_answer_rejects_api_error_body(payload_factory, role_factory):
+    """接口用 200 包一层错误 JSON 时不能提交（复盘 PK590557 的 R16/R18）
+
+    取数器只认"请求有响应"，错误 JSON 照样会进 `[SOLUTION]` 段；原样交上去
+    就是又一次 0 分，还把 `TASK_SUBMIT_LIMIT` 的额度耗在一次注定不被放行的
+    提交上。命中时这一回合不交卷，沙盒命令照常重跑。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    for body in (
+        '{"status": "error", "message": "missing query param city"}',
+        '{"error": "Unauthorized", "code": 401}',
+        '{"code": 404, "detail": "no such endpoint"}',
+        "404 Not Found",
+        "Traceback (most recent call last):\nValueError: bad city",
+    ):
+        payload["lastCmdResult"] = _solution_result(
+            phase_task, "task_1_beijing.md", body,
+        )
+        commands, _ = decide(payload)
+        assert "10011" not in commands, body
+    # 错误体不算答案，沙盒命令继续下发（下一回合重新取数）
+    assert sandbox_command(payload) != ""
+
+
+def test_sandbox_answer_keeps_real_data_that_mentions_errors(
+    payload_factory, role_factory,
+):
+    """正常数据里出现 "error"/"Forbidden" 这类字眼时照常提交
+
+    "故宫"的英文是 Forbidden City，一份完全正确的文化遗产答案里就会出现
+    Forbidden；`{"error": null}` 也是常见的正常包装。这道闸门只拦"看着就是
+    错误"的形态，不能把正确答案拦下来。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    for body in (
+        "Forbidden City 故宫博物院",
+        '{"error": null, "data": {"city": "北京", "count": 7}}',
+        '{"code": "BJ-01", "name": "故宫"}',
+        '{"status": "ok", "count": 7}',
+    ):
+        payload["lastCmdResult"] = _solution_result(
+            phase_task, "task_1_beijing.md", body,
+        )
+        commands, _ = decide(payload)
+        assert commands["10011"]["action"] == "submitAnswer", body
+        assert commands["10011"]["taskAnswer"] == body
+
+
+def test_task_error_body_matches_only_error_shapes():
+    """`_task_error_body` 的判定边界：只认错误键/错误状态值/4xx-5xx/异常回溯"""
+    bad = (
+        '{"status":"error"}',
+        '{"status": "failed"}',
+        '{"status": 503}',
+        '{"code": 500}',
+        '{"code": "403"}',
+        '{"error": "boom"}',
+        "500 Internal Server Error",
+        "[APIFAIL] http://localhost:8899 HTTPError 404",
+        "urllib.error.URLError: <urlopen error>",
+    )
+    good = (
+        "Forbidden City 故宫博物院",
+        "Not Found 是一首歌",
+        '{"error": null}',
+        '{"error": []}',
+        '{"code": "BJ-01"}',
+        '{"code": 2001}',
+        '{"status": "ok", "count": 7}',
+        "晴，26℃",
+    )
+    for text in bad:
+        assert brain._task_error_body(text), text
+    for text in good:
+        assert not brain._task_error_body(text), text
+
+
+def test_cached_error_body_is_not_submitted(payload_factory, role_factory):
+    """缓存里那条"答案"是错误体时同样不能交（提交闸门不能只拦一条路）
+
+    缓存是在执行器输出上直接建的（`_remember_task_answers`），只按取数证据
+    `[API]` 过滤，错误 JSON 一样会进缓存；`_cached_answer` 走的是与
+    `_task_answer` 不同的那条路，闸门必须也装在这里。
+    """
+    phase_task = "请阅读task_1_alpha.md"
+    # 执行器把 401 的错误 JSON 当成"取到的数"记进了缓存
+    brain._remember_task_answers(
+        "[exitCode:0]\n[TASK]上一个任务\n"
+        "[API] http://localhost:8899/heritage?city=alpha => 42\n"
+        f"{TASK_SOLUTION_MARKER}task_1_alpha.md\n"
+        '{"status": "error", "code": 401}\n'
+        f"{TASK_SOLUTION_END}\n"
+    )
+    assert "task_1_alpha.md" in brain._TASK_ANSWER_CACHE  # 缓存确实收下了它
+
+    payload = payload_factory(
+        round_no=16,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    assert brain._cached_answer(Turn.load(payload)) is None
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_alpha.md", '{"status": "error", "code": 401}',
+    )
+    commands, _ = decide(payload)
+    assert "10011" not in commands
+
+
+def test_task_brief_reports_error_body_reason(payload_factory, role_factory):
+    """`task_brief` 把"交上去的是错误体"写成 state=error_body"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"status": "error", "code": 404}',
+    )
+    brief = brain.task_brief(Turn.load(payload))
+    assert "state=error_body" in brief
+
+
 # === 夜晚决策 ===
 
 
@@ -4087,3 +4232,89 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+def test_executor_api_fail_reports_status_and_body(capsys):
+    """取数失败的诊断行带上 HTTP 状态码与响应体（#77 的 S1）
+
+    复盘里只有 `[APIFAIL] http://localhost:8899 HTTPError`，分不清 401（缺鉴权）
+    还是 404（地址不对），下一轮修复只能靠猜；401/404 的响应体里通常就写着
+    缺什么。诊断还必须和状态码挤在同一行：`[APIFAIL]` 的行数就是"取数失败了
+    几次"（`task_brief` 的 fail 计数），一次失败拆成两行会让计数翻倍。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]
+    match = re.search(r"def fetch\(url\):.*?(?=\ndef )", script, re.S)
+    assert match
+
+    class HTTPError(Exception):
+        code = 401
+
+        def read(self):
+            return b'{"status":"error","message":"missing Authorization"}'
+
+    def _urlopen(request, timeout=None):
+        raise HTTPError()
+
+    class _Request:
+        def __init__(self, url, headers=None):
+            self.url = url
+
+    class _RequestModule:
+        Request = _Request
+        urlopen = staticmethod(_urlopen)
+
+    class _Urllib:
+        request = _RequestModule
+
+    namespace = {
+        "FAIL": brain.TASK_API_FAIL_MARKER,
+        "TIMEOUT": brain.TASK_API_TIMEOUT,
+        "BODY_LIMIT": brain.TASK_API_BODY_LIMIT,
+        "urllib": _Urllib,
+    }
+    exec(match.group(0), namespace)  # noqa: S102
+    assert namespace["fetch"]("http://localhost:8899/weather") == ""
+
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith(brain.TASK_API_FAIL_MARKER)
+    assert "HTTPError 401" in lines[0]  # 状态码要看得出来是 401 还是 404
+    assert "missing Authorization" in lines[0]  # 响应体里的线索一并带回
+
+
+def test_executor_api_fail_without_status_keeps_one_line(capsys):
+    """连不上（无状态码）时诊断行仍然只有一行，且不带多余空格"""
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]
+    match = re.search(r"def fetch\(url\):.*?(?=\ndef )", script, re.S)
+    assert match
+
+    class URLError(Exception):
+        pass  # 没有 code 也没有 read（连不上时就是这样）
+
+    def _urlopen(request, timeout=None):
+        raise URLError()
+
+    class _Request:
+        def __init__(self, url, headers=None):
+            self.url = url
+
+    class _RequestModule:
+        Request = _Request
+        urlopen = staticmethod(_urlopen)
+
+    class _Urllib:
+        request = _RequestModule
+
+    namespace = {
+        "FAIL": brain.TASK_API_FAIL_MARKER,
+        "TIMEOUT": brain.TASK_API_TIMEOUT,
+        "BODY_LIMIT": brain.TASK_API_BODY_LIMIT,
+        "urllib": _Urllib,
+    }
+    exec(match.group(0), namespace)  # noqa: S102
+
+    assert namespace["fetch"]("http://localhost:8899/x") == ""
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == [f"{brain.TASK_API_FAIL_MARKER} http://localhost:8899/x URLError"]
