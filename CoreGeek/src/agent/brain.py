@@ -743,7 +743,7 @@ def _idle_gather(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> None:
-    """兜底：没有任何目标的角色就近采一铲矿
+    """兜底：没有任何目标的工人就近采一铲矿
 
     决策的各条分支都会尽量给角色安排动作，但任务点够不到、武器还没建成、
     地图上一座矿都采不了时，角色会整回合没有任何指令（复盘里的"角色原地
@@ -752,10 +752,11 @@ def _idle_gather(
 
     不打扰的情况:
         - 本回合已经有指令的角色（决策层已经给了更优先的动作）
-        - 任务进行中的开拓者：任务要求它留在任务点周围一格内，
-          任何移动都可能让任务强制结束
-        - 有任务可领的开拓者：接任务、交任务是主要得分来源，被兜底支去采矿
-          等于把开拓者从任务点上拽走（它的任务优先级最高，见 `_pioneer_day_logic`）
+        - 开拓者：`collect` 是工人专属动作（任务书 4.4，见 `_go_mine`），
+          支它去矿边只会换来一条 `[COMMAND_ERROR]`（PK590881 的 R11–R15）；
+          而且任务进行中的开拓者要留在任务点周围一格内、有任务可领的开拓者
+          要赶去接任务（接任务、交任务是主要得分来源，见 `_pioneer_day_logic`），
+          都轮不到采矿
         - 黄昏（调用方不调用）：回防到武器旁待命比多采一铲矿更重要，
           武器要有角色操控才会开火
 
@@ -767,9 +768,7 @@ def _idle_gather(
     """
     if unit.unit_id in commands:
         return
-    if unit.kind == PIONEER and (
-        turn.phase_task or any(task.is_valid for task in turn.player_tasks)
-    ):
+    if unit.kind != WORKER:
         return
     for mine_type in SELLABLE_MINES:
         if _go_mine(turn, unit, mine_type, claimed, commands):
@@ -1960,14 +1959,14 @@ def _task_wait_logic(
     自进化任务的答案要等下一回合的沙盒输出，而任务期间开拓者必须留在任务点
     周围一格内（离开会强制结束任务），于是它常常整回合什么都不做——复盘里
     "开拓者 20011 R11-R17 无任何指令、idle_man 升至 3"，一个可操控单位整段
-    白天白搭。这里给它安排两条就地能做的动作：
+    白天白搭。这里给它安排一条就地能做的动作：在"仍然落在任务点周围一格内"
+    的相邻格里挪一步，方向朝最近的武器塔（不离开任务圈，顺带为夜晚操控武器
+    省一段路）。走不通时不下指令——原地待命比乱走安全（任务点的有效性只看
+    距离），但只要挪得动，这名角色就不会再零指令空转。
 
-        1. 身旁有矿就采一铲（采集不移动，任务照旧有效）
-        2. 否则在"仍然落在任务点周围一格内"的相邻格里挪一步，方向朝最近的
-           武器塔（不离开任务圈，顺带为夜晚操控武器省一段路）
-
-    两条都走不通时不下指令——原地待命比乱走安全（任务点的有效性只看距离），
-    但只要有一件事可做，这名角色就不会再零指令空转。
+    这里**不安排采集**：任务书 4.4 的指令表里 `collect` 只许工人用，开拓者
+    发了也是整条被驳回（复盘 PK590881 的 R11–R15 就是这么把任务窗口耗掉的，
+    见 `_go_mine`）——"顺手采一铲"的收益远小于白白丢掉的一整个任务回合。
 
     参数:
         turn: 当前回合信息
@@ -1976,16 +1975,7 @@ def _task_wait_logic(
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
     """
-    # 1. 旁边就有矿: 采一铲换资源（原地动作，不会离开任务圈）
-    if not pioneer.backpack_full:
-        for mine_type in SELLABLE_MINES:
-            mine = _adjacent_mine(turn, pioneer, mine_type)
-            if mine is not None and mine not in claimed:
-                commands[pioneer.unit_id] = collect_command(mine)
-                claimed.add(mine)
-                return
-
-    # 2. 没矿可采: 在任务圈内朝最近的武器塔挪一步
+    # 在任务圈内朝最近的武器塔挪一步（采集是工人专属动作，见上面的说明）
     weapons = turn.weapons()
     if not weapons:
         return
@@ -3267,6 +3257,12 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
 
     只认 `CMD:` / `ANSWER:` 两个前缀；两条都出现时优先 `CMD`——真去沙盒取数
     才算解出来，LLM 凭文档直接给的答案只当兜底。
+
+    `CMD:` 给的命令先过一道 `_shell_command_ok` 的体检（引号成对、单行）：
+    拼不出合法命令的回复直接丢掉，本回合改走执行器自己取数（`_sandbox_command`
+    的兜底路径），而不是拿一整个回合去换一条注定报语法错的命令；状态里没落下
+    命令时 `_task_prompt` 下一回合会再问一次，问到 `TASK_LLM_MAX_PROMPTS`
+    次为止（复盘 PK590881 的 R14 就是被一条引号不配对的命令耗掉了一个回合）。
     """
     reply = str(payload.get("llmResp") or "")
     if not turn.phase_task or not reply:
@@ -3276,7 +3272,7 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
         text = line.strip()
         if text.startswith(TASK_LLM_CMD_PREFIX):
             command = text[len(TASK_LLM_CMD_PREFIX):].strip()
-            if command:
+            if command and _shell_command_ok(command):
                 state["pending_cmd"] = command
                 return
     for line in reply.splitlines():
@@ -3286,6 +3282,33 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
             if answer:
                 state["answer"] = answer
                 return
+
+
+def _shell_command_ok(command: str) -> bool:
+    """LLM 给的沙盒命令能不能直接交给 bash 跑（引号成对、单行）
+
+    LLM 的回复是一行 `CMD: <命令>`，会被原样拼进沙盒命令里。少一个配对的
+    引号时 bash 整条报 `unexpected EOF while looking for matching '"'`：
+    复盘 PK590881 的 R14 就是这么白丢一个回合的——沙盒输出里连任务标识都
+    没有，`_task_answer` 只能判 `no_marker`，下一回合从头再来。
+
+    体检只看两件事：
+        - 单/双引号各自成对（不区分转义）
+        - 不含换行（换行会把命令拆成多行，末尾的 `[TASK_END]` 会被卷进命令体）
+
+    成对性不看转义，`echo "a\\"b"` 这类合法写法会被一并挡掉：宁可漏放一条，
+    交给执行器自己去取数（`_sandbox_command` 的兜底路径），也不拿一个回合去
+    赌一条可能跑不起来的命令。
+
+    参数:
+        command: LLM 给的取数命令（单行）
+
+    返回:
+        True 表示这条命令可以拼进沙盒命令
+    """
+    if not command or "\n" in command or "\r" in command:
+        return False
+    return all(command.count(quote) % 2 == 0 for quote in ('"', "'"))
 
 
 def _llm_task_command(turn: Turn) -> str:
@@ -4066,8 +4089,16 @@ def _go_mine(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """让单位去采矿"""
-    if unit.backpack_full:
+    """让单位去采矿（只有工人能干这活）
+
+    任务书 4.4 的指令表里 `collect` 的可用角色一栏只写了工人，别的角色下达
+    采集会被判题系统整条打回。复盘 PK590881 的 R11–R15 连续 5 个回合
+    `[COMMAND_ERROR] role 20011 (pioneer) wants collect, but only worker can
+    do this action`：开拓者被支去采石，矿一块没采到（任务角色还得留在任务点
+    周围一格内，根本走不到矿边），任务窗口也一起耗光了。这里做最后一道闸门，
+    非工人一律不下发采集/走向矿点，调用方按"这名角色干不了这活"另作安排。
+    """
+    if unit.kind != WORKER or unit.backpack_full:
         return False
 
     mines = [
