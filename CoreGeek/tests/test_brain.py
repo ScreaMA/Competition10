@@ -3292,6 +3292,176 @@ def test_task_answer_ignores_task_echo_from_llm(payload_factory, role_factory):
     assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
 
 
+# === issue #47：沙盒命令失败特征 / 任务文件绝对路径 / 接口错误体 ===
+
+
+def test_task_failed_rejects_sandbox_failure_text():
+    """沙盒"命令没跑成"的输出不是答案：命令不存在、接口错误体、管道中断都要挡
+
+    回归：PK590245 的 R14 把 "/bin/bash: jq: command not found..." 当答案提交，
+    PK590244 的 R14 把 {"status":"error",...,"code":404} 当答案提交，两次判负。
+    旧实现只挡 "No such file" 三条，这两类都从缝里漏了过去。
+    """
+    assert brain._task_failed("/bin/bash: jq: command not found")
+    assert brain._task_failed("sh: 1: jq: not found")
+    assert brain._task_failed(
+        '{"status":"error","message":"Endpoint not found: /api/docs","code":404}'
+    )
+    assert brain._task_failed("curl: (23) Failed writing body")
+    assert brain._task_failed("cat: task_1_beijing.md: No such file or directory")
+    assert brain._task_failed("Traceback (most recent call last):")
+
+    # 正常取数结果不能被误伤：`code` 后面必须是 4xx/5xx 才算错误体
+    assert not brain._task_failed('{"city": "北京", "count": 7}')
+    assert not brain._task_failed('{"code": 200, "city": "北京"}')
+
+
+def test_pioneer_skips_llm_command_error_output(payload_factory, role_factory):
+    """LLM 给的命令在沙盒里跑挂时不能交卷：报错原文不是答案
+
+    回归：PK590245 的 R14，LLM 命令用了沙盒里没有的 jq，
+    "/bin/bash: jq: command not found" 被原样 submitAnswer。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: cat task_1_beijing.md | jq -r .answer"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        evidence="/bin/bash: jq: command not found",
+    )
+    commands, _ = decide(payload)
+
+    assert commands.get("10011", {}).get("action") != "submitAnswer"
+
+
+def test_pioneer_skips_solution_whose_body_is_api_error(
+    payload_factory, role_factory,
+):
+    """接口用 200 回一个错误体时，它进了取数证据也不能当答案交
+
+    回归：PK590244 的 R14 交上去的是
+    {"status":"error","message":"Endpoint not found: /api/docs","code":404}。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _solution_result(
+        phase_task,
+        "task_1_beijing.md",
+        '{"status":"error","message":"Endpoint not found: /api/docs","code":404}',
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands
+
+
+def test_sandbox_command_uses_absolute_task_path_from_dump(
+    payload_factory, role_factory,
+):
+    """回读段里认出的绝对路径替换掉任务描述里的裸文件名
+
+    回归：PK590245 的 R16/R18 拿相对路径 `cat task_1_beijing.md`，沙盒工作目录
+    一变就是 "No such file or directory"，两个回合白丢在找文件上。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=2,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = (
+        f"[exitCode:0]\n{TASK_MARKER}{_task_token(phase_task)}\n"
+        f"{TASK_FILE_MARKER}/tmp/selfEvolutionTask/task_1_beijing.md\n"
+        "# 自进化任务 A-1\n"
+        f"{TASK_FILE_END}\n{TASK_END_MARKER}\n"
+    )
+    command = sandbox_command(payload)
+
+    assert "TASK_PATH = '/tmp/selfEvolutionTask/task_1_beijing.md'" in command
+    # 绝对路径已知时，执行器先搜它所在的目录再全盘搜（`[SCAN] tasks=0` 的成因）
+    assert "SEED_DIRS" in command
+
+
+def test_llm_command_bare_task_file_becomes_absolute(
+    payload_factory, role_factory,
+):
+    """LLM 命令里的裸任务文件名换成沙盒里的绝对路径
+
+    回归：PK590245 的 R16–R18，LLM 照着任务描述写 `cat task_1_beijing.md`，
+    沙盒工作目录漂移后回回都是 No such file。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task,
+        f"{TASK_FILE_MARKER}/tmp/selfEvolutionTask/task_1_beijing.md\n"
+        "接口文档：GET http://localhost:8899/heritage?city=\n"
+        f"{TASK_FILE_END}\n",
+    )
+    decide(payload)
+
+    payload["llmResp"] = "CMD: cat task_1_beijing.md"
+    decide(payload)
+    command = sandbox_command(payload)
+
+    assert "cat /tmp/selfEvolutionTask/task_1_beijing.md" in command
+    # 已经在绝对路径里的那处不会被拼成 `//tmp/.../tmp/...`
+    assert command.count("/tmp/selfEvolutionTask/task_1_beijing.md") == 1
+
+
+def test_task_cache_skips_api_error_body():
+    """接口错误体不进答案缓存（否则后面领到同一份任务会直接交这个 0 分答案）"""
+    brain._remember_task_answers(
+        "[exitCode:0]\n[TASK]任务\n"
+        "[API] http://localhost:8899/docs => 74\n"
+        "[SOLUTION]task_1_beijing.md\n"
+        '{"status":"error","message":"Endpoint not found: /api/docs","code":404}\n'
+        "[/SOLUTION]\n"
+    )
+
+    assert brain._TASK_ANSWER_CACHE == {}
+
+
+def test_task_executor_rejects_api_error_body_in_take_data():
+    """沙盒执行器把 200 回的错误体挡在取数证据之外
+
+    错误体进了 `[API]` 就等于"取到了数"，会被打成 `[SOLUTION]` 交上去
+    （PK590244 的 R14 就是这么判负的），所以在 fetch 阶段就要认出来。
+    """
+    script = brain._task_executor("task_1_beijing.md")
+
+    assert "def is_error_body(body):" in script
+    assert "if is_error_body(body):" in script
+
+
+def test_task_executor_seeds_search_with_task_dir():
+    """任务文件路径已知时先搜它所在目录，不赌全盘 walk 的顺序
+
+    回归：PK590245 的沙盒输出是 `[SCAN] tasks=0`（walk 的目录预算在走到任务
+    目录之前就用光了），执行器一份任务文件都没认出来，答案区因此永远是空的。
+    """
+    script = brain._task_executor("/tmp/selfEvolutionTask/task_1_beijing.md")
+
+    assert "SEED_DIRS = (" in script
+    assert "os.path.isabs(TASK_PATH)" in script
+    assert "find_files(DOC_NAMES, 6, SEED_DIRS)" in script
+
+
 # === issue #45：V4 日计划（布局 / 目标队列 / 夜战救急） ===
 
 

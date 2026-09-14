@@ -464,8 +464,33 @@ class LlmPlan:
 
 LLM_PLAN_DEFAULT = LlmPlan()
 
-# 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
-TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
+# 沙盒输出中的错误特征：命中说明这条沙盒命令没跑成（文件没找到、命令不存在、
+# 接口回的是错误体），它的输出一个字都不能当作答案提交。旧实现只挡
+# "No such file" 三条，最近两场复盘里两次 0 分提交都是从缝里漏过去的：
+#   - PK590245 的 R14：沙盒里没有 jq，"/bin/bash: jq: command not found..." 被
+#     原样 submitAnswer，Judge 判负；
+#   - PK590244 的 R14：接口回的是
+#     {"status":"error","message":"Endpoint not found: /api/docs","code":404}，
+#     也被当成答案交了上去。
+TASK_ERROR_MARKERS = (
+    "No such file",                        # cat/find 找不到文件
+    "Permission denied",                   # 读不到的目录
+    "Is a directory",                      # 把目录当文件读
+    "command not found",                   # bash：命令不在沙盒里（jq 等）
+    "not found",                           # dash 的写法：`sh: 1: jq: not found`
+    "Failed writing body",                 # curl 的下游管道断了
+    "Endpoint not found",                  # 接口 404 的响应体
+    "Traceback (most recent call last)",   # 取数脚本自己炸了
+    "Connection refused",
+    "Could not resolve host",
+    "Operation timed out",
+)
+# 上面那串挡不住的结构化错误体：接口用 200 回一个错误 JSON 时没有关键字可认，
+# 只能按字段形态判（`code` 是 4xx/5xx 或 `status` 明写 error）。
+TASK_ERROR_PATTERNS = (
+    re.compile(r'"status"\s*:\s*"error"', re.IGNORECASE),
+    re.compile(r'"code"\s*:\s*"?[45][0-9][0-9]'),
+)
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -2959,6 +2984,80 @@ def _nearest_task_position(turn: Turn, origin: Pos) -> Pos | None:
 # === 自进化任务（沙盒） ===
 
 
+def _task_failed(text: str) -> bool:
+    """这段沙盒输出/答案是不是"命令没跑成"的产物
+
+    命中错误特征（命令不存在、文件读不到、接口回错误体）的内容既不是数据、
+    更不是答案，一次都不能提交：提交错误答案既拿不到任务分，又白白烧掉任务
+    冷却（见 `TASK_ERROR_MARKERS` / `TASK_ERROR_PATTERNS`）。
+    """
+    if any(bad in text for bad in TASK_ERROR_MARKERS):
+        return True
+    return any(pattern.search(text) for pattern in TASK_ERROR_PATTERNS)
+
+
+def _task_path_seen(result: str, name: str | None = None) -> str | None:
+    """沙盒输出里出现过的绝对路径（可选：只认文件名与 `name` 相同的那一个）
+
+    回读段与探测段打印的都是 `find /` 的原样输出（绝对路径），这里只从中挑
+    绝对路径，免得把任务描述里那个裸文件名当成本地路径用。
+
+    参数:
+        result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
+        name: 期望的文件名或路径；为 None 时取第一个绝对路径
+
+    返回:
+        匹配的绝对路径；没有时返回 None
+    """
+    wanted = os.path.basename((name or "").replace("\\", "/"))
+    for match in TASK_FILE_PATTERN.findall(result or ""):
+        path = match.strip()
+        if not path.startswith("/"):
+            continue
+        if wanted and os.path.basename(path.replace("\\", "/")) != wanted:
+            continue
+        return path
+    return None
+
+
+def _task_path(turn: Turn) -> str | None:
+    """当前任务该读哪个文件（优先用沙盒里见过的绝对路径）
+
+    任务描述里点名的是 `task_1_beijing.md` 这样的裸文件名，而沙盒的工作目录
+    并不固定：PK590245 的 R16/R18 就是拿相对路径去 cat，回回都是
+    "No such file or directory"，两个回合白丢。上一回合的回读段（`[TASK_FILE]`
+    分段）与探测段里带着沙盒里的真实绝对路径，认出来就直接用它，执行器也就
+    不必再依赖"全盘 walk 恰好走到任务目录"（沙盒输出里 `[SCAN] tasks=0` 正是
+    walk 的目录预算没走到任务目录的结果）。
+
+    描述里连文件名都没给时退回原路径：从沙盒输出里认一个绝对路径出来。
+    """
+    named = _task_file(turn.phase_task)
+    seen = _task_path_seen(turn.last_cmd_result, named)
+    if seen is not None:
+        return seen
+    if named is not None:
+        return named
+    return _task_file(turn.last_cmd_result)
+
+
+def _absolute_paths(command: str, task_path: str | None) -> str:
+    """把命令里以相对路径出现的任务文件名换成沙盒里的绝对路径
+
+    LLM 看得到沙盒回读段里的绝对路径，但复述命令时常常只写裸文件名；沙盒的
+    工作目录又不固定（PK590245 的 R16/R18 就是这个形态）。只替换"独立成词"
+    的那处（前面的 `(?<![\\w./-])` 保证 `/tmp/x/task_1_beijing.md` 里的不会被
+    二次拼接，后面的 `(?![\\w.-])` 保证 `task_1_beijing.md.bak` 不会被误伤）。
+    """
+    if not command or not task_path or not task_path.startswith("/"):
+        return command
+    name = os.path.basename(task_path)
+    if not name:
+        return command
+    pattern = re.compile(r"(?<![\w./-])" + re.escape(name) + r"(?![\w.-])")
+    return pattern.sub(task_path, command)
+
+
 def _task_output(turn: Turn) -> str:
     """上一回合沙盒输出里属于当前任务的那一份（没有时为空串）
 
@@ -3087,6 +3186,9 @@ def _task_prompt(turn: Turn, payload: dict[str, Any]) -> str:
         "",
         "约束：沙盒无法访问外网，本地接口在 http://localhost:8899；",
         "一条命令限时 15 秒，一回合只能发一条命令，命令的 stdout 会原样回到我这里。",
+        "沙盒里只有基础 shell（bash/dash）和 python3，没有 jq 这类额外工具；",
+        "文件路径一律写绝对路径（相对路径会因工作目录漂移而 No such file）；",
+        "命令报错的输出不会被当成答案，别把报错原文当答案回给我。",
         "请只回一行，二选一：",
         "CMD: <一条能在沙盒里直接跑出答案的 shell 命令，只输出答案本身>",
         "ANSWER: <你已经能确定答案时，直接给答案>",
@@ -3119,14 +3221,21 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
                 return
 
 
-def _llm_task_command(turn: Turn) -> str:
+def _llm_task_command(turn: Turn, task_path: str | None = None) -> str:
     """把 LLM 给的取数命令包成一条沙盒命令（带任务标识，供下一回合取答案）
 
     包装方式和执行器一致：`[TASK]<标识>` 与 `[TASK_END]` 之间是答案区，
     末尾的 `:` 保证退出码为 0。
+
+    命令下发前过一道 `_absolute_paths`：LLM 常常照着任务描述写裸文件名，
+    而沙盒的工作目录并不固定（PK590245 的 R16/R18 就是 `cat task_1_beijing.md`
+    报 No such file，白丢两个回合）。沙盒里已经见过这个文件的绝对路径时
+    （`task_path`），把命令里的裸文件名换成它。
     """
     state = _task_llm_state(turn)
-    command = str(state.get("pending_cmd") or "")
+    command = _absolute_paths(
+        str(state.get("pending_cmd") or ""), task_path,
+    )
     if not command:
         return ""
     state["pending_cmd"] = ""
@@ -3147,11 +3256,19 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
+    if _task_failed(answer):
+        return None  # LLM 把沙盒报错抄成了答案（PK590245 的 R14 就是这个形态）
     return answer
 
 
 def _llm_command_answer(turn: Turn, region: str) -> str | None:
-    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）"""
+    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）
+
+    命令在沙盒里跑挂时的输出（`jq: command not found`、
+    `{"status":"error",...,"code":404}` 之类）不是答案：PK590245 的 R14 与
+    PK590244 的 R14 两次 0 分提交交的都是这种报错原文，所以这里用
+    `_task_failed` 整段挡掉，宁可这一回合不交卷，等下一条输出。
+    """
     if not turn.phase_task:
         return None
     state = _task_llm_state(turn)
@@ -3161,7 +3278,7 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
     answer = region.strip()
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
-    if any(bad in answer for bad in TASK_ERROR_MARKERS):
+    if _task_failed(answer):
         return None
     if _task_echo(answer, turn.phase_task):
         return None
@@ -3186,6 +3303,10 @@ def _sandbox_command(turn: Turn) -> str:
     `_sandbox_probe` 探一次沙盒，下一回合从探测结果里认出文件名再走上面的
     读文件流程。
 
+    任务文件一律用 `_task_path` 给的路径：沙盒上一回合的回读段/探测段里带
+    真实绝对路径时就照它读，不再拿任务描述里的裸文件名去赌工作目录
+    （PK590245 的 R16/R18 就是相对路径 cat 失败，白丢两个回合）。
+
     答案区之后依次是工作目录诊断与任务文件回读（`[TASK_FILE]` 分段，供
     `_task_file` 认出沙盒里的真实文件名、给执行器圈定候选任务文件）。
     这两段都排在 `TASK_END_MARKER` 之后，永远不会被当成答案。
@@ -3201,13 +3322,15 @@ def _sandbox_command(turn: Turn) -> str:
     ):
         return ""
 
+    # 沙盒里已经见过这个任务的绝对路径就照它读（没见过的才是描述里的裸名字）
+    target = _task_path(turn)
+
     # LLM 给了取数命令就优先跑它：一回合只能发一条命令，它比"继续猜地址"更准
-    llm_command = _llm_task_command(turn)
+    llm_command = _llm_task_command(turn, target)
     if llm_command:
         return llm_command
 
-    # 描述里没给文件名时，用上一回合的探测结果找；还没探过就先探一次
-    target = _task_file(turn.phase_task) or _task_file(turn.last_cmd_result)
+    # 描述里没给文件名、探测结果里也还没认出文件名时，先探一次沙盒
     if target is None:
         return _sandbox_probe(turn)
 
@@ -3294,6 +3417,12 @@ DATA = __DATA__
 FAIL = __FAIL__
 SCAN = __SCAN__
 SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
+# 任务文件的绝对路径已知时，先搜它所在的目录再全盘搜（见 find_files）
+SEED_DIRS = (
+    (os.path.dirname(TASK_PATH),)
+    if TASK_PATH and os.path.isabs(TASK_PATH)
+    else ()
+)
 
 
 def read(path):
@@ -3314,36 +3443,70 @@ def fetch(url):
     try:
         request = urllib.request.Request(url, headers={"Accept": "*/*"})
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            return response.read().decode("utf-8", "replace").strip()[:BODY_LIMIT]
+            raw = response.read()
     except Exception as exc:
         print(FAIL, url, type(exc).__name__)
         return ""
+    body = raw.decode("utf-8", "replace").strip()[:BODY_LIMIT]
+    if is_error_body(body):
+        print(FAIL, url, "error-body")
+        return ""
+    return body
 
 
-def find_files(patterns, limit):
+def is_error_body(body):
+    """接口用 200 回一个错误体时，它同样是"没取到数"
+
+    PK590244 的 R14 交上去的就是这一条：
+    {"status":"error","message":"Endpoint not found: /api/docs","code":404}——
+    响应码是 200，所以 `fetch` 原样返回，它既进了 `[API]` 取数证据、又被当成
+    答案 submitAnswer，任务直接判负。这里按字段形态把它挡在取数证据之外，
+    宁可这一回合不交卷。
+    """
+    text = body or ""
+    low = text.lower()
+    if "endpoint not found" in low:
+        return True
+    if "error" in low and ("status" in low or "code" in low):
+        return True
+    return bool(re.search(r'"code"\\s*:\\s*"?[45][0-9][0-9]', text))
+
+
+def find_files(patterns, limit, roots=()):
     """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
 
     全盘 walk 是这里最慢的一步，所以两个上限都要兜住：找到够数就停，
     进的目录太多也停（沙盒命令整体限时 15 秒，宁可少找几个也不能超时）。
+
+    `roots` 是排在 `/` 前面先搜的目录（任务文件所在目录，由调用方从它
+    认识的绝对路径里取）。`os.walk("/")` 的目录预算 DIR_BUDGET 常常在走到
+    任务目录之前就用光了——PK590245 的沙盒输出是 `[SCAN] tasks=0`，一份任务
+    文件都没认出来，答案区因此永远是空的。先在有把握的目录里找一遍，
+    就不必赌 walk 的顺序。
     """
     found = []
     seen = set()
     visited = 0
-    for root, dirs, files in os.walk("/"):
-        visited += 1
-        if visited > DIR_BUDGET:
-            break
-        dirs[:] = [d for d in dirs if os.path.join(root, d) not in PRUNE]
-        for name in files:
-            path = os.path.join(root, name)
-            if path in seen:
-                continue
-            if not any(re.search(pattern, name, re.I) for pattern in patterns):
-                continue
-            seen.add(path)
-            found.append(path)
-            if len(found) >= limit:
+    bases = []
+    for base in list(roots) + ["/"]:
+        if base and base not in bases and os.path.isdir(base):
+            bases.append(base)
+    for base in bases:
+        for root, dirs, files in os.walk(base):
+            visited += 1
+            if visited > DIR_BUDGET:
                 return found
+            dirs[:] = [d for d in dirs if os.path.join(root, d) not in PRUNE]
+            for name in files:
+                path = os.path.join(root, name)
+                if path in seen:
+                    continue
+                if not any(re.search(pattern, name, re.I) for pattern in patterns):
+                    continue
+                seen.add(path)
+                found.append(path)
+                if len(found) >= limit:
+                    return found
     return found
 
 
@@ -3352,7 +3515,9 @@ def task_files():
     wanted = os.path.basename(TASK_PATH) if TASK_PATH else ""
     named = []
     others = []
-    for path in find_files((r"^(task|spec).*\\.(md|txt|json)$",), 24):
+    for path in find_files(
+        (r"^(task|spec).*\\.(md|txt|json)$",), 24, SEED_DIRS,
+    ):
         if wanted and os.path.basename(path) == wanted:
             named.append(path)
         else:
@@ -3420,7 +3585,7 @@ def candidates(text, name, urls):
 
 
 files = task_files()
-doc_files = find_files(DOC_NAMES, 6)
+doc_files = find_files(DOC_NAMES, 6, SEED_DIRS)
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
 print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
@@ -3566,8 +3731,11 @@ def _task_answer(turn: Turn) -> str | None:
         1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
            执行器取不到数据时答案区是空的，这一回合就不提交；
         2. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
-    命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
-    又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
+    命中错误特征的答案（命令不存在、文件不存在、接口回错误体）同样不能提交：
+    错误答案既拿不到分，又白白消耗任务冷却，所以宁可这一回合不提交，等下一
+    条沙盒输出。错误特征只查取出来的那一段答案，不查整个答案区——执行器会
+    连着试好几个地址，其中一个取数失败（`[APIFAIL]`）不该把另一个成功的
+    结果一起废掉。
     """
     if not turn.phase_task:
         return None
@@ -3591,13 +3759,13 @@ def _task_answer(turn: Turn) -> str | None:
 
     if TASK_DATA_MARKER not in region:
         return None  # 没取到数据：沙盒里只有任务原文，不能当答案交上去
-    if any(bad in region for bad in TASK_ERROR_MARKERS):
-        return None
 
     answer = _solution_answer(region, turn)
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
         return None
     if _task_echo(answer, turn.phase_task):
+        return None
+    if _task_failed(answer):
         return None
     return answer
 
@@ -3655,6 +3823,11 @@ def _remember_task_answers(result: str) -> None:
     把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
     ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
 
+    命中错误特征的答案同样不进缓存：接口用 200 回一个错误体时它既有 `[API]`
+    证据、又会被打成 `[SOLUTION]` 段（PK590244 的 R14 交上去的
+    `{"status":"error",...,"code":404}` 就是这个形态），缓存下来等于把这个
+    0 分答案背给后面领到同一份任务的任务点。
+
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
     """
@@ -3664,7 +3837,12 @@ def _remember_task_answers(result: str) -> None:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and TASK_DATA_MARKER in evidence:
+        if (
+            name
+            and answer
+            and TASK_DATA_MARKER in evidence
+            and not _task_failed(answer)
+        ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
 
