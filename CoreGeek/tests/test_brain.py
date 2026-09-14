@@ -9,6 +9,10 @@ import pytest
 
 import agent.brain as brain
 from agent.brain import (
+    DAY_PLAN_LIMIT,
+    ECONOMY_MINE_ORDER,
+    FIXER_STOCK,
+    FIXER_STOCK_FIRST,
     GOLD_FLUSH_TOWERS,
     LLM_MAX_WALLS,
     LLM_MIN_TOWERS,
@@ -16,10 +20,17 @@ from agent.brain import (
     LLM_PLAN_TEMPLATE,
     LLM_PROMPT_PER_DAY,
     LOW_GOLD_THRESHOLD,
+    MEDICINE,
+    MEDICINE_HP,
+    MEDICINE_HP_NIGHT,
     MINERAL_SELL_THRESHOLD,
+    PIONEER_WEAPON_VOUCHERS,
+    QUEUE_TARGETS,
     SELL_BATCH,
     STATION_UPGRADE_VOUCHER,
     STONE_BATCH,
+    STONE_PLAN_MAX,
+    STONE_RESERVE_MIN,
     TASK_DATA_MARKER,
     TASK_END_MARKER,
     TASK_FILE_END,
@@ -33,28 +44,39 @@ from agent.brain import (
     TASK_TIMEOUT,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
+    WALL_BUILD_ROUNDS,
     WALL_FIRST_ROUND,
     WALL_FIXER,
+    WALL_FIXER_GOLD,
     WALL_STONE_COST,
     WALL_UPGRADE_GOLD,
     WALL_UPGRADE_VOUCHER,
     WEAPON_UPGRADE_VOUCHER,
     WEAPON_UPGRADE_VOUCHER2,
     LlmPlan,
+    _base_layout,
     _calc_tower_sites,
     _calc_wall_order,
     _closest_step,
+    _day_plan,
     _generate_strategy_prompt,
     _gold_left,
     _llm_plan,
+    _mine_order,
     _pair_controllers_and_weapons,
+    _plan_extras,
     _plan_summary,
+    _repair_plan,
     _reserved_build_sites,
     _step_toward,
+    _stone_demand,
     _task_token,
     _tower_site_brief,
     _tower_sites_reachable,
     _valid_stand_cells,
+    _wall_holes,
+    _wall_ring,
+    _work_queue,
     decide,
     sandbox_command,
 )
@@ -69,6 +91,7 @@ from agent.protocol import (
     PIONEER,
     RAILGUN,
     ROCKET,
+    ROUNDS_PER_DAY,
     STONE_MINE,
     VENDOR,
     WALL,
@@ -188,7 +211,7 @@ def test_wall_order_shape(payload_factory):
     # 6(上) + 4(左) + 6(下) + 4(右) - 1(入口) = 19
     assert len(order) == 19
     assert len(set(order)) == 19
-    assert Pos(13, 22) not in order  # 入口
+    assert Pos(13, 24) not in order  # 入口开在威胁最小一侧的中间格（V4）
     for pos in order:
         assert _footprint_distance(pos, footprint) == 2
         assert turn.land(pos)
@@ -472,6 +495,7 @@ def test_walk_to_tower_skips_other_build_sites(payload_factory, role_factory):
     assert all(pos not in _reserved_build_sites(turn) for pos in stands)
     assert Pos(13, 23) in _calc_wall_order(turn)  # 右侧围墙的建造位
     assert Pos(13, 23) not in stands
+    assert Pos(13, 24) in stands  # 唯一可落脚的那格仍然可用
 
     # 建造点之外一处也站不下时退回旧行为：允许站在建造点上，
     # 否则角色会因为"相邻格全是建造位"而永远建不起来
@@ -482,13 +506,14 @@ def test_walk_to_tower_skips_other_build_sites(payload_factory, role_factory):
             role_factory(40001, WALL, 11, 22),
             role_factory(40002, WALL, 12, 22),
             role_factory(40003, WALL, 12, 24),
-            role_factory(40004, WALL, 13, 22),  # 围墙圈的入口，也不是建造点
+            role_factory(40004, WALL, 13, 22),
+            # V4 的入口在 (13,24)：把它也堵上，非建造点的落脚位就一个不剩
+            role_factory(40005, WALL, 13, 24),
         ],
     )
     turn = Turn.load(crowded)
-    assert _valid_stand_cells(turn, turn.workers()[0], tower, set()) == [
-        Pos(13, 23), Pos(13, 24),
-    ]
+    stands = _valid_stand_cells(turn, turn.workers()[0], tower, set())
+    assert stands == [Pos(13, 23)]  # 退回旧行为：允许站在建造点上
 
 
 def test_second_worker_skips_build_when_gold_runs_out(
@@ -601,17 +626,26 @@ def test_trade_moves_toward_vendor_when_far(payload_factory, role_factory):
 
 
 def test_trade_keeps_stone_when_backpack_not_full(payload_factory, role_factory):
-    """金币还够一座塔时，石头不足一批就先留着（攒批卖价更省回合）"""
+    """防线与塔都齐了时，零散石材也卖掉（攒批没有意义）
+
+    V4/S2：围墙配额铺满、武器塔也建满之后，背包里的石材再攒批只是让金币继续
+    躺着（复盘里 stone 从 1 块堆到 3 块、金币从 R6 起恒 0 到 R17）。
+    手里还有建造需求时才有攒批的意义（见 `_build_backlog`）。
+    """
     payload = _payload_with_full_defense(
         payload_factory, role_factory,
-        gold=LOW_GOLD_THRESHOLD,  # 还没见底：不为了几块矿石专门跑一趟小贩
+        gold=LOW_GOLD_THRESHOLD,
         worker_pos=Pos(20, 17),
         backpack=[WALL_MATERIAL] * (SELL_BATCH - 1),
         zones=[(VENDOR, 20, 16)],
     )
     commands, _ = decide(payload)
 
-    assert "10010" not in commands
+    assert commands["10010"] == {
+        "action": "sell",
+        "name": WALL_MATERIAL,
+        "num": SELL_BATCH - 1,
+    }
 
 
 def test_trade_sells_ore_as_soon_as_gold_runs_out(
@@ -3020,7 +3054,7 @@ def test_income_ore_sells_without_waiting_for_batch(payload_factory, role_factor
 
 
 def test_stone_still_waits_for_a_batch(payload_factory, role_factory):
-    """石材照旧攒够一批再卖（铁/铜的即时变现不影响围墙材料）"""
+    """防线与塔都齐了时零散石材也卖（与上一个用例同一语义，保留两处入口）"""
     payload = _payload_with_full_defense(
         payload_factory, role_factory,
         gold=LOW_GOLD_THRESHOLD,
@@ -3030,7 +3064,8 @@ def test_stone_still_waits_for_a_batch(payload_factory, role_factory):
     )
     commands, _ = decide(payload)
 
-    assert "10010" not in commands
+    assert commands["10010"]["action"] == "sell"
+    assert commands["10010"]["name"] == WALL_MATERIAL
 
 
 def test_defender_starts_first_wall_before_towers(payload_factory, role_factory):
@@ -3246,3 +3281,439 @@ def test_task_answer_ignores_task_echo_from_llm(payload_factory, role_factory):
     commands, _ = decide(payload)
 
     assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+# === issue #45：V4 日计划（布局 / 目标队列 / 夜战救急） ===
+
+
+def test_wall_holes_counts_missing_ring(payload_factory, role_factory):
+    """C：破洞数 = 规划里的墙 - 已经建好的墙（别处多砌的不抵消正面破洞）
+
+    V4 的第一步是"计算破洞的数量 C"，这里按坐标逐格比对：圈外顺手多砌的
+    墙不算数，正面缺的每一段都算破洞。
+    """
+    order = _calc_wall_order(Turn.load(payload_factory()))
+
+    # 一段墙都没砌：破洞就是整圈
+    assert _wall_holes(Turn.load(payload_factory())) == order
+
+    payload = payload_factory(
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(40001, WALL, order[0].x, order[0].y),
+            role_factory(40002, WALL, 35, 30),  # 圈外的另一段墙
+        ],
+    )
+    holes = _wall_holes(Turn.load(payload))
+
+    assert order[0] not in holes
+    assert len(holes) == len(order) - 1
+
+
+def test_stone_demand_follows_v4_formula(payload_factory, role_factory):
+    """AR：ceil((C + Rmin - BR) / 10)，上限 2（V4 的三个例子逐条复现）
+
+    第一天 C=18 -> AR=2、第二天 8 个破洞 + 2 块石材 -> AR=2、
+    第二天 7 个破洞 + 2 块石材 -> AR=1。
+    """
+    ring = len(_calc_wall_order(Turn.load(payload_factory())))
+
+    def demand(stones: int, walls: int) -> int:
+        """砌好 walls 段围墙、背包里有 stones 块石材时的 AR"""
+        order = _calc_wall_order(Turn.load(payload_factory()))
+        roles = [
+            role_factory(
+                10010, WORKER, 5, 23, backPackCapability=100,
+                backpack=[WALL_MATERIAL] * stones,
+            ),
+        ]
+        roles += [
+            role_factory(40000 + index, WALL, pos.x, pos.y)
+            for index, pos in enumerate(order[:walls])
+        ]
+        turn = Turn.load(payload_factory(roles=roles))
+        return _stone_demand(turn, _wall_holes(turn))
+
+    # (19+5-0)/10 = 2.4 -> 向上取整 3 -> 上限 2
+    assert demand(0, 0) == STONE_PLAN_MAX
+    # (8+5-2)/10 = 1.1 -> 2
+    assert demand(2, ring - 8) == 2
+    # (7+5-2)/10 = 1.0 -> 1
+    assert demand(2, ring - 7) == 1
+    # 破洞补完、保底石材也留够了：今天不挖石矿
+    assert demand(STONE_RESERVE_MIN, ring) == 0
+
+
+def test_work_queue_replaces_head_with_stone(payload_factory):
+    """目标队列：默认 5 个铜矿，AR 个石矿从队首替换进来（V4）"""
+    turn = Turn.load(payload_factory())
+
+    assert _work_queue(turn, 0) == (COPPER_MINE,) * QUEUE_TARGETS
+    assert _work_queue(turn, 1) == (
+        STONE_MINE,
+    ) + (COPPER_MINE,) * (QUEUE_TARGETS - 1)
+    assert _work_queue(turn, STONE_PLAN_MAX) == (
+        (STONE_MINE,) * STONE_PLAN_MAX
+        + (COPPER_MINE,) * (QUEUE_TARGETS - STONE_PLAN_MAX)
+    )
+
+
+def test_base_layout_follows_enemy_side(payload_factory, role_factory):
+    """布局按来敌方位定向：敌人从左边来时正面/后排整体转到左右两列
+
+    V4 的布局是"基地在右下角"的写法，正面由 `_wall_side_order` 现算，
+    所以基地换到别处（或敌人从另一侧来）时同一套坐标自动反转。
+    """
+    default = _base_layout(Turn.load(payload_factory()))
+    assert default is not None
+    # 看不到敌人时正面是 up（前面没有敌人时的默认顺序），背面是 down
+    assert (default.front, default.back) == ("up", "down")
+    assert default.corners == (Pos(9, 25), Pos(12, 25), Pos(9, 22), Pos(11, 22))
+
+    left = _base_layout(Turn.load(payload_factory(
+        enemies=[role_factory(20010, WORKER, 3, 24)],  # 敌方单位在基地正左方
+    )))
+    assert left is not None
+    assert (left.front, left.back) == ("left", "right")
+    assert left.corners == (Pos(9, 25), Pos(9, 22), Pos(12, 25), Pos(12, 23))
+
+    assert _base_layout(Turn.load(payload_factory(station=None))) is None
+
+
+def test_layout_stand_covers_five_ring_walls(payload_factory):
+    """墙角站位：3×3 修复范围正好盖住 5 段外墙（V4 的"一次修复 5 个墙"）"""
+    turn = Turn.load(payload_factory())
+    layout = _base_layout(turn)
+    assert layout is not None
+    ring = {pos for cells in _wall_ring(turn).values() for pos in cells}
+
+    for stand in layout.corners[:3]:
+        assert stand is not None
+        covered = {
+            pos for pos in ring if distance(stand, pos) <= brain.WALL_FIXER_RADIUS
+        }
+        assert len(covered) == 5
+
+
+def test_repair_plan_ends_at_r2_stand(payload_factory, role_factory):
+    """修墙路径（PT）以 R2 站位为终点（PLE），没有破洞时 PT=0（V4）"""
+    turn = Turn.load(payload_factory(
+        roles=[role_factory(10010, WORKER, 5, 23, backPackCapability=100)],
+    ))
+    worker = turn.workers()[0]
+    layout = _base_layout(turn)
+    assert layout is not None
+    r2 = layout.corners[1]
+
+    holes = _wall_holes(turn)
+    rounds, end = _repair_plan(turn, worker, holes)
+    assert end == r2
+    assert rounds >= len(holes) * WALL_BUILD_ROUNDS
+
+    assert _repair_plan(turn, worker, ()) == (0, r2)
+
+
+def test_day_plan_builds_queue_and_tall(payload_factory, role_factory):
+    """当天的计划：破洞 -> AR -> 队列 -> 修墙路径 -> Tall（V4 的规划链）"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10010, WORKER, 5, 23, backPackCapability=100)],
+        zones=[(STONE_MINE, 4, 24), (COPPER_MINE, 30, 5)],
+    )
+    turn = Turn.load(payload)
+    worker = turn.workers()[0]
+    day = _day_plan(turn, worker)
+    layout = _base_layout(turn)
+    assert layout is not None
+
+    assert day.holes == _wall_holes(turn)
+    assert day.stone_mines == STONE_PLAN_MAX  # 整圈破洞 -> 上限 2
+    # 队列由石矿打头（V4：石料是防线材料），并按当天的回合预算裁剪成
+    # "一天真跑得完"的长度（Dnum 循环），至少留一件事做
+    assert day.queue[:1] == (STONE_MINE,)
+    assert 0 < day.queue.count(STONE_MINE) <= STONE_PLAN_MAX
+    assert day.end_point == layout.corners[1]  # PLE = R2 站位
+    assert day.repair_rounds > 0 and day.route_rounds > 0
+    assert day.total_rounds == day.repair_rounds + day.route_rounds
+
+
+def test_plan_extras_follow_v4_priority(payload_factory, role_factory):
+    """额外目标优先级：小贩 > 生命药剂 > 武器商店 > 铁矿 > 石头（V4）"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[
+            role_factory(
+                10010, WORKER, 5, 23, backPackCapability=100, health=MEDICINE_HP - 20,
+            ),
+        ],
+        zones=[(STONE_MINE, 4, 24)],
+    )
+    turn = Turn.load(payload)
+    worker = turn.workers()[0]
+    queue = _work_queue(turn, 1)
+
+    # 队列里有铜矿 + 血量偏低：小贩与药剂都在，第 1 天不补修复包
+    assert _plan_extras(turn, worker, queue, 0) == (
+        VENDOR, MEDICINE, IRON_MINE, STONE_MINE,
+    )
+    # Tall 贴到白天的回合数上限：一个额外目标都不加
+    assert _plan_extras(turn, worker, queue, DAY_PLAN_LIMIT) == ()
+
+    # 血量健康时不买药；第 3 天起才轮到武器商店
+    healthy = Turn.load(payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10010, WORKER, 5, 23, backPackCapability=100)],
+        zones=[(STONE_MINE, 4, 24)],
+    ))
+    assert MEDICINE not in _plan_extras(healthy, healthy.workers()[0], queue, 0)
+    assert WEAPON_SHOP not in _plan_extras(
+        healthy, healthy.workers()[0], queue, 0,
+    )
+
+
+def test_mine_order_follows_day_queue(payload_factory, role_factory):
+    """采集顺序按当天队列排：石工石矿打头，铜矿工人以铜矿为主矿（V4）"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(10012, WORKER, 20, 23, backPackCapability=100),
+        ],
+        zones=[(STONE_MINE, 4, 24), (COPPER_MINE, 20, 22), (IRON_MINE, 21, 22)],
+    )
+    turn = Turn.load(payload)
+    stone_worker, copper_worker = turn.workers()
+    day = _day_plan(turn, stone_worker)
+
+    # 破洞还没补完：队列里石矿打头，石工先采石
+    assert day.stone_mines >= 1
+    assert day.queue[0] == STONE_MINE
+    assert _mine_order(turn, stone_worker, plan=day)[0] == STONE_MINE
+    # 铜矿工人（第 2 名）以铜矿为主矿，铁作次选
+    assert _mine_order(turn, copper_worker, plan=day) == ECONOMY_MINE_ORDER
+
+
+def test_mine_order_switches_to_copper_when_walls_done(
+    payload_factory, role_factory,
+):
+    """破洞补完、保底石材也留够时队列只剩铜矿：石工也转去挖铜（V4）"""
+    order = _calc_wall_order(Turn.load(payload_factory()))
+    roles = [
+        role_factory(40000 + index, WALL, pos.x, pos.y)
+        for index, pos in enumerate(order)
+    ]
+    roles.append(
+        role_factory(
+            10010, WORKER, 5, 23, backPackCapability=100,
+            backpack=[WALL_MATERIAL] * STONE_RESERVE_MIN,
+        ),
+    )
+    turn = Turn.load(payload_factory(
+        gold=0, roles=roles,
+        zones=[(STONE_MINE, 4, 24), (COPPER_MINE, 20, 22)],
+    ))
+    worker = turn.workers()[0]
+    day = _day_plan(turn, worker)
+
+    assert day.stone_mines == 0
+    assert _mine_order(turn, worker, plan=day)[0] == COPPER_MINE
+
+
+def test_day_three_restocks_wall_fixer(payload_factory, role_factory):
+    """第 3 天顺路补围墙修复包：第一次只买 2 个（V4）"""
+    base = Turn.load(payload_factory())
+    roles = [
+        role_factory(10020 + index, kind, pos.x, pos.y, attackRange=4, level=3)
+        for index, (kind, pos) in enumerate(
+            zip(TOWER_LOADOUT, _calc_tower_sites(base))
+        )
+    ]
+    roles.append(
+        role_factory(10010, WORKER, 20, 17, backPackCapability=100),
+    )
+    payload = payload_factory(
+        round_no=ROUNDS_PER_DAY * 2 + 1,  # 第 3 天第 1 个回合
+        gold=100,
+        roles=roles,
+        zones=[(WEAPON_SHOP, 20, 16)],
+    )
+    payload["weaponShopList"] = [{"name": WALL_FIXER, "price": WALL_FIXER_GOLD}]
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "buy",
+        "name": WALL_FIXER,
+        "num": FIXER_STOCK_FIRST,
+    }
+
+
+def test_worker_breaks_through_weak_wall(payload_factory, role_factory):
+    """无路可走时拆开身边的残墙开路（V4：血量 < 50% 的一级墙算"已经破了"）"""
+    worker_pos = Pos(5, 23)
+    weak = Pos(4, 23)  # 挡在工人和石矿之间的那一格
+    stone = Pos(3, 23)
+    enclosure = [pos for pos in get_neighbors(worker_pos) if pos != weak]
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[
+            role_factory(
+                10010, WORKER, worker_pos.x, worker_pos.y, backPackCapability=100,
+            ),
+            *[
+                role_factory(40000 + index, WALL, pos.x, pos.y)
+                for index, pos in enumerate(enclosure)
+            ],
+            # 一级墙满血 1000，400 血已经低于一半 -> 视为"已经破了"
+            role_factory(49999, WALL, weak.x, weak.y, health=400),
+        ],
+        zones=[(STONE_MINE, stone.x, stone.y)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "remove",
+        "targetPos": [{"x": weak.x, "y": weak.y}],
+    }
+
+
+def test_night_drinks_medicine_when_hurt(payload_factory, role_factory):
+    """夜晚血量 <= 50 时喝一剂生命药剂（V4）"""
+    payload = payload_factory(
+        round_no=DAY_ROUNDS + 1,  # 第 1 天夜里
+        roles=[
+            role_factory(
+                10010, WORKER, 9, 23, backPackCapability=100,
+                health=MEDICINE_HP_NIGHT, backpack=[MEDICINE],
+            ),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {"action": "use", "name": MEDICINE}
+
+
+def test_night_uses_station_voucher_when_base_critical(
+    payload_factory, role_factory,
+):
+    """夜晚基地血量 < 150 时用基地升级券（V4：回满血 + 升级）"""
+    payload = payload_factory(
+        round_no=DAY_ROUNDS + 1,
+        roles=[
+            role_factory(
+                10010, WORKER, 9, 23, backPackCapability=100,
+                backpack=[STATION_UPGRADE_VOUCHER],
+            ),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+    )
+    for role in payload["teamOur"]["roles"]:
+        if role["roleType"] == "station":
+            role["health"] = 100
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "use",
+        "name": STATION_UPGRADE_VOUCHER,
+        "targetPos": [{"x": 10, "y": 24}],
+    }
+
+
+def test_night_fixer_repairs_wall_next_to_stand(payload_factory, role_factory):
+    """夜晚站在墙角的人用修复包补身边那一段残墙（V4 的角落站位）"""
+    layout = _base_layout(Turn.load(payload_factory()))
+    assert layout is not None
+    stand = layout.corners[0]  # R1：开拓者的站位
+    assert stand is not None
+    ring = _wall_ring(Turn.load(payload_factory()))
+    reachable = sorted(
+        (
+            pos for cells in ring.values() for pos in cells
+            if distance(stand, pos) <= brain.WALL_FIXER_RADIUS
+        ),
+        key=lambda pos: (pos.x, pos.y),
+    )
+    target = reachable[0]
+
+    payload = payload_factory(
+        round_no=DAY_ROUNDS + 1,
+        roles=[
+            role_factory(
+                10011, PIONEER, stand.x, stand.y, backPackCapability=40,
+                backpack=[WALL_FIXER],
+            ),
+            role_factory(10020, GATLING, stand.x, stand.y - 1, attackRange=4),
+            role_factory(49999, WALL, target.x, target.y, health=80),
+        ],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "use",
+        "name": WALL_FIXER,
+        "targetPos": [{"x": target.x, "y": target.y}],
+    }
+
+
+def test_pioneer_shops_by_priority(payload_factory, role_factory):
+    """开拓者收工后按优先级补货：先买 3 张武器升级券1（V4）"""
+    base = Turn.load(payload_factory())
+    roles = [
+        role_factory(10011, PIONEER, 20, 17, backPackCapability=40),
+        *[
+            role_factory(10020 + index, kind, pos.x, pos.y, attackRange=4)
+            for index, (kind, pos) in enumerate(
+                zip(TOWER_LOADOUT, _calc_tower_sites(base))
+            )
+        ],
+    ]
+    payload = payload_factory(
+        round_no=1,
+        gold=PIONEER_WEAPON_VOUCHERS * UPGRADE_GOLD + 50,
+        roles=roles,
+        zones=[(WEAPON_SHOP, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "buy",
+        "name": WEAPON_UPGRADE_VOUCHER,
+        "num": PIONEER_WEAPON_VOUCHERS,
+    }
+
+
+def test_pioneer_shopping_skips_expensive_items(
+    payload_factory, role_factory,
+):
+    """开拓者买不起武器/基地券时先补围墙修复包（V4 的优先级顺延）"""
+    base = Turn.load(payload_factory())
+    roles = [
+        role_factory(10011, PIONEER, 20, 17, backPackCapability=40),
+        *[
+            role_factory(
+                10020 + index, kind, pos.x, pos.y, attackRange=4, level=3,
+            )
+            for index, (kind, pos) in enumerate(
+                zip(TOWER_LOADOUT, _calc_tower_sites(base))
+            )
+        ],
+    ]
+    payload = payload_factory(
+        round_no=1,
+        gold=50,  # 不够一张基地升级券（100 金），够 3 张修复包（30 金）
+        roles=roles,
+        zones=[(WEAPON_SHOP, 20, 16)],
+    )
+    payload["weaponShopList"] = [{"name": WALL_FIXER, "price": WALL_FIXER_GOLD}]
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "buy",
+        "name": WALL_FIXER,
+        "num": FIXER_STOCK,
+    }

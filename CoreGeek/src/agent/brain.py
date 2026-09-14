@@ -77,6 +77,7 @@ from .protocol import (
     move_command,
     collect_command,
     build_command,
+    remove_command,
     attack_command,
     sell_command,
     buy_command,
@@ -198,12 +199,64 @@ WALL_UPGRADE_VOUCHERS = {
     1: (WALL_UPGRADE_VOUCHER, WALL_UPGRADE_GOLD),
     2: (WALL_UPGRADE_VOUCHER2, WALL_UPGRADE_GOLD2),
 }
+
+# === V4 日计划（基地布局 + 每日任务队列）===
+# 参照战术参考里对手的 V4 逻辑：每天开局先做一次规划（数破洞、算当天要挖几座
+# 石矿、生成目标队列、估一遍耗时），三个角色再照计划执行，而不是每回合各自
+# 就地贪心。这里落成"能算、能执行"的那部分，阈值都取自那份逻辑的原话。
+#
+# 基地布局（以基地 2x2 占地为锚点、按来敌方位定向，基地在左上/右下时自动
+# 反转）：外墙 = 基地外围第二圈（`_wall_ring`，即 6x6 可建造区的外框）；
+# 站位 = 墙内一圈的四个角 R1(前上)/R2(前下)/R3(后上)/K0(后下)。站在墙内圈
+# 的角上时，一个 3×3 修复包正好盖住 5 段外墙（角上 1 段 + 两条边各 2 段）
+# ——这就是那份逻辑里"一次修复 5 个墙"的由来；基地贴地图边时有一侧的墙在
+# 图外，只剩 4 段。R3 入夜前要先退到 K0：R3 正对敌方进场的方向，站在那儿
+# 会被进场的机器人先手。
+#
+# 炮位仍按 `_calc_tower_sites` 的"三面分散 + 可达性校验"选：V4 的"正面两座
+# + 背面一座"图的是炮火压住来路，而当前实现已经用 `_enemy_sides` 把第一座塔
+# 压在来路上，并用 BFS 保证每座塔都有人走得到（聊天记录里的"炮塔堵路"），
+# 再按那个布局重排等于把既有回归测试锁定的塔位推倒重来。
+STONE_PER_MINE = 10  # 一座矿采空要 10 个回合（任务书4.2：每个矿采集10次后消失，每次得1个）
+STONE_RESERVE_MIN = 5  # Rmin：背包里始终留 5 块石材的保底
+STONE_PLAN_MAX = 2  # AR 上限：一天最多规划 2 座石矿（第三座连来回的路都走不完）
+QUEUE_TARGETS = 5  # 目标队列长度（默认 5 个铜矿，按 AR 从头替换成石矿）
+WALL_BUILD_ROUNDS = 1  # 建一段围墙占 1 个回合（V4 修墙路径的时间口径）
+WEAK_WALL_RATIO = 0.5  # 一级墙血量低于一半就算"已经破了"：可拆穿走捷径（拆掉再补）
+DAY_PLAN_LIMIT = DAY_ROUNDS  # Tall 的上限：白天只有 70 个回合
+
+# 生命药剂（任务书4.6.3：使用者回满血，10 金）。白天血量偏低时备一剂，
+# 夜里血量掉到 50 以下立刻喝掉——这只救小人自己，不救墙也不救基地。
+MEDICINE = "Medicine"
+MEDICINE_GOLD = 10
+MEDICINE_HP = 80  # 白天：血量低于 80 时补一剂（V4 的额外目标）
+MEDICINE_HP_NIGHT = 50  # 夜晚：血量 <= 50 时喝（V4）
+STATION_CRITICAL_HP = 150  # 夜晚：基地血量 < 150 时用基地升级券（V4）
+CARRIER_LOW_HP = 40  # 夜晚：持券者自己血量 < 40 时也用一次（V4）
+FIXER_STOCK = 3  # 围墙修复包的常备量（V4：不足就补齐）
+FIXER_STOCK_FIRST = 2  # 第 3 天第一次补给只买 2 个（V4："天数=3则购买2个"）
+FIXER_RESTOCK_DAY = 3  # 开拓者从第 3 天起负责补给修复包（V4）
+FIXER_CARRIER_DAY = 4  # 铜矿工人从第 4 天起自带 3 个修复包（V4）
+FIXER_NIGHT_HP = 100  # 夜晚：正面的人（R1/R2）发现自己那片墙 < 100 血时补一次
+FIXER_NIGHT_HP_WEAK = 150  # 夜晚：后排的人（R3）负责的墙 < 150 血时补一次
+SELF_FIXER_HP = 30  # 自身血量 < 30 时也补一次（V4："如果自身血量<30，也使用一次"）
+PIONEER_WEAPON_VOUCHERS = 3  # 开拓者一次备 3 张武器升级券（三座塔各一张，V4）
+PIONEER_WALL_VOUCHERS = 10  # 开拓者一次备 10 张围墙升级券（V4）
+
 # 报文没给武器商店价格表时的商品兜底价（正式售价见任务书4.6.3）
 ITEM_FALLBACK_PRICE = {
     name: price
-    for vouchers in (WEAPON_UPGRADE_VOUCHERS, WALL_UPGRADE_VOUCHERS)
+    for vouchers in (
+        WEAPON_UPGRADE_VOUCHERS,
+        WALL_UPGRADE_VOUCHERS,
+        STATION_UPGRADE_VOUCHERS,  # 基地券漏在这里会让"金币不足"判断失效
+    )
     for name, price in vouchers.values()
 }
+# 消耗品不在券表里，兜底价单独补上：查不到价格时按 0 算会让"金币不足"的
+# 判断失效（0 金也敢下单，回合结算时才失败），先按任务书4.6.3 的售价兜底。
+ITEM_FALLBACK_PRICE[WALL_FIXER] = WALL_FIXER_GOLD
+ITEM_FALLBACK_PRICE[MEDICINE] = MEDICINE_GOLD
 # 金币闲置熔断线：手里攥着够再建两座塔的金币时，不允许再把塔数配额压到满编
 # 以下（复盘里"金币连续多回合冻结在 50，无塔无墙无升级"就是这么来的）。
 # 一座塔 25 金换 10 点火力和一段射程，比攒到 100 金升一级划算得多，
@@ -216,8 +269,10 @@ SELLABLE_MINES = (STONE_MINE, IRON_MINE, COPPER_MINE)
 # 铁/铜必须有一条独立于围墙的变现通道，否则防守方的金币会一直冻结
 # （三场复盘里 gold 从 R6/R8/R9 起一路为 0 直到 R17，背包里却一直躺着矿石）。
 INCOME_MINES = (IRON_MINE, COPPER_MINE)
-# 负责"矿石换金币"的工人的采集顺序：铁/铜是纯收入来源，石材只作兜底
-ECONOMY_MINE_ORDER = (IRON_MINE, COPPER_MINE, STONE_MINE)
+# 负责"矿石换金币"的工人（V4 里的铜矿工人）的采集顺序：铜是队列里的默认
+# 目标（V4："默认为5个铜矿"），铁作次选——铁矿在世界事件里会连着两天采不了，
+# 铜矿没有这个风险；石材只作兜底。
+ECONOMY_MINE_ORDER = (COPPER_MINE, IRON_MINE, STONE_MINE)
 
 # 任务点排序权重：报文缺少 timeoutRounds 时用最大值，不抢占"临期优先"
 TASK_TIMEOUT_UNKNOWN = 10 ** 9
@@ -697,6 +752,11 @@ def _worker_day_logic(
     # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"（防守方还有下限，见 `_wall_target`）
     wall_quota = len(turn.walls()) < _wall_target(turn, plan)
 
+    # 当天的任务规划（V4）：破洞数、今天要挖几座石矿、目标队列、Tall 富余时
+    # 顺路补的额外目标。计划每回合现算（模块本身不存跨回合状态），下面的
+    # 采集顺序与额外目标都从这里取。
+    day = _day_plan(turn, worker)
+
     # 防守方的开局防线（S3）：塔位优先的建造分支会把工人一直占在基地旁等金币，
     # 首段围墙因此要等到金币花光（R8~R10）才开工，甚至整局一段都没有。这里让
     # 分管经济的工人在开局窗口内跑完整的防线计划——按 `_calc_wall_order` 给出的
@@ -765,8 +825,12 @@ def _worker_day_logic(
         if _trade_logic(turn, worker, claimed, commands):
             return
         if not walls_missing:
+            # V4 额外目标：防线已经建完，正事只剩当天那份队列，顺路的事
+            # （补围墙修复包 / 补生命药剂 / 把矿石卖给小贩）排在同一层
+            if _plan_extra_action(turn, worker, day, claimed, commands):
+                return
             # 手里还没有可卖的矿石: 继续采集,攒够一批再换金币
-            _gather_logic(turn, worker, claimed, commands)
+            _gather_logic(turn, worker, claimed, commands, plan=day)
             return
 
     # 检查背包里的石头数量
@@ -785,7 +849,7 @@ def _worker_day_logic(
     # 如果旁边有矿且石头不足,采集
     # （负责矿石变现的工人跳过这一步：否则它会一直就地采石，
     #   永远轮不到铁/铜，矿种分工就落空了；但围墙配额没铺满时全员先采石）
-    if _mine_order(turn, worker, prefer_stone=wall_quota)[0] == STONE_MINE:
+    if _mine_order(turn, worker, prefer_stone=wall_quota, plan=day)[0] == STONE_MINE:
         mine = _adjacent_mine(turn, worker, STONE_MINE)
         if mine is not None and stones < _stone_reserve(turn, plan, wall_quota):
             commands[worker.unit_id] = collect_command(mine)
@@ -809,10 +873,25 @@ def _worker_day_logic(
     if _gold_critical(turn) and _trade_logic(turn, worker, claimed, commands):
         return
 
-    # 还是没着落: 就近采矿; 采不到就把背包里的矿石卖掉腾地方
-    if _gather_logic(turn, worker, claimed, commands, prefer_stone=wall_quota):
+    # V4 额外目标：正事（修墙、挖队列里的矿）都排不上时，按当天的优先级
+    # 顺路多做一件事（把矿卖给小贩 / 补生命药剂 / 补围墙修复包），
+    # 再做原来的兜底（矿种由 `_gather_logic` 按队列顺序顺延）
+    if _plan_extra_action(turn, worker, day, claimed, commands):
         return
-    _trade_logic(turn, worker, claimed, commands)
+
+    # 还是没着落: 就近采矿; 采不到就把背包里的矿石卖掉腾地方
+    if _gather_logic(
+        turn, worker, claimed, commands, prefer_stone=wall_quota, plan=day,
+    ):
+        return
+    if _trade_logic(turn, worker, claimed, commands):
+        return
+
+    # 最后一招（V4）：正事一件都办不成时，拆开挡在路上的残墙开路
+    # （一级墙血量低于一半就算"已经破了"，拆穿它走捷径，过去后再补回来）
+    _demolish_weak_wall(
+        turn, worker, _nearest_zone(turn, STONE_MINE, worker.pos), commands,
+    )
 
 
 def _gold_critical(turn: Turn) -> bool:
@@ -925,6 +1004,418 @@ def _early_wall(
     return _go_mine(turn, worker, STONE_MINE, claimed, commands)
 
 
+# === 每日任务规划（V4）===
+
+
+@dataclass(frozen=True, slots=True)
+class DayPlan:
+    """当天的任务规划（V4：每天算一次，三个角色照着执行）
+
+    字段:
+        holes: 还差的墙位（C，按建造顺序）
+        stone_mines: 今天要挖几座石矿（AR）
+        queue: 目标队列（AR 个石矿打头，其余是铜矿）
+        repair_rounds: 修墙路径的回合数（PT）
+        end_point: 修墙路径的终点（PLE，也是这一天干完活要回来的地方）
+        route_rounds: 走完队列再回 PLE 的估算回合数（LTmin）
+        total_rounds: Tall = PT + LTmin
+        extras: Tall 还有富余时按优先级补上的额外目标
+
+    这是每回合现算的纯函数结果（本模块不存跨回合状态），所以"今天的计划"
+    永远按当前局面重算：矿区刷新、围墙被打掉、小人夜里换了位置都会立刻反映
+    到队列与耗时估算上。
+    """
+
+    holes: tuple[Pos, ...]
+    stone_mines: int
+    queue: tuple[str, ...]
+    repair_rounds: int
+    end_point: Pos | None
+    route_rounds: int
+    total_rounds: int
+    extras: tuple[str, ...]
+
+
+def _wall_holes(turn: Turn) -> tuple[Pos, ...]:
+    """还差的墙位（C：应该存在的墙 - 当前已有的墙）
+
+    "应该存在"按 `_calc_wall_order` 的规划算（基地外围第二圈，入口那一格
+    不算破洞），"当前已有"按坐标逐格比对——别处顺手多砌的墙不会把正面的
+    破洞抵消掉，V4 的"算出破洞数量"要的就是正面还缺几段。
+    """
+    built = {wall.pos for wall in turn.walls()}
+    return tuple(pos for pos in _calc_wall_order(turn) if pos not in built)
+
+
+def _stone_demand(turn: Turn, holes: tuple[Pos, ...]) -> int:
+    """AR：今天要挖几座石矿（V4 的 ceil((C + Rmin - BR) / 10)，上限 2）
+
+    C 是破洞数（`_wall_holes`），Rmin 是背包里要留的保底石材
+    （`STONE_RESERVE_MIN`），BR 是手里的石材（两名工人的背包一起算：谁采的
+    都算数）。一座矿采空是 `STONE_PER_MINE` 个回合（任务书4.2：每个矿采集
+    10 次后消失，每次得 1 个），所以除以 10 得到的是"要挖几座矿"。
+    上限 2：白天只有 70 个回合，第三座矿连来回的路都走不完。
+    """
+    held = sum(worker.backpack.count(WALL_MATERIAL) for worker in turn.workers())
+    need = len(holes) + STONE_RESERVE_MIN - held
+    if need <= 0:
+        return 0
+    return min(STONE_PLAN_MAX, -(-need // STONE_PER_MINE))  # 向上取整
+
+
+def _work_queue(turn: Turn, stone_mines: int) -> tuple[str, ...]:
+    """目标队列：默认 5 个铜矿，按 AR 从头替换成石矿（V4）
+
+    石料是防线材料、铜是收入，所以石矿永远排在队首：手里没石材时先补破洞，
+    挖够了再换铜矿变现（V4 原话："默认为5个铜矿，按照AR的数量替换队列前的
+    元素"）。
+    """
+    stone_part = (STONE_MINE,) * min(stone_mines, QUEUE_TARGETS)
+    return stone_part + (COPPER_MINE,) * (QUEUE_TARGETS - len(stone_part))
+
+
+def _queue_order(turn: Turn, plan: DayPlan | None = None) -> tuple[str, ...]:
+    """把目标队列摊成这一回合的矿种顺序（队列打头，其余矿种照旧兜底）
+
+    队列里没有的矿种仍然排在后头：地图上只剩铁矿时石工照样采铁（空转比
+    采错矿更糟），只是优先级排在队列之后。调用方已经算过当天的计划时把
+    `plan` 传进来，省得把破洞数与队列再算一遍。
+
+    参数:
+        turn: 当前回合信息
+        plan: 当天的计划（None 时现算一份）
+
+    返回:
+        按优先级排序的矿种元组
+    """
+    queue = plan.queue if plan is not None else _work_queue(
+        turn, _stone_demand(turn, _wall_holes(turn)),
+    )
+    return tuple(dict.fromkeys(queue + SELLABLE_MINES))
+
+
+def _queue_targets(
+    turn: Turn,
+    queue: tuple[str, ...],
+    origin: Pos,
+) -> tuple[Pos, ...]:
+    """队列里每个目标对应的矿点坐标（依次就近取，同类型可落到不同的矿点）
+
+    一条队列里可能有 5 个铜矿、地图上却只有 2 座：取过的矿点不重复用，
+    取不满就少算几个目标（V4 的口径也是"剔掉走不到的路径"）。
+    """
+    targets: list[Pos] = []
+    used: set[Pos] = set()
+    here = origin
+    for mine_type in queue:
+        mines = [pos for pos in turn.get_mines(mine_type) if pos not in used]
+        if not mines:
+            continue
+        nearest = min(mines, key=lambda pos: (distance(here, pos), pos.x, pos.y))
+        used.add(nearest)
+        targets.append(nearest)
+        here = nearest
+    return tuple(targets)
+
+
+def _route_rounds(
+    start: Pos,
+    targets: tuple[Pos, ...],
+    end: Pos | None,
+    dwell: int,
+) -> int:
+    """走完一串目标再回到 end 要几个回合（V4 的时间口径）
+
+    八方向移动下两点之间的路程就是切比雪夫距离（任务书4.5.4），每个目标还要
+    停下来干 `dwell` 个回合（挖矿 10 个回合、砌墙 1 个回合）。顺序按贪心
+    最近邻排——V4 的原话也是"两两算好距离做成表格"，地图小、目标少，够用。
+
+    参数:
+        start: 出发位置
+        targets: 依次要跑的目标（矿点或墙位）
+        end: 干完活回到的位置（PLE），没有时不再算回程
+        dwell: 每个目标上停留的回合数
+
+    返回:
+        估计的回合数
+    """
+    rounds = 0
+    here = start
+    remaining = list(targets)
+    while remaining:
+        nxt = min(remaining, key=lambda pos: (distance(here, pos), pos.x, pos.y))
+        remaining.remove(nxt)
+        rounds += distance(here, nxt) + dwell
+        here = nxt
+    if targets and end is not None:
+        rounds += distance(here, end)
+    return rounds
+
+
+def _repair_plan(
+    turn: Turn,
+    worker: Unit,
+    holes: tuple[Pos, ...],
+) -> tuple[int, Pos | None]:
+    """修墙路径的回合数（PT）与终点（PLE，V4）
+
+    修墙是石工一天里的第一件事：从当前位置把破洞一个个补上、再回到自己的
+    站位（R2）——所以 PLE 就是 R2 站位，也是这一天挖完矿要回来落脚的地方
+    （V4："以 PLE 为起点、R2 位置为终点执行修墙"）。没有破洞时 PT=0，
+    PLE 照旧取 R2。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        holes: 还差的墙位
+
+    返回:
+        (PT, PLE) 二元组
+    """
+    stand = _stand_for(turn, worker)
+    if not holes:
+        return 0, stand
+    return _route_rounds(worker.pos, holes, stand, WALL_BUILD_ROUNDS), stand
+
+
+def _plan_extras(
+    turn: Turn,
+    worker: Unit,
+    queue: tuple[str, ...],
+    total_rounds: int,
+) -> tuple[str, ...]:
+    """Tall 还有富余时按优先级补上的额外目标（V4 的额外目标优先级表）
+
+    顺序（V4 原话）:
+        小贩（背包里有可卖的矿，或今天的队列里有铜矿——反正要去挖铜）>
+        生命药剂（自身血量 < 80）>
+        武器商店（第 3 天起、背包里的围墙修复包不足常备量）>
+        铁矿 > 石头
+    时间已经贴到白天的回合数上限（Tall >= 70）时一个也不加：先把当天的正事
+    （修墙 + 队列里的矿）做完，顺路的事留到明天。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        queue: 当天的目标队列
+        total_rounds: Tall（修墙 + 队列的估算回合数）
+
+    返回:
+        额外目标元组（按优先级排列；一个都排不上时为空）
+    """
+    if total_rounds >= DAY_PLAN_LIMIT:
+        return ()
+
+    extras: list[str] = []
+    if COPPER_MINE in queue or any(
+        worker.backpack.count(kind) for kind in SELLABLE_MINES
+    ):
+        extras.append(VENDOR)
+    if worker.health < MEDICINE_HP:
+        extras.append(MEDICINE)
+    if (
+        _game_day(turn) >= FIXER_RESTOCK_DAY
+        and worker.backpack.count(WALL_FIXER) < FIXER_STOCK
+    ):
+        extras.append(WEAPON_SHOP)
+    # 铁矿/石头排在最后：这两个矿种本来就在 `_queue_order` 的兜底链里
+    # （队列里没有时按 铜->铁->石 顺延），列在这里是为了让计划本身完整
+    extras.append(IRON_MINE)
+    extras.append(STONE_MINE)
+    return tuple(extras)
+
+
+def _day_plan(turn: Turn, worker: Unit) -> DayPlan:
+    """当天的任务规划（V4：数破洞 -> 算 AR -> 修墙路径 -> 目标队列 -> 额外目标）
+
+    Tall = PT + LTmin 是"修完墙 + 走完队列"的估算回合数，V4 用它判断计划排不
+    排得下：目标一个一个往队列里加（Dnum 循环），只有加完仍然 Tall < 70 才留下
+    ——否则会出现"计划里排了 5 座矿、一天却只跑得完 2 座"的假计划，队列本身
+    是挖矿优先级（`_queue_order` 按它排矿种），排进去却干不完会让工人一直往
+    远矿跑。第一个目标无论如何都留（至少得有一件事做）。
+
+    计划不落库，每回合现算，所以夜里换了位置、矿区刷新、围墙被打掉都会立刻
+    反映进来。
+    """
+    holes = _wall_holes(turn)
+    stone_mines = _stone_demand(turn, holes)
+    repair_rounds, end_point = _repair_plan(turn, worker, holes)
+    origin = end_point if end_point is not None else worker.pos
+
+    queue: list[str] = []
+    route_rounds = 0
+    for kind in _work_queue(turn, stone_mines):
+        candidate = tuple(queue + [kind])
+        candidate_rounds = _route_rounds(
+            origin, _queue_targets(turn, candidate, origin),
+            end_point, STONE_PER_MINE,
+        )
+        if queue and repair_rounds + candidate_rounds >= DAY_PLAN_LIMIT:
+            break  # 加到这一件就超预算了：V4 的"Dnum=n 成立、n+1 不成立"
+        queue.append(kind)
+        route_rounds = candidate_rounds
+
+    total_rounds = repair_rounds + route_rounds
+    return DayPlan(
+        holes=holes,
+        stone_mines=stone_mines,
+        queue=tuple(queue),
+        repair_rounds=repair_rounds,
+        end_point=end_point,
+        route_rounds=route_rounds,
+        total_rounds=total_rounds,
+        extras=_plan_extras(turn, worker, tuple(queue), total_rounds),
+    )
+
+
+def _plan_extra_action(
+    turn: Turn,
+    worker: Unit,
+    day: DayPlan,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """按当天的额外目标优先级，能做的那件就做（V4）
+
+    正事（修墙、挖队列里的矿、建塔）都排不上时才轮到这里。V4 的五个额外
+    目标里，铁矿/石头由 `_gather_logic` 按队列兜底链处理（同一件事不写两遍），
+    所以这里只认前三件：
+        VENDOR      -> 把背包里的矿石卖给小贩（顺路变现）
+        MEDICINE    -> 血量 < 80 时补一剂生命药剂（背包里有就喝，没有就去买）
+        WEAPON_SHOP -> 补围墙修复包（夜里不能施工，这是唯一能救墙的东西）
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        day: 当天的计划
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达指令
+    """
+    for target in day.extras:
+        if target == VENDOR and _trade_logic(turn, worker, claimed, commands):
+            return True
+        if target == MEDICINE and _take_medicine(turn, worker, claimed, commands):
+            return True
+        if target == WEAPON_SHOP and _stock_fixers(turn, worker, claimed, commands):
+            return True
+    return False
+
+
+def _take_medicine(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """血量偏低时备一剂生命药剂：背包里有就喝，没有就去武器商店买
+
+    V4 把"买药"列进额外目标（自身血量 < 80），夜里掉到 50 以下时由
+    `_night_medicine` 喝掉（任务书4.6.3：生命药剂 10 金，使用者回满血）。
+    血量健康时不做——金币优先给建造与升级，药剂只是保命。
+    """
+    if worker.health >= MEDICINE_HP:
+        return False
+    if MEDICINE in worker.backpack:
+        commands[worker.unit_id] = use_command(MEDICINE)
+        return True
+    return _go_buy_item(
+        turn, worker, claimed, commands, MEDICINE,
+        _item_price(turn, MEDICINE, 1), allow=True,
+    )
+
+
+def _stock_fixers(
+    turn: Turn,
+    unit: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """按天数补给围墙修复包（V4）：不足常备量时去武器商店补齐
+
+    夜里不能施工，围墙挨打后唯一的救急手段就是这个 10 金的修复包（一次把
+    3×3 里的墙奶回来），所以要在白天备足。V4 的补给节奏：石工从第 3 天起
+    补货（"天数=3则购买2个"），铜矿工人从第 4 天起自带 3 个；开拓者那份
+    在 `_pioneer_shopping_list` 里（他没有天数门槛，缺了随时补）。
+    背包里够了就不买——10 金一张，够用就行。
+
+    参数:
+        turn: 当前回合信息
+        unit: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达指令（购买或走向武器商店）
+    """
+    day = _game_day(turn)
+    workers = turn.workers()
+    # 第 2 名工人就是 V4 的铜矿工人（第 4 天起自带 3 个），其余角色（石工、
+    # 只剩一名工人时的那个）从第 3 天起补货，第一次只买 2 个
+    copper = len(workers) >= 2 and unit.unit_id != workers[0].unit_id
+    if day < (FIXER_CARRIER_DAY if copper else FIXER_RESTOCK_DAY):
+        return False
+
+    held = unit.backpack.count(WALL_FIXER)
+    want = FIXER_STOCK_FIRST if day < FIXER_CARRIER_DAY else FIXER_STOCK
+    if held >= want:
+        return False
+
+    return _go_buy_item(
+        turn, unit, claimed, commands, WALL_FIXER,
+        _item_price(turn, WALL_FIXER, want - held), allow=True, num=want - held,
+    )
+
+
+def _wall_at(turn: Turn, pos: Pos) -> Unit | None:
+    """坐标上的围墙（没有时返回 None）"""
+    for wall in turn.walls():
+        if wall.pos == pos:
+            return wall
+    return None
+
+
+def _demolish_weak_wall(
+    turn: Turn,
+    unit: Unit,
+    target: Pos | None,
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """拆开挡路的残墙（V4）：血量低于一半的一级墙就算"已经破了"，可以拆穿走捷径
+
+    V4 的路径口径是"血量 < 50% 的一级墙视为可通过，通过时拆掉、过完再补回来"。
+    拆墙不返还石材（任务书4.5.1），所以只在真的没路可走时用最后一招：挑一格
+    紧挨着自己、又比现在更靠近目标的残墙拆掉，下一回合就能从缺口穿过去。
+    白天才做（夜里拆墙也走不了，还要留人在武器旁）。
+
+    参数:
+        turn: 当前回合信息
+        unit: 当前决策的单位
+        target: 想去的目标（矿点等），None 时不做
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达拆除指令
+    """
+    if target is None or not turn.is_day:
+        return False
+
+    here = distance(unit.pos, target)
+    for pos in get_neighbors(unit.pos):
+        wall = _wall_at(turn, pos)
+        if wall is None or wall.level > 1:
+            continue
+        if wall.health >= _wall_full_health(wall.level) * WEAK_WALL_RATIO:
+            continue
+        if distance(pos, target) >= here:
+            continue
+        commands[unit.unit_id] = remove_command(pos)
+        return True
+    return False
+
+
 def _tower_picks(
     worker: Unit,
     tower_sites: tuple[Pos, ...],
@@ -1017,28 +1508,38 @@ def _mine_order(
     worker: Unit,
     *,
     prefer_stone: bool = False,
+    plan: DayPlan | None = None,
 ) -> tuple[str, ...]:
-    """该工人本回合的采集矿种顺序
+    """该工人本回合的采集矿种顺序（V4：按当天的目标队列排）
 
-    "矿种互补"只在还有另一名工人兜底采石材时成立：同一时刻最多一名工人去
-    采铁/铜换金币，其余人继续采石材保证围墙不停工；只剩一名工人时它必须
-    石材优先（围墙是防守的根本），所以退回默认顺序。
+    队列是"今天要采什么"的那份规划（`_day_plan`）：AR 个石矿打头、其余是
+    铜矿。两名工人时仍按分工走——第 1 名工人（石工）照着队列采，第 2 名
+    工人（V4 的铜矿工人）以铜矿为主矿、铁作次选；只剩一名工人时它一个人
+    兼两摊，队列里有什么先采什么（石矿打头，防线优先）。
+
+    围墙配额还欠着时（`prefer_stone`）全员石材优先：那时候只有石材能让
+    首段围墙立起来，多采一铲铁没有意义（老行为，见 `_wall_target`）。
+
+    队列里没有的矿种仍然排在后头（`SELLABLE_MINES` 兜底）：地图上只剩
+    铁矿时石工照样采铁，空转比采错矿更糟。
 
     参数:
         turn: 当前回合信息
         worker: 待判断的工人
         prefer_stone: 为 True 时全员石材优先（围墙配额还没铺满时用）
+        plan: 当天的计划（None 时现算一份）
 
     返回:
         按优先级排序的矿种元组
     """
-    if (
-        prefer_stone
-        or len(turn.workers()) < 2
-        or not _is_economy_worker(turn, worker)
-    ):
+    if prefer_stone:
         return SELLABLE_MINES
-    return ECONOMY_MINE_ORDER
+    if len(turn.workers()) < 2:
+        return _queue_order(turn, plan)
+    if _is_economy_worker(turn, worker):
+        # 第 2 名工人是 V4 的铜矿工人：铜是队列里的默认目标，铁作次选
+        return ECONOMY_MINE_ORDER
+    return _queue_order(turn, plan)
 
 
 def _pioneer_day_logic(
@@ -1146,8 +1647,82 @@ def _pioneer_day_logic(
         ):
             return
 
-    # 4. 没有可接取的任务: 跟随武器塔,为夜晚操控武器做准备
+    # 4. 没有可接取的任务: 收工后去武器商店补货（V4），再跟随武器塔为夜晚做准备
+    if _pioneer_shopping(turn, pioneer, claimed, commands):
+        return
     _pioneer_follow_weapons(turn, pioneer, wall_order, claimed, commands)
+
+
+def _pioneer_shopping_list(turn: Turn) -> tuple[tuple[str, int], ...]:
+    """开拓者的采购清单（商品, 要备的数量），顺序即优先级（V4）
+
+    V4 把"围墙与武器升级"这件事交给开拓者：任务做完/任务点冷却时顺路把券
+    和修复包买齐，工人腾出手去跑当天的矿物队列。优先级是 V4 的原话：
+        3×武器升级券1 > 1×基地升级券1 > 围墙修复包（不足 3 个时补齐）
+        > 10×围墙升级券1 > 3×武器升级券2 > 基地升级券2
+    券按"当前等级用得上"的那张列：武器/基地还在 level1 时只需要第一张，
+    已经到 level2 才轮到第二张（买早了用不上，还占背包）。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        (商品名, 要备的数量) 元组，按优先级排列
+    """
+    station = turn.station()
+    weapons = turn.weapons()
+    items: list[tuple[str, int]] = []
+    if any(weapon.level == 1 for weapon in weapons):
+        items.append((WEAPON_UPGRADE_VOUCHER, PIONEER_WEAPON_VOUCHERS))
+    if station is not None and station.level == 1:
+        items.append((STATION_UPGRADE_VOUCHER, 1))
+    items.append((WALL_FIXER, FIXER_STOCK))
+    if any(wall.level == 1 for wall in turn.walls()):
+        items.append((WALL_UPGRADE_VOUCHER, PIONEER_WALL_VOUCHERS))
+    if any(weapon.level == 2 for weapon in weapons):
+        items.append((WEAPON_UPGRADE_VOUCHER2, PIONEER_WEAPON_VOUCHERS))
+    if station is not None and station.level == 2:
+        items.append((STATION_UPGRADE_VOUCHER2, 1))
+    return tuple(items)
+
+
+def _pioneer_shopping(
+    turn: Turn,
+    pioneer: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """开拓者收工后去武器商店补货（V4 的采购优先级）
+
+    按 `_pioneer_shopping_list` 的顺序一件件试：背包里还缺几件就买几件，
+    买不起（或不在店旁、天快黑了）就试下一件，一件都办不成时不下指令，
+    交给下面的"跟随武器塔"——夜里武器要有人操控，采购不能把开拓者留在
+    地图另一头。
+
+    塔还没建齐时给工人留一座塔的钱（`reserve`）：券可以晚一天买，火力
+    成型晚一天就可能被机器人贴脸打基地。
+
+    参数:
+        turn: 当前回合信息
+        pioneer: 当前决策的开拓者
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达指令（购买或走向武器商店）
+    """
+    reserve = WEAPON_BUILD_COST if len(turn.weapons()) < LLM_MAX_TOWERS else 0
+    for item, want in _pioneer_shopping_list(turn):
+        held = pioneer.backpack.count(item)
+        if held >= want:
+            continue
+        if _go_buy_item(
+            turn, pioneer, claimed, commands, item,
+            _item_price(turn, item, want - held),
+            allow=True, reserve=reserve, num=want - held,
+        ):
+            return True
+    return False
 
 
 def _task_wait_logic(
@@ -1626,6 +2201,7 @@ def _go_buy_item(
     *,
     allow: bool,
     reserve: int = 0,
+    num: int = 1,
 ) -> bool:
     """去武器商店买一件道具：已经在店旁就直接买，否则走过去
 
@@ -1638,9 +2214,10 @@ def _go_buy_item(
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
         item: 道具名（如 WallFixer / StationUpgradeVoucher1）
-        price: 售价（来自 weaponShopList，取不到时用兜底价）
+        price: 这一单的总价（数量按 num 算，来自 weaponShopList，取不到时用兜底价）
         allow: 是否允许本回合花钱买
         reserve: 买之前要留下的金币（给更高优先级的支出留钱）
+        num: 一次买几件（修复包这类消耗品按常备量一次补齐）
 
     返回:
         True 表示本回合已下达指令（购买或移动）
@@ -1655,7 +2232,7 @@ def _go_buy_item(
         return False
 
     if distance(worker.pos, shop) <= 1:
-        commands[worker.unit_id] = buy_command(item)
+        commands[worker.unit_id] = buy_command(item, num)
         return True
 
     if not _can_return_before_dusk(turn, worker, shop):
@@ -1933,6 +2510,11 @@ def _fall_back_to_weapons(
     武器工事必须由角色操控才会开火（任务书4.4节），提前回防可以避免
     夜晚首个回合武器无人操控而白白空转。
 
+    V4 的站位优先：自己那个退守位（`_dusk_stand`，R3 是 K0）正好挨着某座
+    武器时先回站位——站在那里照样能操控武器，而站位在墙内一圈的角上，
+    围墙修复包的 3×3 一次能奶 5 段墙（V4 的"角落站位"），夜里补墙最顺手。
+    站位挨不着武器（或者走不过去）时退回原来的"就近武器"。
+
     参数:
         turn: 当前回合信息
         unit: 待召回的角色
@@ -1942,6 +2524,17 @@ def _fall_back_to_weapons(
     weapons = turn.weapons()
     if not weapons:
         return
+
+    stand = _dusk_stand(turn, unit)
+    if stand is not None and any(
+        distance(stand, weapon.pos) <= 1 for weapon in weapons
+    ):
+        if distance(unit.pos, stand) <= 1:
+            return
+        step = _step_toward(turn, unit, stand, claimed)
+        if step is not None:
+            commands[unit.unit_id] = move_command(step)
+            return
 
     nearest = min(
         weapons,
@@ -1955,6 +2548,153 @@ def _fall_back_to_weapons(
         commands[unit.unit_id] = move_command(step)
 
 
+def _use_item_if_held(
+    unit: Unit,
+    item: str,
+    commands: dict[int, dict[str, Any]],
+    target: Pos | None = None,
+) -> bool:
+    """背包里有这件道具就用掉（没有时不下指令）
+
+    这些道具都是"用完就没、效果立即生效"的救急品（生命药剂、围墙修复包、
+    升级券），所以调用方不需要记"用过没有"：用完之后条件自然不再成立
+    （血回满了、墙回满了、基地升级了），本模块因此不用存任何跨回合状态。
+    """
+    if item not in unit.backpack:
+        return False
+    commands[unit.unit_id] = use_command(item, target)
+    return True
+
+
+def _night_medicine(unit: Unit, commands: dict[int, dict[str, Any]]) -> bool:
+    """夜晚血量 <= 50 时喝一剂生命药剂（V4）
+
+    任务书4.6.3：生命药剂 10 金，使用者回满血。喝下去血量就满了，条件自然
+    不再成立，所以不会每回合都在喝药——只有真的挨打到快没血才用。
+    """
+    if unit.health > MEDICINE_HP_NIGHT:
+        return False
+    return _use_item_if_held(unit, MEDICINE, commands)
+
+
+def _night_station_voucher(
+    turn: Turn,
+    unit: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """基地血量 < 150（或持券者自己 < 40）时用基地升级券（V4）
+
+    夜里没有工人施工，基地掉到 150 以下就只剩挨打了；这张券等于一次"满血
+    复活 + 升级"（任务书4.5.1：升级后建筑回到满血）。持券的人自己快没了时
+    也用它——人倒下背包里的券也就用不上了（V4："持有券的小人血量低于40时"）。
+
+    参数:
+        turn: 当前回合信息
+        unit: 当前决策的角色
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达指令（使用或走向基地）
+    """
+    station = turn.station()
+    if station is None or not station.is_alive or station.level >= 3:
+        return False
+    if station.health >= STATION_CRITICAL_HP and unit.health >= CARRIER_LOW_HP:
+        return False
+
+    entry = STATION_UPGRADE_VOUCHERS.get(station.level)
+    if entry is None:
+        return False
+    voucher = entry[0]
+    if voucher not in unit.backpack:
+        return False
+
+    # 已经在基地旁就直接用；否则往基地走（基地快没了，值得离开武器一趟）
+    if distance(unit.pos, station.pos) <= 1:
+        commands[unit.unit_id] = use_command(voucher, station.pos)
+        return True
+    step = _step_toward(turn, unit, station.pos, claimed)
+    if step is not None:
+        commands[unit.unit_id] = move_command(step)
+        return True
+    return False
+
+
+def _night_wall_fixer(turn: Turn, unit: Unit, commands: dict[int, dict[str, Any]]) -> bool:
+    """夜晚用围墙修复包补墙（V4：靠站位把 3×3 覆盖到的墙一次奶满）
+
+    修复包要站在目标围墙一格范围内用（任务书4.6.3），所以只有当自己身边
+    就有残墙时才动手——不动窝就能补，武器照旧有人操控。阈值按 V4 的分工：
+    正面的人（R1/R2）盯自己那一片墙，血量低于 `FIXER_NIGHT_HP` 就补一次；
+    后排的人（R3）负责次要方向的墙，阈值放宽到 `FIXER_NIGHT_HP_WEAK`；
+    自身血量低于 `SELF_FIXER_HP` 时也补一次（人快没了，把身前的墙奶回来）。
+
+    补完墙就满血了，条件自然不再成立（不会每回合都在奶同一段墙）。
+
+    参数:
+        turn: 当前回合信息
+        unit: 当前决策的角色
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达使用指令
+    """
+    if WALL_FIXER not in unit.backpack:
+        return False
+
+    # 正面的人（R1 开拓者 / R2 石工）盯自己那一片墙（阈值 100），
+    # 后排的人（R3 铜工）负责次要方向的墙（阈值 150）
+    threshold = (
+        FIXER_NIGHT_HP if _stand_role(turn, unit) <= 1 else FIXER_NIGHT_HP_WEAK
+    )
+    if unit.health < SELF_FIXER_HP:
+        threshold = _wall_full_health(1)  # 自己快没了：身边有残墙就补，不看阈值
+
+    damaged = tuple(
+        wall for wall in turn.walls()
+        if wall.health < threshold
+        and distance(unit.pos, wall.pos) <= WALL_FIXER_RADIUS
+    )
+    if not damaged:
+        return False
+
+    target = _best_repair_spot(turn, damaged, unit.pos)
+    if target is None:
+        return False
+    return _use_item_if_held(unit, WALL_FIXER, commands, target.pos)
+
+
+def _night_support(
+    turn: Turn,
+    unit: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """夜晚的救急动作（V4）：生命药剂 > 基地升级券 > 围墙修复包
+
+    开火之前先看一眼要不要救急：血量 <= 50 先喝药（人倒下了谁也救不了），
+    基地 < 150 或有券的人自己 < 40 时用基地升级券，站位旁的墙快破了补一次
+    修复包。三件事都只在真的危急时触发，触发后条件自然消失，所以武器照旧
+    有人操控、不会整夜都在做后勤。
+
+    参数:
+        turn: 当前回合信息
+        unit: 当前决策的角色
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达救急指令（调用方不要再下攻击/移动指令）
+    """
+    if _night_medicine(unit, commands):
+        return True
+    if _night_station_voucher(turn, unit, claimed, commands):
+        return True
+    return _night_wall_fixer(turn, unit, commands)
+
+
 # === 夜晚决策 ===
 
 
@@ -1964,6 +2704,11 @@ def _decide_night(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
 
     # 为每个武器配对一个操控角色
     for controller, weapon in _pair_controllers_and_weapons(turn):
+        # 救急优先（V4）：喝药 / 基地升级券 / 补墙只在真危急时触发，
+        # 触发后条件立刻消失，武器不会因此整夜没人操控
+        if _night_support(turn, controller, claimed, commands):
+            continue
+
         # 检查操控角色是否在武器旁边
         if distance(controller.pos, weapon.pos) <= 1:
             # 武器在冷却中,跳过
@@ -2884,6 +3629,7 @@ def _gather_logic(
     commands: dict[int, dict[str, Any]],
     *,
     prefer_stone: bool = False,
+    plan: DayPlan | None = None,
 ) -> bool:
     """保证工人每回合都有产出：按矿种分工就近采集
 
@@ -2897,11 +3643,14 @@ def _gather_logic(
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
         prefer_stone: 为 True 时全员石材优先（围墙配额还没铺满时用）
+        plan: 当天的计划（为 None 时由 `_mine_order` 现算一份）
 
     返回:
         True 表示本回合已下达采集或移动指令
     """
-    for mine_type in _mine_order(turn, worker, prefer_stone=prefer_stone):
+    for mine_type in _mine_order(
+        turn, worker, prefer_stone=prefer_stone, plan=plan,
+    ):
         if _go_mine(turn, worker, mine_type, claimed, commands):
             return True
     return False
@@ -3476,6 +4225,148 @@ def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
         and 0 <= pos.x < turn.width
         and 0 <= pos.y < turn.height
     )
+
+
+# === 基地布局（V4）===
+
+# 背面方位表：正面（主要来敌方向）的对面就是后排，R3 与 K0 在这一侧
+_OPPOSITE_SIDE = {"up": "down", "down": "up", "left": "right", "right": "left"}
+
+
+@dataclass(frozen=True, slots=True)
+class BaseLayout:
+    """基地布局锚点（V4：按来敌方位定向，基地在左上/右下时自动反转）
+
+    字段:
+        front: 主要来敌方位（up/left/down/right）
+        back: 背面方位（front 的反面）
+        corners: 墙内一圈的四个角，顺序为 R1(前上)/R2(前下)/R3(后上)/K0(后下)；
+                 格子不在地图上（基地贴地图边）时为 None
+
+    站位分工（V4）：R1 是开拓者，R2 是石工（第 1 名工人，正面下角），
+    R3 是铜工（第 2 名工人，后上角）；K0 是入夜前 R3 退守的安全位。
+    布局里的三个炮位（正面两座、背面一座）不进这个对象：塔位仍由
+    `_calc_tower_sites` 按"三面分散 + 可达性校验"选（理由见模块开头的
+    V4 常量说明）。
+    """
+
+    front: str
+    back: str
+    corners: tuple[Pos | None, Pos | None, Pos | None, Pos | None]
+
+    @property
+    def hold(self) -> Pos | None:
+        """K0：R3 入夜前的安全位"""
+        return self.corners[3]
+
+
+def _side_corridor(
+    xmin: int,
+    xmax: int,
+    ymin: int,
+    ymax: int,
+    side: str,
+) -> tuple[Pos, ...]:
+    """墙内一圈（离基地一格）在某一侧的四个格子，从"头"排到"尾"
+
+    槽位含义（V4 布局）：0=小人站位、1=炮位、2=炮位/安全位、3=小人站位。
+    竖边（left/right）按 y 从大到小排、横边（up/down）按 x 从小到大排，
+    这样"头"永远是布局意义上的前上角（R1）、"尾"是前下角（R2），基地在
+    哪个角落都不用另写一套坐标。
+    """
+    if side in ("left", "right"):
+        x = xmin - 1 if side == "left" else xmax + 1
+        return tuple(Pos(x, y) for y in (ymax + 1, ymax, ymin, ymin - 1))
+    y = ymax + 1 if side == "up" else ymin - 1
+    return tuple(Pos(x, y) for x in (xmin - 1, xmin, xmax, xmax + 1))
+
+
+def _base_layout(turn: Turn) -> BaseLayout | None:
+    """算出 V4 布局的锚点（没有基地时返回 None）
+
+    来敌方位沿用围墙那套判定（`_wall_side_order` 的第一位就是先封的那一侧），
+    所以"正面"永远是敌人来的方向；基地贴地图边时图外的格子由 `turn.land`
+    过滤掉，拿不到坐标的角在 `corners` 里是 None。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        布局锚点；没有基地时返回 None
+    """
+    station = turn.station()
+    if station is None:
+        return None
+
+    footprint = station_footprint(station.pos)
+    xs = [pos.x for pos in footprint]
+    ys = [pos.y for pos in footprint]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+
+    front = _wall_side_order(turn)[0]
+    back = _OPPOSITE_SIDE[front]
+    front_cells = _side_corridor(xmin, xmax, ymin, ymax, front)
+    back_cells = _side_corridor(xmin, xmax, ymin, ymax, back)
+
+    corners = tuple(
+        pos if turn.land(pos) else None
+        for pos in (front_cells[0], front_cells[3], back_cells[0], back_cells[2])
+    )
+    return BaseLayout(front=front, back=back, corners=corners)
+
+
+def _stand_role(turn: Turn, unit: Unit) -> int:
+    """该角色在 V4 布局里占哪个站位（0=R1 开拓者 / 1=R2 石工 / 2=R3 铜工）
+
+    分工与 `_stand_for` 共用一套判定：开拓者是 R1，第 1 名工人是 R2（正面
+    下角），第 2 名工人是 R3（后上角）；只剩一名工人时它一个人兼两摊，按
+    R2 算（修墙更要紧）。
+    """
+    if unit.kind == PIONEER:
+        return 0
+    workers = turn.workers()
+    if len(workers) < 2 or (workers and unit.unit_id == workers[0].unit_id):
+        return 1
+    return 2
+
+
+def _stand_for(turn: Turn, unit: Unit) -> Pos | None:
+    """该角色在 V4 布局里的站位（R1 开拓者 / R2 石工 / R3 铜工）
+
+    站位不在地图上（基地贴地图边）时返回 None，调用方退回原来的"就近站位"。
+
+    参数:
+        turn: 当前回合信息
+        unit: 待判断的角色
+
+    返回:
+        该角色的站位坐标；没有基地或站位不在图内时返回 None
+    """
+    layout = _base_layout(turn)
+    if layout is None:
+        return None
+    return layout.corners[_stand_role(turn, unit)]
+
+
+def _dusk_stand(turn: Turn, unit: Unit) -> Pos | None:
+    """入夜前的退守位（V4）：R3（铜矿工人）先退到 K0，其他人回自己的站位
+
+    K0 在后排炮位旁边，又正对敌方进场方向的身后（V4："R3 位置会毒死 E1
+    进入，因此入夜时小人 R3 需要先站在 K0 位置"）；K0 拿不到坐标时退回它
+    自己的站位 R3。没有布局时返回 None，调用方按"就近武器"处理。
+    """
+    layout = _base_layout(turn)
+    if layout is None:
+        return None
+    if _stand_role(turn, unit) == 2:
+        return layout.hold if layout.hold is not None else _stand_for(turn, unit)
+    return _stand_for(turn, unit)
+
+
+def _game_day(turn: Turn) -> int:
+    """当前是第几个游戏日（从 1 开始，与 `_day_round` 同一套算法）"""
+    return (turn.round_no - 1) // ROUNDS_PER_DAY + 1
 
 
 # === LLM 策略咨询 ===
