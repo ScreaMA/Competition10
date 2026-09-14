@@ -4061,6 +4061,22 @@ def test_task_brief_without_task(payload_factory):
     assert brain.task_brief(turn) == "phase=- state=no_task"
 
 
+def _executor_function(name: str):
+    """从生成的沙盒脚本里抠出一个函数，供单测直接调用
+
+    执行器的代码在 `TASK_EXECUTOR` 模板里，拼成命令、替换掉占位符之后才是
+    真正下发到沙盒里跑的那一份。单测要验的正是这一份的行为，所以从命令里
+    正则抠出函数体 exec 出来跑，而不是去调 brain 模块里的同名对象。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(rf"def {name}\(.*?(?=\ndef )", script, re.S)
+    assert match, f"沙盒脚本里没有 {name}"
+    namespace: dict = {}
+    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    return namespace[name]
+
+
 def test_executor_template_has_no_placeholders():
     """执行器命令里的占位符必须全部替换掉（漏一个脚本就整个跑不起来）"""
     command = _task_executor("task_1_beijing.md")
@@ -4073,13 +4089,7 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     复盘里 R12–R17 连续 6 回合 `APIFAIL ... ），API InvalidURL`，任务因此
     8 个回合读不到题面。这里直接从生成的脚本里取出 refine_url 验证行为。
     """
-    command = _task_executor("task_1_beijing.md")
-    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
-    match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
-    assert match
-    namespace: dict = {}
-    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
-    refine = namespace["refine_url"]
+    refine = _executor_function("refine_url")
 
     assert refine("http://localhost:8899/weather?city=北京。") == (
         "http://localhost:8899/weather?city=%E5%8C%97%E4%BA%AC"
@@ -4087,3 +4097,29 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+def test_executor_refine_url_truncates_dirty_host():
+    """沙盒执行器的 URL 净化：脏字符落在主机名/端口上时截回可用的基址（#75）
+
+    #67 的修法只剥两端，而 PK590581/PK590607 日志里的原始形态是
+    `[APIFAIL] http://localhost:8899`），API InvalidURL`——反引号与全角
+    标点后面还跟着英文，剥两端剥不掉，而且它们落在 **netloc** 上：
+    `urlsplit` 对端口是惰性校验，不抛异常，这个坏地址一路放行到 urlopen
+    才失败。每回合都拿它去请求，取数一次都没成功，任务因此读不到题面。
+    """
+    refine = _executor_function("refine_url")
+
+    # 基址 + 反引号 + 全角标点 + 后续英文：截到主机名为止，正好是本地基址
+    assert refine("http://localhost:8899`），API") == "http://localhost:8899"
+    assert refine("http://localhost:8899），API") == "http://localhost:8899"
+    # 截断只作用在主机名上：路径与查询照旧保留
+    assert refine("http://localhost:8899`/api?city=北京") == (
+        "http://localhost:8899/api?city=%E5%8C%97%E4%BA%AC"
+    )
+    # 冒号后面不是数字 -> 那段不是端口（截断留下的残渣），整段丢掉
+    assert refine("http://localhost:88abc/") == "http://localhost/"
+    # 主机名整个是脏的: 认不出来就返回空串（调用方退回 BASE 重试）
+    assert refine("http://），API") == ""
+    # IPv6 字面量里的冒号不是端口分隔符，照旧放行
+    assert refine("http://[::1]:8899/x") == "http://[::1]:8899/x"

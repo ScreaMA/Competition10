@@ -3539,13 +3539,18 @@ def task_files():
 def refine_url(raw):
     """把文档里抓到的地址整成 urlopen 能吃的形式（整不出来就返回空串）
 
-    文档是中文的，地址常写在句子中间或反引号里，尾随的全角标点、引号会让
-    urllib 直接抛 `InvalidURL`——复盘 #67 里 R12–R17 连续 6 回合
-    `APIFAIL ... ），API InvalidURL`（URL 含反引号+中文）就是这么来的，
-    任务因此 8 个回合读不到题面、最终 0 分。这里做两件事：
+    文档是中文的，地址常写在句子中间或反引号里，整条抓回来时会连着尾随的
+    全角标点、引号甚至后面的英文一起带上，urllib 到取数那一步就抛
+    `InvalidURL`——PK590581/PK590607 的 R12–R17 连续 6 回合
+    `[APIFAIL] http://localhost:8899`），API InvalidURL` 就是这么来的，
+    任务因此 8 个回合读不到题面、最终 0 分。这里做三件事：
 
     1. 剥掉两端的标点/引号/括号（含全角）
-    2. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
+    2. 主机名与端口只保留前面合法的一段：脏字符落在 **netloc** 上时
+       `urlsplit` 并不报错（端口是惰性校验），整个地址一路放行到 urlopen
+       才抛 `InvalidURL`。截到第一个非主机字符为止（`localhost:8899`）
+       把本地基址拿回来；冒号后面不是数字的"端口"是截断留下的残渣，整段丢掉
+    3. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
     """
     text = raw.strip()
     trim = "`'\\\"、，。；：？！,.;:!?)]}>（）【】《》“”‘’"
@@ -3561,9 +3566,25 @@ def refine_url(raw):
         return ""
     if not parts.scheme or not parts.netloc:
         return ""
+    # 主机名只可能由 ASCII 组成（IDN 在 URL 里是 punycode），IPv6 字面量是
+    # 方括号包起来的一段，端口跟在冒号后面。这里逐字符截断而不是整条丢掉：
+    # `http://localhost:8899`），API` 截断后正好是能用的本地基址
+    host_chars = set("abcdefghijklmnopqrstuvwxyz0123456789.-_~%[]:")
+    _, _, authority = parts.netloc.rpartition("@")
+    host = ""
+    for char in authority:
+        if char.lower() not in host_chars:
+            break
+        host += char
+    if "]" not in host:
+        name, sep, port = host.rpartition(":")
+        if sep and not port.isdigit():
+            host = name  # 冒号后面不是数字（截断留下的残渣）-> 整段丢掉
+    if not host:
+        return ""
     path = urllib.parse.quote(parts.path, safe="/%:@&=+$,-_.!~*'()")
     query = urllib.parse.quote(parts.query, safe="=&%:@+$,-_.!~*'()")
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+    return urllib.parse.urlunsplit((parts.scheme, host, path, query, ""))
 
 
 def endpoints(doc_text):
