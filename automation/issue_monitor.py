@@ -317,17 +317,16 @@ class IssueMonitor:
         return bool(set(issue.labels) & set(self.labels))
 
     def fetch_candidates(self) -> list[Issue]:
-        """拉取需要处理的Issue列表（只看最新的 `max_candidates` 个开放Issue）
+        """拉取需要处理的Issue列表（窗口固定为最新的 `max_candidates` 个开放Issue）
 
         注意: GitHub API 的 `labels` 参数是“与”语义（要求Issue同时带全部标签），
         而配置中的 issue_labels 是“或”语义（命中任意一个即处理），
         因此这里拉取全部开放Issue，再在本地过滤。
 
-        顺序（先截断、后过滤）：**先按编号从新到旧只留最新的那几个**
+        顺序（先截断、后过滤）：**先按编号从新到旧固定取最新的那几个**
         （`automation.max_issues_per_round`，默认 3），再在它们中间做
-        "已处理/忽略标签"的过滤——这样更早的历史 issue 永远不会被翻出来处理
-        （复盘流水线积压了几十个分析，结论只看最近几场）。已经处理过的
-        最新 issue 会被过滤掉，本轮就没有候选，不会往历史里回溯。
+        "已处理/命中忽略标签"的过滤。窗口不滑动：这 3 个处理完之后本轮就没有
+        候选，不会顺延到次新的一批，更早的历史 issue 也不会被翻出来处理。
         """
         try:
             issues = self.client.list_issues()
@@ -338,7 +337,7 @@ class IssueMonitor:
         # 新的在前：编号越大越新（同一批 issue 的编号单调递增）
         issues.sort(key=lambda issue: issue.number, reverse=True)
         if self.max_candidates > 0 and len(issues) > self.max_candidates:
-            LOGGER.info("只处理最新的 %d 个 issue，其余 %d 个不再处理",
+            LOGGER.info("窗口固定为最新的 %d 个 issue，其余 %d 个不处理",
                         self.max_candidates, len(issues) - self.max_candidates)
             issues = issues[: self.max_candidates]
 
