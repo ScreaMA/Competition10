@@ -354,15 +354,24 @@ TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过�
 # 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
 # 合不上。复盘里 PK589649/589653 的沙盒从 R11 起连续 6~7 个回合返回逐字相同
 # 的输出（exitCode:0 但没有取数证据），开拓者被读文件死循环占死，任务分丢光、
-# 这名劳动力也一起白搭。这里给任务两条止损线，到线就放弃任务、把开拓者还给
+# 这名劳动力也一起白搭。这里给任务三条止损线，到线就放弃任务、把开拓者还给
 # 战斗调度（见 `_task_abandoned`）：
 #   - 同一份沙盒输出连续出现 TASK_LOOP_LIMIT 次（读文件循环）
 #   - 任务已经占用开拓者 TASK_TIMEOUT_ROUNDS 个回合（任务书：单个任务时限 15 回合）
+#   - 同一份命令连续失败 TASK_SANDBOX_RETRY 个回合（取数失败，见 `_task_failed`）
 # 超时线取 10 而不是任务书的 15：真能解出答案的任务在收到第二条沙盒输出的
 # 回合就交卷了（答案缓存命中时更快），拖到第 10 个回合还交不上卷的任务，
 # 剩下的 5 个回合同样交不上，不如早点把开拓者还给战斗调度。
+# 第三条是给"每回合换一种失败法"的情况兜底的：复盘 PK590301/590392 里沙盒
+# R12 全盘扫描超时、R13/R15 扫到系统文档（uom-se README）、R14 cat 文件不存在、
+# R17 地址拼错抛 InvalidURL——输出每回合都不一样，上面那条"逐字相同"的熔断
+# 一次都没触发，开拓者照样被白占 7 个回合，任务分和这名劳动力一起丢掉。
+# 取 3 而不是 2：第一次取数失败当回合才向 LLM 求助，回复要到再下一个回合才
+# 下得去沙盒（见 `_consume_task_reply`/`_llm_task_command`），线压到 2 会让
+# 这条兜底路径一次都跑不到就被放弃；3 仍然把白占的回合数从 7 压到 3。
 TASK_LOOP_LIMIT = 3
 TASK_TIMEOUT_ROUNDS = 10
+TASK_SANDBOX_RETRY = 3
 # 兼容旧名：测试与外部脚本仍按 `TASK_TIMEOUT` 引用（改名时漏改调用方）
 TASK_TIMEOUT = TASK_TIMEOUT_ROUNDS
 
@@ -404,6 +413,7 @@ class TaskWatch:
         output: 当时那份属于本任务的沙盒输出（没有输出时为空串）
         rounds: 这个任务已经占用开拓者的回合数
         repeats: 当前这份输出已经连续出现了几次
+        fails: 连续几个回合的沙盒输出都是取数失败（见 `_task_failed`）
     """
 
     token: str
@@ -411,6 +421,7 @@ class TaskWatch:
     output: str
     rounds: int
     repeats: int
+    fails: int = 0
 
 
 # 任务看门狗（模块级单例，只存最近一回合的观察值）：每回合由 `decide` 用当前
@@ -466,6 +477,15 @@ LLM_PLAN_DEFAULT = LlmPlan()
 
 # 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
 TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
+
+# 沙盒"取数失败"的证据（S1）：命令跑到了、但没拿到数据的那些痕迹。
+# 判据只认明确的失败标记，不认"输出里没有答案"——探测轮次、LLM 指定命令的
+# 输出、任务文件回读都不带这些标记，不该被算成失败（见 `_task_failed`）。
+# `[TIMEOUT]` 是整条沙盒命令超时（15 秒限时）时判题系统留下的标记。
+TASK_FAIL_MARKERS = (
+    TASK_API_FAIL_MARKER,
+    "[TIMEOUT]",
+) + TASK_ERROR_MARKERS
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -634,8 +654,15 @@ def _idle_gather(
           任何移动都可能让任务强制结束
         - 有任务可领的开拓者：接任务、交任务是主要得分来源，被兜底支去采矿
           等于把开拓者从任务点上拽走（它的任务优先级最高，见 `_pioneer_day_logic`）
+          （任务已被看门狗放弃时不在此列：开拓者已经"下班"回了战斗调度，
+            见 `_pioneer_day_logic` 第 0 步，这时按"任务进行中"跳过兜底只会让它
+            整回合零指令空转——复盘 PK590301/590392 里 R11–R18 就是这么空转的）
         - 黄昏（调用方不调用）：回防到武器旁待命比多采一铲矿更重要，
           武器要有角色操控才会开火
+
+    采集走不通时把矿石变现（S3）：背包塞满的角色既采不动矿、也腾不出手做别的，
+    卖矿是它这一回合唯一的产出；不卖的话这一回合就是零指令，金币也跟着继续
+    冻结（复盘里 gold 从 R8 恒 0 到 R18，背包里却一直躺着可卖的矿石）。
 
     参数:
         turn: 当前回合信息
@@ -645,13 +672,16 @@ def _idle_gather(
     """
     if unit.unit_id in commands:
         return
-    if unit.kind == PIONEER and (
-        turn.phase_task or any(task.is_valid for task in turn.player_tasks)
+    if (
+        unit.kind == PIONEER
+        and not _task_abandoned(turn)
+        and (turn.phase_task or any(task.is_valid for task in turn.player_tasks))
     ):
         return
     for mine_type in SELLABLE_MINES:
         if _go_mine(turn, unit, mine_type, claimed, commands):
             return
+    _trade_logic(turn, unit, claimed, commands)
 
 
 def _gold_left(turn: Turn, commands: dict[int, dict[str, Any]]) -> int:
@@ -2977,6 +3007,25 @@ def _task_output(turn: Turn) -> str:
     return ""
 
 
+def _task_failed(output: str) -> bool:
+    """这一回合的沙盒输出是不是一次取数失败（S1）
+
+    判据只看明确的失败证据（`TASK_FAIL_MARKERS`）：命令跑到了、却没能取到数据。
+    没有输出（命令还没下发、或输出不属于本任务）不算失败，"输出里没有答案"也不算
+    ——探测轮次与 LLM 指定命令的输出本来就不带取数证据，把它们算成失败会让任务
+    在正常推进中就被放弃。已经取到数据的输出（带 `TASK_DATA_MARKER`）当然更不算。
+
+    参数:
+        output: 本回合属于当前任务的沙盒输出（`_task_output`）
+
+    返回:
+        True 表示这一回合确实失败了一次
+    """
+    if not output or TASK_DATA_MARKER in output:
+        return False
+    return any(mark in output for mark in TASK_FAIL_MARKERS)
+
+
 def _watch_task(turn: Turn) -> None:
     """刷新任务看门狗（每回合由 `decide` 调用一次）
 
@@ -2995,6 +3044,7 @@ def _watch_task(turn: Turn) -> None:
 
     token = _task_token(turn.phase_task)
     output = _task_output(turn)
+    failed = _task_failed(output)
     previous = _TASK_WATCH
     if (
         previous is None
@@ -3002,7 +3052,9 @@ def _watch_task(turn: Turn) -> None:
         or turn.round_no != previous.round_no + 1
     ):
         # 新任务（或接不上上一回合的观察）：这一份输出算第 1 次出现
-        _TASK_WATCH = TaskWatch(token, turn.round_no, output, 1, 1 if output else 0)
+        _TASK_WATCH = TaskWatch(
+            token, turn.round_no, output, 1, 1 if output else 0, 1 if failed else 0,
+        )
         return
 
     # 又读到同一份输出说明这一回合没有任何进展，往上累计；换了新输出则重新数
@@ -3014,16 +3066,20 @@ def _watch_task(turn: Turn) -> None:
         repeats = 1
     _TASK_WATCH = TaskWatch(
         token, turn.round_no, output, previous.rounds + 1, repeats,
+        # 连续失败才计数：中间有一回合成功（或没输出）就从头数
+        previous.fails + 1 if failed else 0,
     )
 
 
 def _task_abandoned(turn: Turn) -> bool:
     """当前任务是不是已经被看门狗放弃（只读，不刷新观察值）
 
-    两条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT_ROUNDS`）：同一份沙盒输出连续
-    出现了 `TASK_LOOP_LIMIT` 次，或者任务已经占用了 `TASK_TIMEOUT_ROUNDS` 个回合。
-    复盘里开拓者就是被"每回合回读同一份任务文件"的死循环占死的（PK589649
-    的 R11–R17、PK589653 的 R12–R17），任务分拿不到，这名劳动力也一起白搭。
+    三条止损线：同一份沙盒输出连续出现了 `TASK_LOOP_LIMIT` 次、任务已经占用了
+    `TASK_TIMEOUT_ROUNDS` 个回合（见下），或者沙盒连续失败 `TASK_SANDBOX_RETRY`
+    个回合（每回合换一种失败法，见 `_task_failed`）。复盘里开拓者就是被"每回合
+    回读同一份任务文件"的死循环占死的（PK589649 的 R11–R17、PK589653 的
+    R12–R17），PK590301/590392 里则是"每回合换一种失败法"（InvalidURL / cat 文件
+    不存在 / 全盘扫描超时）照样占满 7 个回合，任务分拿不到，这名劳动力也一起白搭。
 
     观察值必须是本回合或上一回合记下的（`sandbox_command` 排在 `decide` 之前
     调用时，看到的是上一回合那条），回合号对不上就当作没有观察，免得把别的
@@ -3036,7 +3092,11 @@ def _task_abandoned(turn: Turn) -> bool:
         return False
     if turn.round_no not in (watch.round_no, watch.round_no + 1):
         return False
-    return watch.repeats >= TASK_LOOP_LIMIT or watch.rounds >= TASK_TIMEOUT_ROUNDS
+    return (
+        watch.repeats >= TASK_LOOP_LIMIT
+        or watch.rounds >= TASK_TIMEOUT_ROUNDS
+        or watch.fails >= TASK_SANDBOX_RETRY
+    )
 
 
 def _task_llm_state(turn: Turn) -> dict[str, Any]:
@@ -3362,6 +3422,30 @@ def task_files():
     return named + others
 
 
+# 地址里允许出现的字符（RFC 3986 的 unreserved + 保留字，去掉了引号/反引号/圆括号
+# 这类在文档里常用来包裹地址的记号）。文档里的地址几乎总是被中文标点或者 markdown
+# 记号包着——"接口地址：http://localhost:8899）"、"`http://…/api`（注意鉴权）"
+# ——旧实现只 rstrip 掉结尾那几个字符，夹在地址中间的那些照样被带进 urlopen，
+# 结果抛 InvalidURL 而不是取到数（复盘 PK590392 里 R12/R13/R15/R17 四次取数失败
+# 都是 "[APIFAIL] http://localhost:8899） -> InvalidURL" 这个形态）。
+URL_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "-._~:/?#[]@!$&'*+,;=%"
+)
+
+
+def clean_url(raw):
+    """把抓到的地址在第一个非法字符处截断（剥离 markdown/中文标点残留）
+
+    只截断不删除：地址后面的说明文字一律丢掉，而不是把非法字符抠掉再拼起来
+    ——抠掉会让 "http://localhost:8899）:8080" 变成另一个看似合法的地址。
+    """
+    for index, char in enumerate(raw):
+        if char not in URL_CHARS:
+            return raw[:index].rstrip(".,;:!?")
+    return raw.rstrip(".,;:!?")
+
+
 def endpoints(doc_text):
     """接口文档里的调用样例：本地接口优先，其次才是文档里抓到的其他地址
 
@@ -3370,10 +3454,13 @@ def endpoints(doc_text):
     MAX_CALLS 被这些在无网沙盒里调不通的地址耗光，真正能取数的本地接口
     一次都没被请求到，答案区永远是空的——三场复盘里"沙盒执行了（exitCode:0）
     却拿不到答案"就是这么来的。
+
+    抓到的地址要先过 clean_url：文档里的地址后面常跟着中文标点或 markdown
+    记号，不剥离就是一条调不通的地址（见 URL_CHARS）。
     """
     urls = []
     for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
-        raw = raw.strip().strip("\\"'").rstrip(".,;:!?、。）])")
+        raw = clean_url(raw.strip())
         if raw and raw not in urls:
             urls.append(raw)
     local = [url for url in urls if "localhost" in url or "127.0.0.1" in url]

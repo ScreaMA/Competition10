@@ -3820,3 +3820,198 @@ def test_day_plan_makes_room_for_selling_when_backpack_full(
     assert len(_day_plan(loaded, stone_loaded).queue) <= len(
         _day_plan(empty, stone_empty).queue
     )
+
+
+# === issue #56：沙盒连败熔断 / 地址残留字符 / 闲置角色变现（PK590301/590392） ===
+
+
+def _executor_helpers() -> dict:
+    """把沙盒执行器的函数定义单独 exec 出来（不含末尾的取数驱动代码）
+
+    执行器是拼进沙盒命令的一段脚本（`TASK_EXECUTOR`），它的地址清洗逻辑只能
+    这样拿出来单测：后半段的驱动代码会真的去 walk 本地磁盘并请求接口，不能
+    跟着一起执行。
+    """
+    head, sep, _ = brain.TASK_EXECUTOR.partition("\nfiles = task_files()")
+    assert sep, "执行器脚本结构变了：找不到驱动段的起点"
+    namespace: dict = {
+        "__TASK_PATH__": "",
+        "__BASE__": brain.TASK_API_DEFAULT,
+        "__TIMEOUT__": brain.TASK_API_TIMEOUT,
+        "__MAX_CALLS__": brain.TASK_API_MAX_CALLS,
+        "__TIME_BUDGET__": brain.TASK_API_TIME_BUDGET,
+        "__DIR_BUDGET__": brain.TASK_EXEC_DIR_BUDGET,
+        "__QUERY_MAX__": brain.TASK_API_QUERY_MAX,
+        "__BODY_LIMIT__": brain.TASK_API_BODY_LIMIT,
+        "__SOLVE_MAX__": brain.TASK_SOLVE_MAX,
+        "__DOC_NAMES__": brain.TASK_API_DOC_NAMES,
+        "__SUFFIXES__": brain.TASK_API_PATH_SUFFIXES,
+        "__PRUNE__": brain.TASK_EXEC_PRUNE,
+        "__SOLUTION__": brain.TASK_SOLUTION_MARKER,
+        "__SOLUTION_END__": brain.TASK_SOLUTION_END,
+        "__DATA__": brain.TASK_DATA_MARKER,
+        "__FAIL__": brain.TASK_API_FAIL_MARKER,
+        "__SCAN__": brain.TASK_SCAN_MARKER,
+    }
+    exec(head, namespace)  # noqa: S102 - 被测对象本身就是一段沙盒脚本
+    return namespace
+
+
+def test_task_executor_strips_markdown_residue_from_urls():
+    """文档里的地址夹着中文标点/markdown 记号时先剥干净，不把残留拼进请求
+
+    回归：PK590392 的 R12/R13/R15/R17 四次取数失败都是
+    "[APIFAIL] http://localhost:8899） -> InvalidURL"——旧实现只 rstrip 掉结尾
+    那几个字符，夹在地址中间的标点照样被带进 urlopen，一整个回合就白跑了。
+    """
+    helpers = _executor_helpers()
+
+    # 结尾的中文括号（复盘里的原形态）
+    assert helpers["clean_url"]("http://localhost:8899）") == "http://localhost:8899"
+    # 地址后面直接跟着说明文字 / markdown 反引号：在第一个非法字符处截断
+    assert helpers["clean_url"](
+        "http://localhost:8899/api`（注意鉴权）"
+    ) == "http://localhost:8899/api"
+    # 正常地址原样保留（含查询串里的合法标点）
+    assert helpers["clean_url"](
+        "http://localhost:8899/api?city=beijing&n=1"
+    ) == "http://localhost:8899/api?city=beijing&n=1"
+
+    # 本地接口仍然排在文档里抓到的外链之前，且列出来的都是干净地址
+    picked = helpers["endpoints"](
+        "接口地址：http://localhost:8899）\n参考 https://example.com/docs（外网）\n"
+    )
+    assert picked[0] == "http://localhost:8899"
+    for url in picked:
+        assert "（" not in url and "）" not in url and "`" not in url
+
+
+def test_task_failure_only_counts_explicit_sandbox_errors():
+    """只有明确的取数失败才算一次失败：探测轮次与已取到数的输出都不算
+
+    判据放宽会让任务在正常推进中被误判放弃（第一次下发命令总要先探测一轮），
+    判据收紧则回到"每回合换一种失败法却一次都不熔断"的老问题。
+    """
+    assert brain._task_failed("[APIFAIL] http://localhost:8899） InvalidURL") is True
+    assert brain._task_failed("cat: task_1_beijing.md: No such file") is True
+    assert brain._task_failed("[TIMEOUT]") is True
+    # 任务文件回读、探测输出都带不出失败标记
+    assert brain._task_failed("# 自进化任务 A-1：查询北京文化遗产") is False
+    # 这一回合取到过数：后面的失败留着下回合再算
+    assert brain._task_failed(
+        "[API] http://localhost:8899 => 42\n[APIFAIL] http://x"
+    ) is False
+    # 没有输出（命令还没下发/输出不属于本任务）不算失败
+    assert brain._task_failed("") is False
+
+
+def test_task_sandbox_retry_releases_pioneer_after_repeated_failures(
+    payload_factory, role_factory,
+):
+    """沙盒每回合换一种失败法时也要熔断：连败到线就放弃任务、开拓者回防
+
+    回归：PK590301/590392 里沙盒 R12 全盘扫描超时、R13/R15 扫到系统文档
+    （uom-se README）、R14 cat 文件不存在、R17 InvalidURL——输出每回合都不一样，
+    "同一份输出连续出现 TASK_LOOP_LIMIT 次"的熔断一次都没触发，开拓者被白占
+    7 个回合，任务分与这名劳动力一起丢掉。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    weapon = Pos(9, 24)
+    failures = (
+        "[APIFAIL] http://localhost:8899） InvalidURL",
+        "cat: task_1_beijing.md: No such file or directory",
+        "[TIMEOUT]",
+    )
+
+    # 还没到止损线：继续守在任务点旁等答案，沙盒命令照发
+    for offset in range(brain.TASK_SANDBOX_RETRY - 1):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        payload["lastCmdResult"] = _sandbox_result(phase_task, failures[offset])
+        commands, _ = decide(payload)
+        command = commands.get("10011")
+        assert command is None or command["action"] in ("move", "collect")
+        assert sandbox_command(payload) != ""
+
+    # 第 TASK_SANDBOX_RETRY 次连着失败：放弃任务，开拓者回基地跟队
+    payload = _stuck_task_payload(
+        payload_factory, role_factory, phase_task,
+        11 + brain.TASK_SANDBOX_RETRY - 1,
+    )
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task, "[APIFAIL] 又一次取数失败",
+    )
+    commands, _ = decide(payload)
+    assert sandbox_command(payload) == ""
+    assert commands["10011"]["action"] == "move"
+    step = Pos(
+        commands["10011"]["targetPos"][0]["x"],
+        commands["10011"]["targetPos"][0]["y"],
+    )
+    assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+
+
+def test_idle_gather_stops_sparing_pioneer_once_task_is_abandoned(
+    payload_factory, role_factory,
+):
+    """任务被放弃后开拓者不再被"任务进行中"豁免：兜底把它派去采一铲矿
+
+    回归：PK590301/590392 里开拓者 R11–R18 一条指令都没有、idle_man 一路涨到 3；
+    看门狗放弃任务后它已经回到战斗调度（`_pioneer_day_logic` 第 0 步），这时
+    继续按"任务进行中"跳过兜底只会让它整回合空转（S3）。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=20,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 10, 24, backPackCapability=40)],
+        tasks=[(14, 14)],
+        zones=[(STONE_MINE, 10, 25)],
+        phase_task=phase_task,
+    )
+    turn = Turn.load(payload)
+    pioneer = turn.pioneers()[0]
+    token = _task_token(phase_task)
+
+    # 任务还活着：开拓者不能被兜底支走（离开任务点周围一格会强制结束任务）
+    brain._TASK_WATCH = brain.TaskWatch(token, turn.round_no, "", 1, 0, 0)
+    commands: dict = {}
+    brain._idle_gather(turn, pioneer, set(), commands)
+    assert "10011" not in commands
+
+    # 任务已被看门狗放弃：兜底接管，开拓者去采身旁那一铲矿
+    brain._TASK_WATCH = brain.TaskWatch(
+        token, turn.round_no, "", 4, 0, brain.TASK_SANDBOX_RETRY,
+    )
+    commands = {}
+    brain._idle_gather(turn, pioneer, set(), commands)
+    assert commands["10011"] == {
+        "action": "collect",
+        "targetPos": [{"x": 10, "y": 25}],
+    }
+
+
+def test_idle_pioneer_sells_ore_instead_of_standing_still(
+    payload_factory, role_factory,
+):
+    """一铲矿都采不了时，闲置角色把手里的矿石变现，而不是整回合零指令（S3）
+
+    回归：PK590301/590392 里 gold 从 R8 恒 0 到 R18（连续 11 个回合）、idle_man
+    一直挂着 3，背包里却躺着可卖的矿石——采集分支走不通时矿石没有任何出口。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        station=(20, 20),
+        roles=[
+            role_factory(
+                10011, PIONEER, 10, 24,
+                backPackCapability=1, backpack=[IRON_MINE],
+            ),
+        ],
+        zones=[(VENDOR, 10, 25)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {"action": "sell", "name": IRON_MINE, "num": 1}
