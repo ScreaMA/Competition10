@@ -1848,6 +1848,33 @@ def test_task_error_body_matches_only_error_shapes():
         assert not brain._task_error_body(text), text
 
 
+def test_task_error_body_matches_broken_script_output():
+    """脚本跑不起来时的 stderr 同样不能当答案交上去（S1：PK591009 的 R14）
+
+    LLM 给的命令调沙盒里的脚本时，脚本自己有毛病的话输出里一行取数结果都没有：
+    CRLF 的 shebang（`bad interpreter`）、脚本不在（`sh: 1: ./check: not found`）、
+    引号不配对（`unexpected EOF while looking for matching`）。这些被当成"取到的
+    数"交上去的话，Judge 判 0 分，还白烧一次提交额度（见 `TASK_SUBMIT_LIMIT`）。
+    """
+    bad = (
+        "/bin/sh^M: bad interpreter: No such file or directory",
+        "sh: 1: ./check: not found",
+        "dash: 3: ./check.sh: not found",
+        "bash: -c: line 1: unexpected EOF while looking for matching",
+        "bash: /tmp/check.sh: cannot execute binary file: Exec format error",
+    )
+    good = (
+        "故宫博物院",
+        '{"city": "北京", "weather": "晴"}',
+        "not found 是英文里的否定说法",
+        "第 3 页写着 not found 的来历",
+    )
+    for text in bad:
+        assert brain._task_error_body(text), text
+    for text in good:
+        assert not brain._task_error_body(text), text
+
+
 def test_cached_error_body_is_not_submitted(payload_factory, role_factory):
     """缓存里那条"答案"是错误体时同样不能交（提交闸门不能只拦一条路）
 
@@ -3817,6 +3844,75 @@ def test_shell_command_check_rejects_unbalanced_quotes_only():
     assert not brain._shell_command_ok("grep -o 'x task.md")
     assert not brain._shell_command_ok("echo a\necho b")
     assert not brain._shell_command_ok("")
+
+
+def test_script_in_command_finds_the_script_not_its_arguments():
+    """`_script_in_command` 认的是"要跑的脚本"，不是解释器/参数/地址（S1）"""
+    assert brain._script_in_command("./check") == "./check"
+    assert brain._script_in_command("sh ./check --round 3") == "./check"
+    assert brain._script_in_command("/bin/sh ./check") == "./check"
+    assert (
+        brain._script_in_command("sudo bash /tmp/selfEvolutionTask/1-x/check.sh")
+        == "/tmp/selfEvolutionTask/1-x/check.sh"
+    )
+    # 不是"跑脚本"的命令一律返回空串：地址、数据文件、解释器自己的路径
+    for command in (
+        "curl -s http://localhost:8899/weather?city=beijing",
+        "grep -o 'x' ./task.md",
+        "cat ./task_1_beijing.md",
+        "/bin/cat /etc/hostname",
+        "/usr/bin/python3 -c 'print(1)'",
+        "bash -c 'cat ./task.md'",
+        "",
+    ):
+        assert brain._script_in_command(command) == "", command
+
+
+def test_crlf_safe_command_normalizes_the_script_it_runs():
+    """跑脚本的命令带上行尾归一化（S1：./check 的 CRLF 坏解释器）
+
+    CRLF 的脚本会让内核把 `\r` 一起读进 shebang，命令只换来一行
+    `/bin/sh^M: bad interpreter`（复盘 PK591009 的 R14），一个任务回合白搭。
+    归一化排在脚本调用之前，并且先判存在——LLM 猜的路径未必真有那个文件。
+    """
+    wrapped = brain._crlf_safe_command("./check")
+    assert wrapped.endswith("./check")  # 归一化在前，原命令照原样跑
+    assert '[ -f "$CRLF_P" ]' in wrapped  # 脚本不在时原命令照跑
+    assert "sed -i" in wrapped
+    assert wrapped.index("CRLF_P='./check'") < wrapped.index("sed -i")
+
+
+def test_crlf_safe_command_leaves_other_commands_alone():
+    """不是"跑脚本"的命令原样下发（取数命令不能被动过）"""
+    for command in (
+        "curl -s http://localhost:8899/weather?city=beijing",
+        "grep -o 'x' ./task.md",
+        "cat ./task_1_beijing.md",
+        "/bin/cat /etc/hostname",
+        "/usr/bin/python3 -c 'print(1)'",
+        "bash -c 'cat ./task.md'",
+        "",
+    ):
+        assert brain._crlf_safe_command(command) == command, command
+
+
+def test_llm_check_command_reaches_sandbox_with_crlf_fix(
+    payload_factory, role_factory,
+):
+    """LLM 给的 `./check` 下发时先做行尾归一化（S1）"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: ./check"
+    decide(payload)
+
+    command = sandbox_command(payload)
+    assert "./check" in command
+    assert "sed -i" in command  # 先归一化行尾再跑脚本
+    assert command.index("CRLF_P='./check'") < command.index("sed -i")
+    assert brain.TASK_MARKER in command  # 包装过，答案区能对上当前任务
 
 
 def test_llm_command_with_unbalanced_quote_falls_back_to_executor(
