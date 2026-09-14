@@ -24,6 +24,7 @@ from agent.brain import (
     decide,
     sandbox_command,
 )
+from agent.grid import get_neighbors
 from agent.protocol import (
     CHALLENGER_TASK_1,
     COPPER_MINE,
@@ -141,6 +142,88 @@ def test_decide_day_builds_weapon(payload_factory, role_factory):
         "targetPos": [{"x": 12, "y": 23}],
         "name": GATLING,
     }
+
+
+def test_workers_take_different_tower_sites(payload_factory, role_factory):
+    """多名工人分头施工：塔位一经认领，后面的工人改去下一座
+
+    回归：以前只有"真正把塔建起来"才会占用 claimed，于是两个工人会一起奔向
+    同一座塔，另一个塔位整局没人管（对战复盘里"金币闲置、武器只建成一座"
+    就是这个现象）。
+    """
+    before = Pos(15, 30)
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST * 3,
+        roles=[
+            role_factory(10010, WORKER, before.x, before.y, backPackCapability=100),
+            role_factory(10012, WORKER, 11, 22, backPackCapability=100),
+        ],
+    )
+    commands, _ = decide(payload)
+
+    # 第一个工人离得远，认领第1座塔位(12,23)并向它移动
+    command = commands["10010"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    assert distance(step, Pos(12, 23)) < distance(before, Pos(12, 23))
+    # 第二个工人已经站在第2座塔位(10,22)旁边，直接开工而不是跟着挤第1座
+    assert commands["10012"] == {
+        "action": "build",
+        "targetPos": [{"x": 10, "y": 22}],
+        "name": RAILGUN,
+    }
+
+
+def test_worker_retries_next_site_after_failed_action(
+    payload_factory, role_factory,
+):
+    """上一回合动作失败时换一座塔重试，不再原地重复同一条失败指令"""
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST * 3,
+        roles=[role_factory(10010, WORKER, 11, 22, backPackCapability=100)],
+    )
+
+    # 正常情况：就站在第1座塔位(12,23)旁，直接建造
+    commands, _ = decide(payload)
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 12, "y": 23}],
+        "name": GATLING,
+    }
+
+    # 上一回合被判为失败（目标点被夺取等）：换第2座塔位(10,22)重试
+    payload["lastRoundRoleActionResults"] = {"10010": False}
+    commands, _ = decide(payload)
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 10, "y": 22}],
+        "name": RAILGUN,
+    }
+
+    # 只剩一座塔位可建时不换位，否则只会白白空转
+    payload["teamOur"]["roles"] += [
+        role_factory(10020, RAILGUN, 10, 22, attackRange=6),
+        role_factory(10030, ROCKET, 9, 23, attackRange=10),
+    ]
+    commands, _ = decide(payload)
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 12, "y": 23}],
+        "name": GATLING,
+    }
+
+
+def test_action_failed_reads_last_round_results(payload_factory):
+    """上一回合的动作结果按角色ID解析，报文没给的角色视为成功"""
+    payload = payload_factory()
+    payload["lastRoundRoleActionResults"] = {"10010": False, "10012": True}
+    turn = Turn.load(payload)
+
+    assert turn.action_failed(10010) is True
+    assert turn.action_failed(10012) is False
+    assert turn.action_failed(99999) is False
 
 
 def test_decide_day_collects_stone(payload_factory, role_factory):
@@ -550,6 +633,38 @@ def test_pioneer_prefers_task_closer_to_timeout(payload_factory, role_factory):
     assert command["action"] == "move"
     step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
     assert distance(step, Pos(10, 28)) < distance(before, Pos(10, 28))
+
+
+def test_pioneer_falls_back_to_next_task_when_one_is_unreachable(
+    payload_factory, role_factory,
+):
+    """最优先的任务点被完全挡住时，开拓者退而去领另一个任务点
+
+    回归：以前只试最优先的那个任务点，走不通就整回合放弃任务去跟随武器塔，
+    160分+160金币的两个任务点会一起过期。
+    """
+    before = Pos(20, 20)
+    blocked_task = Pos(30, 28)
+    reachable_task = Pos(14, 14)
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40)],
+        # 任务点周围一格全是矿区（不可通行的中立元素），开拓者无法靠近领取
+        zones=[(COPPER_MINE, pos.x, pos.y) for pos in get_neighbors(blocked_task)],
+        tasks=[
+            (blocked_task.x, blocked_task.y, {"timeoutRounds": 3}),
+            (reachable_task.x, reachable_task.y, {"timeoutRounds": 30}),
+        ],
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10011"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    # 走向另一个可接的任务点，而不是干等被挡住的这个任务点过期
+    assert step.x < before.x  # 朝任务点(14,14)所在方向移动
+    assert distance(step, blocked_task) >= distance(before, blocked_task)
 
 
 def test_pioneer_waits_near_task_point_when_on_cooldown(

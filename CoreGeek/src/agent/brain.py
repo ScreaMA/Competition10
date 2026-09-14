@@ -211,6 +211,9 @@ def _worker_day_logic(
     任何分支最后都会落到"采集/交易"上，保证工人每回合都有产出，
     不会出现整回合没有任何指令的空转。
 
+    建造位一旦认领（`claimed`）就归该工人：多个工人会分头去建不同的塔/
+    围墙段，而不是几个人同时奔着同一个位置去，白走一趟还互相挡路。
+
     参数:
         turn: 当前回合信息
         worker: 当前决策的工人
@@ -222,11 +225,25 @@ def _worker_day_logic(
     """
     # 优先建造武器
     if towers_missing and turn.gold >= WEAPON_BUILD_COST:
-        for index, site in enumerate(tower_sites):
-            if site in towers_missing and site not in claimed:
+        # 就近认领: 每个工人挑离自己最近的那座塔，两个工人自然分头开工，
+        # 而不是都盯着建造顺序表里的第一座（都挤过去的结果是另一座塔整局没人管）
+        picks = sorted(
+            (
+                (distance(worker.pos, site), index, site)
+                for index, site in enumerate(tower_sites)
+                if site in towers_missing and site not in claimed
+            ),
+            key=lambda pick: pick[:2],
+        )
+        picks = _retry_sites(turn, worker, picks)
+        if picks:
+            for _, index, site in picks:
                 weapon_type = TOWER_LOADOUT[index % len(TOWER_LOADOUT)]
-                _build_or_walk(turn, worker, site, weapon_type, claimed, commands)
-                return
+                if _build_or_walk(turn, worker, site, weapon_type, claimed, commands):
+                    # 认领建造位: 其他工人改去下一座塔,不会几个人挤在同一个位置上
+                    claimed.add(site)
+                    return
+            return
 
     # 围墙已建完: 把富余资源换成战力（武器升级 > 卖矿换金币）
     if not walls_missing:
@@ -250,15 +267,41 @@ def _worker_day_logic(
 
     # 如果有石头,去建造围墙（位置都被其他角色占住时继续往下走,别空转）
     if stones > 0:
-        for site in walls_missing:
-            if site not in claimed:
-                _build_or_walk(turn, worker, site, WALL, claimed, commands)
-                return
+        sites = _retry_sites(
+            turn, worker, [site for site in walls_missing if site not in claimed],
+        )
+        if sites:
+            _build_or_walk(turn, worker, sites[0], WALL, claimed, commands)
+            return
 
     # 没石头(或暂时没位置建): 就近采矿; 采不到就把背包里的矿石卖掉腾地方
     if _gather_logic(turn, worker, claimed, commands):
         return
     _trade_logic(turn, worker, claimed, commands)
+
+
+def _retry_sites(
+    turn: Turn,
+    unit: Unit,
+    candidates: list[Any],
+) -> list[Any]:
+    """上一回合的动作失败时跳过第一个候选,换一处重试
+
+    任务书4.5.4节的碰撞规则下,移动/建造会因为"目标点被夺取"而失败;
+    下一回合原地重复同一条指令往往还是失败,换一个建造位重试才能把建造
+    推进下去。
+
+    参数:
+        turn: 当前回合信息
+        unit: 当前决策的单位
+        candidates: 按优先级排序的候选建造位
+
+    返回:
+        本回合实际可用的候选列表；上一回合没失败时原样返回
+    """
+    if len(candidates) > 1 and turn.action_failed(unit.unit_id):
+        return candidates[1:]
+    return candidates
 
 
 def _pioneer_day_logic(
@@ -280,7 +323,8 @@ def _pioneer_day_logic(
         - 自进化类任务需在沙盒中取数后作答，答案经 `submitAnswer` 提交
 
     任务点的选择是"临期优先、其次就近"：单个任务只有 15 回合时限，
-    先去快过期的那个才能把两个任务的分数都拿到手。
+    先去快过期的那个才能把两个任务的分数都拿到手。两个任务点会按这个
+    顺序依次尝试，最优先的那个走不通时退而先去下一个，不会整局放弃任务。
 
     参数:
         turn: 当前回合信息
@@ -305,17 +349,20 @@ def _pioneer_day_logic(
                 commands[pioneer.unit_id] = submit_answer_command(answer)
             return
 
-    # 2. 有可接取的任务: 前往任务点并领取
+    # 2. 有可接取的任务: 按优先级依次尝试领取
+    # 之前的实现只试最优先的那个任务点：那一格被挡住/绕不过去时开拓者就整回合
+    # 放弃任务、跑去跟随武器塔，两个任务点（合计160分+160金币）都会白白过期。
     valid_tasks = [task for task in turn.player_tasks if task.is_valid]
     if valid_tasks:
-        target_task = min(valid_tasks, key=lambda task: (
+        ordered = sorted(valid_tasks, key=lambda task: (
             task.timeout_rounds if task.timeout_rounds > 0 else TASK_TIMEOUT_UNKNOWN,
             distance(pioneer.pos, task.task_position),
             task.task_position.x,
             task.task_position.y,
         ))
-        if _head_to_task(turn, pioneer, target_task.task_position, claimed, commands):
-            return
+        for task in ordered:
+            if _head_to_task(turn, pioneer, task.task_position, claimed, commands):
+                return
 
     # 3. 任务点都在冷却中: 冷却快结束时提前到任务点旁待命，任务一开放就能接
     elif _rounds_until_task(turn) <= TASK_WAIT_ROUNDS:
@@ -841,18 +888,25 @@ def _build_or_walk(
     building_type: str,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
-) -> None:
-    """如果在建造位置旁边则建造,否则向目标移动"""
+) -> bool:
+    """如果在建造位置旁边则建造,否则向目标移动
+
+    返回:
+        True 表示本回合已下达指令（建造或移动）；False 表示无路可走，
+        调用方应把建造位留给其他角色而不是空占着
+    """
     # 已经在目标旁边(但不是目标本身),执行建造
     if unit.pos != target and distance(unit.pos, target) <= 1:
         commands[unit.unit_id] = build_command(target, building_type)
         claimed.add(target)
-        return
+        return True
 
     # 否则向目标移动
     step = _step_toward(turn, unit, target, claimed)
     if step is not None:
         commands[unit.unit_id] = move_command(step)
+        return True
+    return False
 
 
 def _step_toward(
