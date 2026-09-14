@@ -3542,10 +3542,18 @@ def refine_url(raw):
     文档是中文的，地址常写在句子中间或反引号里，尾随的全角标点、引号会让
     urllib 直接抛 `InvalidURL`——复盘 #67 里 R12–R17 连续 6 回合
     `APIFAIL ... ），API InvalidURL`（URL 含反引号+中文）就是这么来的，
-    任务因此 8 个回合读不到题面、最终 0 分。这里做两件事：
+    任务因此 8 个回合读不到题面、最终 0 分。这里做三件事：
 
     1. 剥掉两端的标点/引号/括号（含全角）
     2. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
+    3. 主机名不是纯 ASCII、或者端口不是数字时整条丢掉（返回空串）
+
+    第 3 条是复盘 #76 补的：正文紧跟地址时（`` http://localhost:8899`），API
+    返回 ``），正则会把 `），API` 一起吞进 netloc，而 `urlsplit` 对端口是惰性
+    校验（这里不抛），旧实现原样返回，直到 urlopen 才抛 InvalidURL——R12–R17
+    连续 6 回合 `[APIFAIL] ... InvalidURL` 就是这么来的。脏地址里还带着
+    "localhost"，`endpoints` 因此把它当成本地接口、连 BASE 都不再试。丢掉之后
+    调用方退回 BASE，取数照常。
     """
     text = raw.strip()
     trim = "`'\\\"、，。；：？！,.;:!?)]}>（）【】《》“”‘’"
@@ -3561,6 +3569,17 @@ def refine_url(raw):
         return ""
     if not parts.scheme or not parts.netloc:
         return ""
+    # 主机名只可能是 ASCII（中文域名要先转 punycode），混进中文/全角标点说明
+    # 地址后面粘着正文，整条丢掉比带着脏主机名去请求强。判 ASCII 用 encode
+    # 而不是 str.isascii：沙盒里的 python 版本不可控，encode 哪个版本都有
+    try:
+        parts.netloc.encode("ascii")
+    except UnicodeEncodeError:
+        return ""
+    try:
+        parts.port  # 取值即校验：端口不是数字时 urlopen 才抛 InvalidURL
+    except ValueError:
+        return ""
     path = urllib.parse.quote(parts.path, safe="/%:@&=+$,-_.!~*'()")
     query = urllib.parse.quote(parts.query, safe="=&%:@+$,-_.!~*'()")
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
@@ -3574,9 +3593,13 @@ def endpoints(doc_text):
     MAX_CALLS 被这些在无网沙盒里调不通的地址耗光，真正能取数的本地接口
     一次都没被请求到，答案区永远是空的——三场复盘里"沙盒执行了（exitCode:0）
     却拿不到答案"就是这么来的。
+
+    抓地址时遇到反引号与全角标点就断（它们只可能是包住地址的标点、不会是
+    地址的一部分）：正文紧跟地址的写法（`http://localhost:8899`），API 返回）
+    下，旧正则会把 `），API` 一起吞进去，地址整个作废（见 `refine_url`）。
     """
     urls = []
-    for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
+    for raw in re.findall(r"https?://[^\\s<>)\\]}`），。、；：”’]+", doc_text):
         raw = refine_url(raw)
         if raw and raw not in urls:
             urls.append(raw)

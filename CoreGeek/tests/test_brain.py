@@ -4087,3 +4087,39 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+def test_executor_drops_url_with_prose_stuck_to_netloc():
+    """正文粘在地址后面时整条丢掉，退回本地接口（#76）
+
+    回归：接口文档是中文的，正文紧跟地址的写法（`` `http://localhost:8899`），
+    API 返回 ``）下，抓地址的正则会把 `），API` 一起吞进 netloc。旧 `refine_url`
+    只剥两端的标点，中间这一段原样放行，而 `urlsplit` 的端口是惰性校验（这里
+    不抛），直到 urlopen 才抛 InvalidURL——R12–R17 连续 6 回合
+    `[APIFAIL] http://localhost:8899`），API InvalidURL`，任务因此 8 个回合读不到
+    题面。脏地址里还带着 "localhost"，`endpoints` 连 BASE 都不再试。
+    """
+    script = _task_executor("task_1_beijing.md").split("\n", 1)[1]
+    refine = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
+    endpoints = re.search(r"def endpoints\(doc_text\):.*?(?=\ndef )", script, re.S)
+    assert refine and endpoints
+    namespace: dict = {}
+    exec(  # noqa: S102
+        'import re\nimport urllib.parse\nBASE = "http://localhost:8899"\n'
+        + refine.group(0) + endpoints.group(0),
+        namespace,
+    )
+    refine_url = namespace["refine_url"]
+
+    # 主机名里混进中文/全角标点：urlopen 会抛 InvalidURL，整条丢掉
+    assert refine_url("http://localhost:8899`），API") == ""
+    # 端口后面粘的是 ASCII 正文：urlopen 会抛 nonnumeric port，同样丢掉
+    assert refine_url("http://localhost:8899abc") == ""
+    # 丢掉之后不能连累干净的地址：文档里规规矩矩写的那条照常可用
+    assert refine_url("http://localhost:8899/api") == "http://localhost:8899/api"
+
+    # 抓地址时在反引号/中文标点处就断：包在反引号里的地址照常可用，
+    # 本地接口因此仍排在 BASE 那一档，取数不必等下一次沙盒执行
+    assert namespace["endpoints"]("调用 `http://localhost:8899`），API 返回") == [
+        "http://localhost:8899"
+    ]
