@@ -38,9 +38,12 @@ from agent.brain import (
     TASK_FILE_MARKER,
     TASK_LOOP_LIMIT,
     TASK_MARKER,
+    TASK_PROBE_LIMIT,
     TASK_PROBE_MARKER,
+    TASK_ROOTS,
     TASK_SOLUTION_END,
     TASK_SOLUTION_MARKER,
+    TASK_SUBMIT_LIMIT,
     TASK_TIMEOUT,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
@@ -3820,3 +3823,183 @@ def test_day_plan_makes_room_for_selling_when_backpack_full(
     assert len(_day_plan(loaded, stone_loaded).queue) <= len(
         _day_plan(empty, stone_empty).queue
     )
+
+
+# === issue #46：任务提交内容 / 沙盒探测收敛（PK590243 / PK590252） ===
+
+
+def test_task_answer_never_submits_a_file_path(payload_factory, role_factory):
+    """答案区里只有一条文件路径时绝不提交（PK590252 的 R17 交的就是路径）
+
+    回归：开拓者找到了任务文件，却把
+    "/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md"
+    当成答案交了上去（`submitAnswer <路径>`），Judge 判 0 分、R18/R19 的 phase
+    一直没清除，任务 2 也跟着连锁未接。同一个局面下换成真正的取数结果照样交卷
+    ——路径闸门不会误伤正常答案。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    brain._TASK_LLM_STATE.clear()  # 上一个用例留下的 LLM 答案不参与本用例
+    payload = _stuck_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task,
+        "task_1_beijing.md",
+        "/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md",
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 路径不是答案：沙盒命令照旧下发，下一回合重新取数
+    assert sandbox_command(payload) != ""
+
+    # 取数取回来的才是答案：同一个局面下换成真正的取数结果照样交卷
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": '{"city": "北京", "count": 7}',
+    }
+
+
+def test_llm_answer_is_not_submitted_when_it_is_a_path(
+    payload_factory, role_factory,
+):
+    """LLM 回的 ANSWER 是一条文件路径时同样不提交（S1 的兜底闸门）
+
+    复盘里 R17 那次提交与前几场的"提交任务原文"是同一类错误：交上去的东西
+    不是沙盒里取到的答案。LLM 直接给答案这条路也走同一道闸门。
+    """
+    phase_task = "请阅读沙盒里的任务说明并作答"
+    brain._TASK_LLM_STATE.clear()  # 上一个用例留下的 LLM 答案不参与本用例
+    payload = payload_factory(
+        round_no=11,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["llmResp"] = (
+        "ANSWER: /tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md"
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+
+
+def test_task_stops_submitting_after_limit(payload_factory, role_factory):
+    """同一份答案交满 TASK_SUBMIT_LIMIT 次仍没被放行时止损，开拓者回基地
+
+    回归：PK590252 的 R17 交上文件路径之后，R18/R19 开拓者仍被这个任务占着
+    （phase 一直没清除）。错答案再交第三遍同样放行不了，早点把开拓者还给
+    战斗调度，比让它在任务点上耗到任务时限（`TASK_TIMEOUT_ROUNDS`）划算。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    weapon = Pos(9, 24)
+    brain._TASK_LLM_STATE.clear()  # 上一个用例留下的 LLM 答案不参与本用例
+    # 沙盒里早就解出过这份任务：每一回合手里都有能交的答案
+    brain._TASK_ANSWER_CACHE["task_1_beijing.md"] = '{"city": "北京", "count": 7}'
+
+    for offset in range(TASK_SUBMIT_LIMIT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        # 每回合的沙盒输出都不一样：这里走的是提交闸门，不是读文件死循环
+        # （同一份输出连着出现 `TASK_LOOP_LIMIT` 次会先触发读文件熔断）
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task, f"第 {offset} 次搜索，仍无任务文件\n",
+        )
+        commands, _ = decide(payload)
+        assert commands["10011"] == {
+            "action": "submitAnswer",
+            "taskAnswer": '{"city": "北京", "count": 7}',
+        }
+
+    # 第 TASK_SUBMIT_LIMIT+1 个回合：不再交卷，开拓者回基地跟队
+    payload = _stuck_task_payload(
+        payload_factory, role_factory, phase_task, 11 + TASK_SUBMIT_LIMIT,
+    )
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task, f"第 {TASK_SUBMIT_LIMIT} 次搜索，仍无任务文件\n",
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"]["action"] == "move"
+    step = Pos(
+        commands["10011"]["targetPos"][0]["x"],
+        commands["10011"]["targetPos"][0]["y"],
+    )
+    assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+    assert sandbox_command(payload) == ""
+
+
+def test_sandbox_probe_stops_after_limit(payload_factory, role_factory):
+    """描述里没有文件名时最多探 TASK_PROBE_LIMIT 次，之后直接把任务根目录交给执行器
+
+    回归：PK590252 的 R12-R17 六个回合里沙盒反复扫根目录与系统 docs
+    （R13 整条命令 `[TIMEOUT]`、R14/R16 两次输出逐字相同），开拓者被占死到
+    日志结束。探测只是给执行器指路，认不出文件名时该由执行器自己去捞。
+    """
+    phase_task = "请阅读沙盒里的任务说明并作答"
+    brain._TASK_LLM_STATE.clear()  # 上一个用例留下的 LLM 答案不参与本用例
+    token = _task_token(phase_task)
+    # 探测回来的清单里一个任务文件都没有（只剩工作目录诊断）
+    empty_probe = (
+        f"[exitCode:0]\n{TASK_PROBE_MARKER}{token}\n"
+        f"pwd\n/\n{TASK_END_MARKER}\n"
+    )
+    probes = 0
+    final_command = ""
+    for offset in range(TASK_PROBE_LIMIT + 1):
+        payload = payload_factory(
+            round_no=11 + offset,
+            gold=0,
+            roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+            tasks=[(14, 14)],
+            phase_task=phase_task,
+        )
+        # 第一个回合还没有沙盒输出（命令刚下发），之后每回合都是空探测结果
+        payload["lastCmdResult"] = empty_probe if offset else ""
+        decide(payload)  # 先刷新看门狗，再要沙盒命令（服务器就是按这个顺序调的）
+        final_command = sandbox_command(payload)
+        if TASK_PROBE_MARKER in final_command:
+            probes += 1
+
+    assert probes == TASK_PROBE_LIMIT
+    # 用满次数后换成执行器：带上本任务标识，并把任务根目录交给它
+    assert TASK_PROBE_MARKER not in final_command
+    assert TASK_MARKER in final_command
+    assert TASK_ROOTS[0] in final_command
+
+
+def test_sandbox_searches_task_root_and_skips_system_docs(
+    payload_factory, role_factory,
+):
+    """找任务文件先扫任务根目录、系统文档树整段跳过（S2）
+
+    回归：PK590252 的 R14/R16 两次读回来的都是
+    /usr/share/doc/uom-se-1.0.4/README.md（与任务无关的库说明），照着它拼出来的
+    地址一次都没取到数；R13 的全盘 find 则直接把整条命令拖到 `[TIMEOUT]`。
+    """
+    brain._TASK_LLM_STATE.clear()  # 上一个用例留下的 LLM 答案不参与本用例
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task="请阅读task_1_beijing.md",
+    )
+    command = sandbox_command(payload)
+
+    # 回读任务文件：先扫任务根目录，那里没有才退到全盘
+    assert f"find {TASK_ROOTS[0]} " in command
+    assert 'if [ -z "$found" ]' in command
+    assert "find / " in command
+    # 系统文档树不扫：README 与 docbook 样式表都在这两棵树里
+    assert '-path "/usr/share/doc"' in command
+    assert '-path "/usr/share/sgml"' in command
+    # 执行器同样把任务根目录当主搜索路径、接口文档也不去系统文档树里捞
+    assert f"ROOTS = {TASK_ROOTS!r}" in command

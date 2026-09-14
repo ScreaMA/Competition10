@@ -32,16 +32,20 @@ def _build_task(task, task_factory):
 def _clear_task_answer_cache():
     """每个用例前后清空自进化任务的答案缓存与任务看门狗
 
-    `agent.brain._TASK_ANSWER_CACHE` 与 `agent.brain._TASK_WATCH` 都是模块级
-    状态（沙盒里读回来的任务答案、上一回合的任务观察值），跨用例残留会让
-    上一个用例的答案/观察值影响到下一个用例。
+    `agent.brain._TASK_ANSWER_CACHE`、`agent.brain._TASK_LLM_STATE` 与
+    `agent.brain._TASK_WATCH` 都是模块级状态（沙盒里读回来的任务答案、任务
+    期间向 LLM 求助拿到的命令/答案、上一回合的任务观察值），跨用例残留会让
+    上一个用例的答案/观察值影响到下一个用例——比如某个用例回了
+    `ANSWER: ...`，后面用同一份任务描述的用例就会拿它去交卷。
     """
     from agent import brain
 
     brain._TASK_ANSWER_CACHE.clear()
+    brain._TASK_LLM_STATE.clear()
     brain._TASK_WATCH = None
     yield
     brain._TASK_ANSWER_CACHE.clear()
+    brain._TASK_LLM_STATE.clear()
     brain._TASK_WATCH = None
 
 
