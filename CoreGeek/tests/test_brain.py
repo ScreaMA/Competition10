@@ -3268,6 +3268,35 @@ def test_task_answer_from_llm_command_output(payload_factory, role_factory):
     assert "晴" in commands["10011"]["taskAnswer"]
 
 
+def test_task_answer_ignores_shell_error_from_llm_command(
+    payload_factory, role_factory,
+):
+    """LLM 给的命令跑挂时，输出是 shell 报错不是答案（S2）
+
+    复盘 PK590835 的 R16 把 `jq: command not found` 当答案交了上去，Judge
+    判 0 分。这类输出既不重复任务原文、也不像文件路径，三道旧闸门都拦不住，
+    所以按 shell 错误特征单独拦一道：这一回合不提交，下一回合重试。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: cat task_1_beijing.md | jq .answer"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        evidence="jq: command not found",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+    # 日志上要能看出"是 LLM 那条命令跑挂了"，而不是又一次取不到数
+    assert "state=llm_cmd_rejected" in brain.task_brief(Turn.load(payload))
+
+
 def test_task_answer_from_llm_direct_answer(payload_factory, role_factory):
     """LLM 直接给答案时不必绕沙盒，下一回合就交卷"""
     brain._TASK_LLM_STATE.clear()
@@ -4087,3 +4116,29 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+def test_executor_refine_url_truncates_cjk_after_host():
+    """汉字紧跟在地址后面时，主机名截到汉字前（PK590835/PK590850 的 InvalidURL）
+
+    地址写在句子里时后面直接跟汉字（"本地接口是 http://localhost:8899 和它的
+    接口文档"），两端剥离够不着 netloc，中文留在主机名里 urlopen 照样抛
+    `InvalidURL`，沙盒连着几个回合 `[APIFAIL]`、任务题面一次都读不到。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]
+    match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
+    assert match
+    namespace: dict = {}
+    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    refine = namespace["refine_url"]
+
+    assert refine("http://localhost:8899）和它的接口文档") == (
+        "http://localhost:8899"
+    )
+    assert refine("http://localhost:8899）") == "http://localhost:8899"
+    # 端口、点分地址与 IPv6 字面量不能被截断
+    assert refine("http://127.0.0.1:8899/weather?city=beijing") == (
+        "http://127.0.0.1:8899/weather?city=beijing"
+    )
+    assert refine("http://[::1]:8899/weather") == "http://[::1]:8899/weather"

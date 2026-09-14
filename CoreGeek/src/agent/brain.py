@@ -509,8 +509,32 @@ class LlmPlan:
 
 LLM_PLAN_DEFAULT = LlmPlan()
 
-# 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
-TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
+# 沙盒命令自己跑挂时的输出特征（S2）：LLM 给的取数命令没跑起来时，它的输出
+# 就是一条 shell 报错，而这条报错既不重复任务原文、也不像文件路径，三道旧
+# 闸门一条都拦不住——复盘 PK590835 的 R16 把 `jq: command not found` 当成答案
+# 交了上去，Judge 判 0 分、任务分照样丢。这类输出按 shell 的错误特征单独拦：
+#   - `command not found` / `: not found`：命令不存在（bash 与 dash 两种写法）
+#   - `bad interpreter`：沙盒里的脚本是 CRLF 换行时 sh 的报错（PK590850 的 R14）
+#   - `Failed writing body` / `Could not resolve host`：curl 取数失败
+#   - `Traceback (most recent call last)`：python 取数脚本抛异常
+# 命中只表示"这一回合不提交"，下一回合照常重试沙盒命令或再问一次 LLM，
+# 不会因为一条坏命令就把整个任务判死。
+TASK_SHELL_ERROR_MARKERS = (
+    "command not found",
+    ": not found",
+    "bad interpreter",
+    "Failed writing body",
+    "Could not resolve host",
+    "Traceback (most recent call last)",
+)
+
+# 沙盒输出中的错误特征：命中说明任务文件没读到、或命令根本没跑起来，
+# 都不能当作答案提交
+TASK_ERROR_MARKERS = (
+    "No such file",
+    "Permission denied",
+    "Is a directory",
+) + TASK_SHELL_ERROR_MARKERS
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -3297,7 +3321,14 @@ def _llm_direct_answer(turn: Turn) -> str | None:
 
 
 def _llm_command_answer(turn: Turn, region: str) -> str | None:
-    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）"""
+    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）
+
+    这条路上的输出没有 `[API]` 取数证据可查（整条命令都是 LLM 写的），
+    所以三道闸门一个都不能少：长度、**shell 错误特征**（`TASK_ERROR_MARKERS`，
+    含 `command not found` 这类）与复读/文件路径判定。命令跑挂时它的输出
+    就是一条报错，交上去必然 0 分（复盘 PK590835 的 R16 交的正是
+    `jq: command not found`），这一回合宁可不交，等下一回合重试。
+    """
     if not turn.phase_task:
         return None
     state = _task_llm_state(turn)
@@ -3308,7 +3339,7 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
     if any(bad in answer for bad in TASK_ERROR_MARKERS):
-        return None
+        return None  # 命令没跑起来：输出是 shell 报错，不是答案（S2）
     if _task_echo(answer, turn.phase_task):
         return None
     if _task_path_answer(answer):
@@ -3542,11 +3573,20 @@ def refine_url(raw):
     文档是中文的，地址常写在句子中间或反引号里，尾随的全角标点、引号会让
     urllib 直接抛 `InvalidURL`——复盘 #67 里 R12–R17 连续 6 回合
     `APIFAIL ... ），API InvalidURL`（URL 含反引号+中文）就是这么来的，
-    任务因此 8 个回合读不到题面、最终 0 分。这里做两件事：
+    任务因此 8 个回合读不到题面、最终 0 分。这里做三件事：
 
     1. 剥掉两端的标点/引号/括号（含全角）
-    2. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
+    2. 主机名截到第一个非法字符（见下面的 `host_chars`）：地址后面直接跟
+       汉字时（"本地接口是 http://localhost:8899 和它的接口文档"），两端
+       剥离够不着 netloc，中文留在主机名里照样是 InvalidURL（PK590835/
+       PK590850 的 R12-R13 连着几回合 `[APIFAIL] ... InvalidURL` 就是这一种）
+    3. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
     """
+    # 主机名里允许出现的字符：字母/数字、`-._`、端口冒号、`[]`（IPv6）、
+    # `@`（userinfo）、`%`（百分号编码）。局部常量而非模块级：这段代码是从
+    # 执行器脚本里整段取出来单独跑的（见测试），少一个外部依赖少一处坑。
+    host_chars = ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                  "0123456789-._:%[]@")
     text = raw.strip()
     trim = "`'\\\"、，。；：？！,.;:!?)]}>（）【】《》“”‘’"
     while text and text[-1] in trim:
@@ -3561,9 +3601,16 @@ def refine_url(raw):
         return ""
     if not parts.scheme or not parts.netloc:
         return ""
+    host = parts.netloc
+    for index, char in enumerate(host):
+        if char not in host_chars:
+            host = host[:index]
+            break
+    if not host:
+        return ""
     path = urllib.parse.quote(parts.path, safe="/%:@&=+$,-_.!~*'()")
     query = urllib.parse.quote(parts.query, safe="=&%:@+$,-_.!~*'()")
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+    return urllib.parse.urlunsplit((parts.scheme, host, path, query, ""))
 
 
 def endpoints(doc_text):
@@ -3835,8 +3882,9 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
 
     复盘里"任务没交卷"只能靠人翻沙盒输出猜原因，这里把判定过程本身变成
     可解析的字段：`ok` / `llm_answer` / `no_marker`（本任务的沙盒输出还没到）/
-    `exit_nonzero`（命令失败）/ `no_api_data`（取不到数）/ `error_in_output` /
-    `short_or_missing` / `echo_task_text`（答案就是任务原文）/
+    `exit_nonzero`（命令失败）/ `no_api_data`（取不到数）/ `error_in_output`
+    （输出里带错误特征，含 shell 报错）/ `llm_cmd_rejected`（LLM 给的取数命令
+    输出不可用）/ `short_or_missing` / `echo_task_text`（答案就是任务原文）/
     `path_answer`（答案是一条文件路径）。
     """
     if not turn.phase_task:
@@ -3860,11 +3908,17 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     llm_output = _llm_command_answer(turn, region)
     if llm_output is not None:
         return llm_output, "llm_cmd_output"
+    if int(_task_llm_state(turn).get("cmd_round") or 0) == turn.round_no - 1:
+        # 上一回合跑的正是 LLM 给的命令，而它的输出没被采纳（命中错误特征 /
+        # 复读任务原文 / 是文件路径）：这一回合不提交，等下一回合重试（S2）
+        return None, "llm_cmd_rejected"
 
-    if TASK_DATA_MARKER not in region:
-        return None, "no_api_data"  # 没取到数据：沙盒里只有任务原文
+    # 错误特征排在取数证据前面：命令没跑起来（"command not found"）与
+    # 取不到数都会导致不提交，但日志上要能分清是哪一种
     if any(bad in region for bad in TASK_ERROR_MARKERS):
         return None, "error_in_output"
+    if TASK_DATA_MARKER not in region:
+        return None, "no_api_data"  # 没取到数据：沙盒里只有任务原文
 
     answer = _solution_answer(region, turn)
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
