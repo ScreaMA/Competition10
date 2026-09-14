@@ -24,6 +24,9 @@ API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
 DEFAULT_TIMEOUT = 30
 
+# 每轮默认只处理最新的几个 issue（见 `IssueMonitor.max_candidates`）
+DEFAULT_MAX_ISSUES = 3
+
 # token 文件候选路径（相对于 automation 目录）
 _TOKEN_CANDIDATES = (
     "github_token.txt",
@@ -281,6 +284,9 @@ class IssueMonitor:
     labels: list[str] = field(default_factory=list)
     ignore_labels: list[str] = field(default_factory=list)
     store: ProcessedStore | None = None
+    # 每轮最多处理几个 issue（0 表示不限制）：复盘流水线会积压十几个分析，
+    # 全跑完要几十分钟，而结论只看最近几场
+    max_candidates: int = DEFAULT_MAX_ISSUES
 
     @classmethod
     def from_config(cls, config: dict[str, Any], client: GitHubClient) -> "IssueMonitor":
@@ -292,6 +298,9 @@ class IssueMonitor:
             labels=list(github.get("issue_labels") or []),
             ignore_labels=list(github.get("ignore_labels") or []),
             store=ProcessedStore(state_file),
+            max_candidates=int(
+                automation.get("max_issues_per_round", DEFAULT_MAX_ISSUES)
+            ),
         )
 
     def should_process(self, issue: Issue) -> bool:
@@ -308,11 +317,16 @@ class IssueMonitor:
         return bool(set(issue.labels) & set(self.labels))
 
     def fetch_candidates(self) -> list[Issue]:
-        """拉取需要处理的Issue列表
+        """拉取需要处理的Issue列表（只取最新的 `max_candidates` 个）
 
         注意: GitHub API 的 `labels` 参数是“与”语义（要求Issue同时带全部标签），
         而配置中的 issue_labels 是“或”语义（命中任意一个即处理），
         因此这里拉取全部开放Issue，再在本地用 should_process 过滤。
+
+        排序与截断：按 Issue 编号从新到旧，只保留最新的那几个
+        （`automation.max_issues_per_round`，默认 3）——复盘流水线一次会积压
+        十几个分析 issue，全处理完要几十分钟，而结论只看最近几场对战；
+        被截掉的留到下一轮（它们仍在开放列表里，`store` 也没标记）。
         """
         try:
             issues = self.client.list_issues()
@@ -321,6 +335,12 @@ class IssueMonitor:
             return []
 
         candidates = [issue for issue in issues if self.should_process(issue)]
+        # 新的在前：编号越大越新（同一批 issue 的编号单调递增）
+        candidates.sort(key=lambda issue: issue.number, reverse=True)
+        if self.max_candidates > 0 and len(candidates) > self.max_candidates:
+            LOGGER.info("只处理最新的 %d 个 issue，其余 %d 个留到下一轮",
+                        self.max_candidates, len(candidates) - self.max_candidates)
+            candidates = candidates[: self.max_candidates]
         for issue in candidates:
             LOGGER.info("candidate: %s", issue.summary)
         LOGGER.info("fetched %d issues, %d to process",

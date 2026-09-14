@@ -17,6 +17,9 @@ automation:
   auto_create_pr: true
   comment_on_issue: true
   branch_prefix: "auto-fix"
+  # 每轮最多处理几个 issue（只挑最新的几个；0 表示不限制）
+  # 复盘流水线会积压十几个分析，全跑完要几十分钟，而结论只看最近几场
+  max_issues_per_round: 3
   # 每轮轮询先检查自己创建的PR是否已合并，合并后把本地主干同步到远端最新
   # 优先快进；本地与远端分叉时按下面的 sync_strategy 处理，冲突则回滚并下轮重试
   auto_sync: true
