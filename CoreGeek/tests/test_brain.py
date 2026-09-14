@@ -3836,14 +3836,36 @@ def test_llm_command_is_run_in_sandbox(payload_factory, role_factory):
     assert brain.TASK_MARKER in command  # 包装过，答案区能对上当前任务
 
 
-def test_shell_command_check_rejects_unbalanced_quotes_only():
-    """命令体检：引号成对且单行才算合格（不合格的命令不拼进沙盒）"""
+def test_shell_command_check_rejects_broken_commands():
+    """命令体检：引号成对且单行、不带 heredoc 才算合格（不合格的不拼进沙盒）"""
     assert brain._shell_command_ok('curl -s "http://localhost:8899/weather"')
     assert brain._shell_command_ok("grep -o 'x' task.md")
     assert not brain._shell_command_ok('curl -s "http://localhost:8899/weather')
     assert not brain._shell_command_ok("grep -o 'x task.md")
     assert not brain._shell_command_ok("echo a\necho b")
     assert not brain._shell_command_ok("")
+
+
+def test_shell_command_check_rejects_heredoc():
+    """heredoc 命令一律不合格（S2：单行命令里结束符独占一行这条要求满足不了）
+
+    复盘 PK591011 的 R16：沙盒只回了一句
+    `here-document at line 0 delimited by end-of-file (wanted 'EOF')`，
+    末标记与末尾的 `:` 被当成 heredoc 正文吞掉；同一场的 R13 更彻底——
+    解析阶段的报错让整条命令一个字都没跑，连任务标识都没打印
+    （`sandbox=发送但 state=no_marker`）。这种命令不能下发，改走执行器兜底。
+    `<<<`（here-string）当场就有内容，单行可跑，照旧放行。
+    """
+    for command in (
+        "cat <<EOF",
+        "python3 - <<EOF",
+        "cat <<-EOF",
+        "cat <<'EOF'",
+        'cat <<"EOF"',
+        "sed -n '1,5p' task.md <<EOF",
+    ):
+        assert not brain._shell_command_ok(command), command
+    assert brain._shell_command_ok('curl -s http://localhost:8899/w <<< "x"')
 
 
 def test_script_in_command_finds_the_script_not_its_arguments():
@@ -3937,6 +3959,31 @@ def test_llm_command_with_unbalanced_quote_falls_back_to_executor(
     assert "curl" not in command  # 坏命令没有下发
     assert "PYEOF" in command  # 改走执行器：读任务文件 + 按文档地址取数
     assert brain.TASK_MARKER in command
+
+
+def test_llm_heredoc_command_falls_back_to_executor(
+    payload_factory, role_factory,
+):
+    """LLM 给的 heredoc 命令丢弃，改由执行器自己取数（PK591011 的 R13/R16）
+
+    单行命令里的 heredoc 收不了尾：结束符要独占一行，包装时另起一行接的
+    `echo "[TASK_END]"` 与末尾的 `:` 会被当成正文吞掉，沙盒只回一句
+    `here-document at line 0 delimited by end-of-file (wanted 'EOF')`。
+    整条命令一个字都没跑，答案区里连任务标识都没有，这一个回合白费。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_alpha.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: python3 - <<EOF"
+    decide(payload)
+
+    command = sandbox_command(payload)
+    assert "<<EOF" not in command  # 坏命令没有下发
+    assert "PYEOF" in command  # 改走执行器：读任务文件 + 按文档地址取数
+    assert brain.TASK_MARKER in command
+    assert brain.TASK_END_MARKER in command  # 末标记照旧在，答案区能取出来
 
 
 def test_task_answer_from_llm_command_output(payload_factory, role_factory):
