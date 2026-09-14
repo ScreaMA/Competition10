@@ -298,9 +298,23 @@ TASK_END_MARKER = "[TASK_END]"
 # 沙盒探测标记：任务描述里没给文件名时先探一次沙盒，这个标记下的输出
 # 只是文件路径清单，`_task_answer` 永远不会把它当成答案提交（见 `_sandbox_probe`）
 TASK_PROBE_MARKER = "[TASK_PROBE]"
-# 沙盒里搜任务文件时跳过的虚拟目录：进程/内核/设备文件系统里不会有任务文件，
-# 却会让全盘 find 变慢并刷出一堆 Permission denied
-TASK_FIND_PRUNE = ("/proc", "/sys", "/dev")
+# 沙盒里搜任务文件时跳过的目录：前三个是进程/内核/设备文件系统，里面不会有
+# 任务文件，却会让全盘 find 变慢并刷出一堆 Permission denied；后面几个是发行版
+# 自带的文档目录，同样与任务无关，却会污染候选清单——PK590278 的 R13/R15 与
+# PK590240 的 R17 里回读回来的正是 /usr/share/doc 下 uom-se 包的 README.md
+# （"读无关文档"），而同一棵树下还有那个三万多字符的 docbook task.xsl。
+# 任务文件与接口文档都在沙盒自己的目录里（PK590240 R14 可见
+# /tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md），
+# 把发行版文档整整一片剪掉，候选清单与耗时都干净得多。
+TASK_FIND_PRUNE = (
+    "/proc",
+    "/sys",
+    "/dev",
+    "/usr/share/doc",
+    "/usr/share/man",
+    "/usr/share/locale",
+    "/usr/share/sgml",
+)
 # 任务文件的文件名特征：描述里点名的那一份，以及任务目录里的同构任务
 # （任务书5.3节的例子是 task_1_beijing / task_2_shanghai 这一套）
 TASK_FILE_NAMES = ("task*", "spec*")
@@ -343,11 +357,36 @@ TASK_API_TIMEOUT = 1  # 单次取数超时（秒），整条沙盒命令限时 1
 TASK_API_MAX_CALLS = 8  # 一条命令里最多请求几次（本地接口，失败也是立刻返回）
 TASK_API_TIME_BUDGET = 8  # 取数阶段的时间上限（秒），留出找文件与回读的余量
 TASK_EXEC_DIR_BUDGET = 4000  # 全盘找文件时最多进几个目录（防止 walk 慢过 15 秒）
+# 执行器找文件的目录顺序（S2）：最可能放任务文件的目录排前面，`/` 垫底。
+#
+# 只给"全盘 walk + 目录预算"是不够的：os.walk("/") 的次序由文件系统决定，
+# Debian 根目录下 /usr/share/doc、/usr/share/locale、/usr/lib 这些一片就能吃掉
+# 几千个目录预算，走不到 /tmp 就停。PK590240 的 R14/R15/R17 里执行器连着三个
+# 回合打出逐字相同的 `[SCAN] tasks=0 docs=6`——任务文件一个都没找到，
+# `[SOLUTION]` 段永远是空的，开拓者一路耗到超时、任务分恒为 0。而同一场
+# R14 的沙盒回读已经证明任务文件就在 /tmp 下面：
+# /tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md。
+# 先按这份顺序找，找到就不再往下走；都没找到才落到 `/`，用剩下的预算兜底。
+TASK_EXEC_ROOTS = (
+    "/tmp",       # PK590240 R14：任务文件的实际位置
+    "/home",
+    "/root",
+    "/opt",
+    "/srv",
+    "/app",
+    "/data",
+    "/workspace",
+    "/mnt",
+    "/var",
+    "/etc",
+    "/",          # 兜底：上面都没有时才全盘找（吃掉剩下的目录预算）
+)
 TASK_API_QUERY_MAX = 2  # 每个接口地址最多试几个查询词
 TASK_API_BODY_LIMIT = 400  # 单个响应体最多带回的字符数
 TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一）
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
+TASK_API_DOC_LIMIT = 6  # 一次最多捞几份接口文档回来（够拼地址就行）
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
 
 # 任务止损（S1）：自进化任务的闭环是"下发沙盒命令 -> 取数 -> submitAnswer"，
@@ -3244,10 +3283,12 @@ def _task_executor(task_path: str) -> str:
         .replace("__MAX_CALLS__", str(TASK_API_MAX_CALLS))
         .replace("__TIME_BUDGET__", str(TASK_API_TIME_BUDGET))
         .replace("__DIR_BUDGET__", str(TASK_EXEC_DIR_BUDGET))
+        .replace("__ROOTS__", repr(TASK_EXEC_ROOTS))
         .replace("__QUERY_MAX__", str(TASK_API_QUERY_MAX))
         .replace("__BODY_LIMIT__", str(TASK_API_BODY_LIMIT))
         .replace("__SOLVE_MAX__", str(TASK_SOLVE_MAX))
         .replace("__DOC_NAMES__", repr(TASK_API_DOC_NAMES))
+        .replace("__DOC_LIMIT__", str(TASK_API_DOC_LIMIT))
         .replace("__SUFFIXES__", repr(TASK_API_PATH_SUFFIXES))
         .replace("__PRUNE__", repr(TASK_EXEC_PRUNE))
         .replace("__SOLUTION__", repr(TASK_SOLUTION_MARKER))
@@ -3282,10 +3323,12 @@ TIMEOUT = __TIMEOUT__
 MAX_CALLS = __MAX_CALLS__
 TIME_BUDGET = __TIME_BUDGET__
 DIR_BUDGET = __DIR_BUDGET__
+ROOTS = __ROOTS__
 QUERY_MAX = __QUERY_MAX__
 BODY_LIMIT = __BODY_LIMIT__
 SOLVE_MAX = __SOLVE_MAX__
 DOC_NAMES = __DOC_NAMES__
+DOC_LIMIT = __DOC_LIMIT__
 SUFFIXES = __SUFFIXES__
 PRUNE = __PRUNE__
 SOLUTION = __SOLUTION__
@@ -3320,22 +3363,21 @@ def fetch(url):
         return ""
 
 
-def find_files(patterns, limit):
-    """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
+def walk_find(root, patterns, limit, found, seen, budget):
+    """在 root 下按文件名找文件，返回这次逛掉的目录数
 
-    全盘 walk 是这里最慢的一步，所以两个上限都要兜住：找到够数就停，
-    进的目录太多也停（沙盒命令整体限时 15 秒，宁可少找几个也不能超时）。
+    两个上限都要兜住：找到够数就停，进的目录太多也停（沙盒命令整体限时
+    15 秒，宁可少找几个也不能超时）。`budget` 是这次还能逛几个目录——
+    由调用方按已经逛掉的数量现算，几次 walk 加起来不超过 `DIR_BUDGET`。
     """
-    found = []
-    seen = set()
     visited = 0
-    for root, dirs, files in os.walk("/"):
+    for base, dirs, files in os.walk(root):
         visited += 1
-        if visited > DIR_BUDGET:
+        if visited > budget or len(found) >= limit:
             break
-        dirs[:] = [d for d in dirs if os.path.join(root, d) not in PRUNE]
+        dirs[:] = [d for d in dirs if os.path.join(base, d) not in PRUNE]
         for name in files:
-            path = os.path.join(root, name)
+            path = os.path.join(base, name)
             if path in seen:
                 continue
             if not any(re.search(pattern, name, re.I) for pattern in patterns):
@@ -3343,7 +3385,40 @@ def find_files(patterns, limit):
             seen.add(path)
             found.append(path)
             if len(found) >= limit:
-                return found
+                return visited
+    return visited
+
+
+def find_files(patterns, limit, roots=None):
+    """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
+
+    按 ROOTS 的顺序逐个找，最可能放任务文件的目录排前面、`/` 垫底：
+    只给"全盘 walk + 目录预算"是不够的，os.walk("/") 的次序由文件系统决定，
+    /usr/share/doc、/usr/lib 这些一片就能吃掉几千个目录预算，走不到 /tmp
+    就停了（PK590240 连续三个回合 `[SCAN] tasks=0 docs=6`：任务文件一个
+    没找到，答案区永远是空的，开拓者一路耗到超时）。沙盒里的 /tmp 只有
+    几十个目录，先逛它几乎不花预算，`/` 兜底时基本还是满预算——所以这条
+    路只会比"直接全盘 walk"找到得更多、不会更少。
+
+    参数:
+        patterns: 文件名正则（不区分大小写）
+        limit: 最多要几个文件
+        roots: 换一份目录顺序（接口文档要优先在任务文件所在目录里找）
+
+    返回:
+        命中的文件路径列表
+    """
+    found = []
+    seen = set()
+    visited = 0
+    for root in (ROOTS if roots is None else roots):
+        if len(found) >= limit or visited > DIR_BUDGET:
+            break
+        if not os.path.isdir(root):
+            continue
+        visited += walk_find(
+            root, patterns, limit, found, seen, DIR_BUDGET - visited,
+        )
     return found
 
 
@@ -3420,7 +3495,22 @@ def candidates(text, name, urls):
 
 
 files = task_files()
-doc_files = find_files(DOC_NAMES, 6)
+# 接口文档优先在任务文件所在目录里找（S2）：全盘捞回来的文档里混着
+# /usr/share/doc 下 uom-se 的 README 这类无关文档（PK590278 的 R13/R15
+# 读到的就是它，白耗两个回合），而真正写着调用样例的那份接口文档通常
+# 跟任务文件放在一起。任务目录里不够 DOC_LIMIT 份时，再按 ROOTS 全盘补齐。
+doc_dirs = []
+for path in files[:SOLVE_MAX]:
+    parent = os.path.dirname(path)
+    if parent and parent not in doc_dirs:
+        doc_dirs.append(parent)
+doc_files = find_files(DOC_NAMES, DOC_LIMIT, doc_dirs)
+if len(doc_files) < DOC_LIMIT:
+    for path in find_files(DOC_NAMES, DOC_LIMIT):
+        if path not in doc_files:
+            doc_files.append(path)
+        if len(doc_files) >= DOC_LIMIT:
+            break
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
 print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
@@ -3463,7 +3553,9 @@ def _sandbox_find(
     限定在 `find . -maxdepth 3` 加两个猜出来的目录（`/tmp/selfEvolutionTask`、
     `/tmp/selfEvolution`），任务文件一次都没被找到，开拓者整个任务周期
     卡在任务点。这里改成从根目录起全盘按文件名找，只跳过 `TASK_FIND_PRUNE`
-    里的虚拟目录，读不到文件的目录由 `2>/dev/null` 静音。
+    里的目录（虚拟文件系统，以及发行版自带的文档目录——后者不会放任务文件，
+    却会把 `/usr/share/doc` 下的无关 README 捞进候选清单，见 `TASK_FIND_PRUNE`），
+    读不到文件的目录由 `2>/dev/null` 静音。
 
     命中还要过一道扩展名闸门（`exts`）：只有"名字像任务文件、且扩展名是
     文档"的才算任务文件，`task.xsl` 这类同名样式表被挡在外面（见

@@ -2841,6 +2841,136 @@ def test_task_executor_prefers_local_api_over_doc_links():
     assert "picked = local or [BASE] + " in brain.TASK_EXECUTOR
 
 
+# === issue #49：沙盒全盘 walk 找不到任务文件 / 读发行版文档（PK590240/590278）===
+
+TASK_NAME_PATTERN = r"^(task|spec).*\.(md|txt|json)$"
+
+
+def _executor_definitions(task_path: str = "task_1_alpha.md") -> dict:
+    """沙盒执行器的定义段（`find_files` 那一摊）编译后的命名空间
+
+    `_task_executor` 交出来的是一段 shell（`$P - <<'PYEOF' … PYEOF`）。单测
+    只需要定义段——`files = task_files()` 之后就要真去请求本地接口取数了，
+    不在单测里跑。拿到的命名空间可以直接改 `ROOTS` / `PRUNE` / `DIR_BUDGET`
+    再调 `find_files`，看它在真实目录树上找到什么。
+    """
+    fragment = brain._task_executor(task_path)
+    script = fragment.split("<<'PYEOF' 2>/dev/null\n", 1)[1]
+    script = script.rsplit("\nPYEOF", 1)[0]
+    definitions = script.split("files = task_files()", 1)[0]
+    namespace: dict = {}
+    exec(compile(definitions, "<sandbox-executor>", "exec"), namespace)
+    return namespace
+
+
+def _touch(path: Path, text: str = "") -> Path:
+    """按目录树写一个小文件（父目录不存在就建出来）"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_task_executor_finds_task_file_under_likely_root(tmp_path):
+    """执行器在 `/tmp` 这种最可能放任务文件的目录里就能找到任务文件
+
+    回归：PK590240 的 R14 回读证明任务文件就在
+    /tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md，
+    可执行器连着 R14/R15/R17 三个回合打出逐字相同的 `[SCAN] tasks=0 docs=6`
+    ——旧实现只有一个 `os.walk("/")` 加目录预算，/usr/share/doc、/usr/lib
+    这些先逛掉几千个目录，走不到 /tmp 就停了，任务文件一个没找到，
+    `[SOLUTION]` 段永远是空的，开拓者一路耗到超时、任务分恒为 0。
+    """
+    task = _touch(
+        tmp_path / "tmp" / "selfEvolutionTask" / "1-fixed-step"
+        / "2-engineering-fix" / "task_1_alpha.md",
+        "# 自进化任务 A-1",
+    )
+    namespace = _executor_definitions()
+    namespace["ROOTS"] = [str(tmp_path / "tmp")]
+    namespace["PRUNE"] = ()
+
+    found = namespace["find_files"](TASK_NAME_PATTERN, 24)
+
+    # 只按 ROOTS 里的第一个目录找就够了：不必再走那一趟全盘
+    assert [Path(path) for path in found] == [task]
+
+
+def test_task_executor_reads_doc_next_to_the_task_file(tmp_path):
+    """接口文档优先在任务文件自己的目录里找，不去翻发行版文档
+
+    回归：PK590278 的 R13/R15 读回来的是 /usr/share/doc 下 uom-se 包的
+    README.md（"读无关文档"，白耗两个回合），而真正写着调用样例的那份
+    接口文档就和任务文件放在一起。
+    """
+    task_dir = tmp_path / "tmp" / "selfEvolutionTask" / "2-engineering-fix"
+    _touch(task_dir / "task_1_alpha.md", "# 自进化任务 A-1")
+    doc = _touch(
+        task_dir / "api_doc.md",
+        "调用样例: http://localhost:8899/api?city=beijing",
+    )
+    # 同名的无关文档：文件名同样命中 DOC_NAMES，但不在任务目录里
+    _touch(
+        tmp_path / "usr" / "share" / "doc" / "uom-se" / "README.md",
+        "GNU Units 的文档",
+    )
+    namespace = _executor_definitions()
+    namespace["ROOTS"] = [str(tmp_path)]  # 拿整棵临时目录树当"全盘"
+    namespace["PRUNE"] = ()
+
+    # 全盘扫（改造前的行为）：uom-se 的 README 也是候选，还可能排在前面
+    everywhere = namespace["find_files"](
+        namespace["DOC_NAMES"], namespace["DOC_LIMIT"],
+    )
+    assert any("uom-se" in path for path in everywhere)
+
+    # 执行器的做法：先在任务文件所在目录里找，找到就轮到它了
+    in_task_dir = namespace["find_files"](
+        namespace["DOC_NAMES"], namespace["DOC_LIMIT"], [str(task_dir)],
+    )
+    assert Path(doc) in [Path(path) for path in in_task_dir]
+    assert all("uom-se" not in path for path in in_task_dir)
+
+
+def test_task_executor_roots_put_tmp_first_and_root_last():
+    """执行器找文件的目录顺序：`/tmp` 打头、`/` 垫底
+
+    顺序本身就是这次的修复：`/` 排在最后，前面那些通常只有几十个目录，
+    先逛它们几乎不花目录预算，全盘兜底时基本还是满预算。
+    """
+    assert brain.TASK_EXEC_ROOTS[0] == "/tmp"
+    assert brain.TASK_EXEC_ROOTS[-1] == "/"
+    # 生成出来的脚本必须带上这份顺序（不是执行器里另写一份）
+    script = brain._task_executor("task_1_alpha.md")
+    assert repr(brain.TASK_EXEC_ROOTS) in script
+    assert "for root in (ROOTS if roots is None else roots):" in script
+
+
+def test_task_find_prunes_system_doc_dirs(payload_factory, role_factory):
+    """全盘找任务文件时跳过发行版自带的文档目录
+
+    回归：/usr/share/doc 下 uom-se 的 README.md 被当任务文件回读回来
+    （PK590240 的 R17、PK590278 的 R13/R15），同一棵树下还躺着那个三万多
+    字符的 docbook task.xsl。这些目录不会放任务文件，剪掉之后候选清单与
+    全盘 find 的耗时都干净得多。
+    """
+    for path in ("/usr/share/doc", "/usr/share/man", "/usr/share/locale"):
+        assert path in brain.TASK_FIND_PRUNE
+
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task="请阅读task_1_alpha.md，获取任务信息",
+    )
+    command = sandbox_command(payload)
+
+    for path in brain.TASK_FIND_PRUNE:
+        assert f'-path "{path}"' in command
+    # 扩展名闸门照旧：剪掉目录之后，task.xsl 这类同名样式表仍然进不来
+    assert '-name "*.xsl"' not in command
+
+
 def test_defender_cashes_out_income_ore_while_wall_quota_open(
     payload_factory, role_factory,
 ):
