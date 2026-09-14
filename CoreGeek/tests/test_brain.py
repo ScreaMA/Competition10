@@ -24,11 +24,15 @@ from agent.brain import (
     TASK_PROBE_MARKER,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
+    WALL_UPGRADE_GOLD,
+    WALL_UPGRADE_VOUCHER,
     WEAPON_UPGRADE_VOUCHER,
+    WEAPON_UPGRADE_VOUCHER2,
     LlmPlan,
     _calc_tower_sites,
     _calc_wall_order,
     _generate_strategy_prompt,
+    _gold_left,
     _llm_plan,
     _pair_controllers_and_weapons,
     _plan_summary,
@@ -1913,6 +1917,205 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
         "name": COPPER_MINE,
         "num": SELL_BATCH,
     }
+
+
+# === 金币阶梯与资金闲置（issue #28） ===
+
+
+def _idle_gold_payload(payload_factory, role_factory, gold: int, *,
+                       towers: int = 3, tower_level: int = 1,
+                       round_no: int = 1) -> dict:
+    """构造"防线建完、金币闲置"的局面（塔数与塔的等级可调）
+
+    默认三座武器都已建成、围墙整圈都在，工人站在武器商店旁，
+    用来观察金币在没有建造目标时去了哪里。
+    """
+    base = Turn.load(payload_factory())
+    roles = [
+        role_factory(
+            10020 + index, kind, pos.x, pos.y,
+            attackRange=4, level=tower_level,
+        )
+        for index, (kind, pos) in enumerate(
+            zip(TOWER_LOADOUT, _calc_tower_sites(base)[:towers])
+        )
+    ]
+    roles += [
+        role_factory(40000 + index, WALL, pos.x, pos.y)
+        for index, pos in enumerate(_calc_wall_order(base))
+    ]
+    roles.append(
+        role_factory(10010, WORKER, 20, 17, backPackCapability=100),
+    )
+    return payload_factory(
+        round_no=round_no, gold=gold, roles=roles,
+        zones=[(WEAPON_SHOP, 20, 16)],
+    )
+
+
+def test_idle_gold_buys_wall_upgrade_voucher(payload_factory, role_factory):
+    """武器线花完的金币不再沉睡：买围墙升级券顶住正面
+
+    回归：三座武器建完、武器券也买过之后金币再没有任何出口，三场复盘
+    都出现"金币连续多回合冻结、无建造无购买"（586322/586323/586377）。
+    """
+    payload = _idle_gold_payload(
+        payload_factory, role_factory, WALL_UPGRADE_GOLD, tower_level=3,
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "buy",
+        "name": WALL_UPGRADE_VOUCHER,
+        "num": 1,
+    }
+
+
+def test_worker_uses_wall_upgrade_voucher_on_wall(payload_factory, role_factory):
+    """背包里有围墙升级券时，站在围墙旁使用（level1 -> level2）"""
+    base = Turn.load(payload_factory())
+    payload = payload_factory(
+        gold=0,
+        roles=[
+            role_factory(
+                10010, WORKER, 20, 17, backPackCapability=100,
+                backpack=[WALL_UPGRADE_VOUCHER],
+            ),
+            role_factory(10011, WALL, 20, 16),
+            # 三座武器满编满级：金币没有别的去处，围墙券可以放心用
+            *[
+                role_factory(
+                    10020 + index, kind, pos.x, pos.y,
+                    attackRange=4, level=3,
+                )
+                for index, (kind, pos) in enumerate(
+                    zip(TOWER_LOADOUT, _calc_tower_sites(base))
+                )
+            ],
+        ],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "use",
+        "name": WALL_UPGRADE_VOUCHER,
+        "targetPos": [{"x": 20, "y": 16}],
+    }
+
+
+def test_wall_upgrade_waits_for_weapon_reserve(payload_factory, role_factory):
+    """金币还没到"武器线储备 + 围墙券"时先攒着，围墙券不吃武器券的钱
+
+    复盘建议的"金币优先转化战力"：一张武器券换 10 点攻击力与一段射程，
+    比一面围墙多 500 血划算得多，所以围墙券只能用武器线花剩下的钱。
+    """
+    def _payload(gold: int) -> dict:
+        payload = _idle_gold_payload(
+            payload_factory, role_factory, gold, towers=2, round_no=3,
+        )
+        # 塔数压在 2 座（塔位还剩 1 个空着，武器线因此要留一座塔的钱）
+        payload["llmResp"] = "PLAN: tower=2"
+        return payload
+
+    # 45 金 = 一座塔的储备(25) + 围墙券(20)：刚好够
+    commands, _ = decide(_payload(WEAPON_BUILD_COST + WALL_UPGRADE_GOLD))
+    assert commands["10010"] == {
+        "action": "buy",
+        "name": WALL_UPGRADE_VOUCHER,
+        "num": 1,
+    }
+
+    # 差一金就买不了：这笔钱要先留给武器线
+    commands, _ = decide(_payload(WEAPON_BUILD_COST + WALL_UPGRADE_GOLD - 1))
+    assert "10010" not in commands
+
+
+def test_worker_upgrades_level2_weapon_with_second_voucher(
+    payload_factory, role_factory,
+):
+    """武器升到 level2 后金币仍有出口：用武器升级券2 继续升到 level3
+
+    回归：以前只认 level1->level2，三座塔都到 level2 之后金币再没有出口。
+    """
+    base = Turn.load(payload_factory())
+    site = _calc_tower_sites(base)[0]
+    payload = payload_factory(
+        round_no=3,
+        gold=0,
+        roles=[
+            role_factory(
+                10010, WORKER, 20, 17, backPackCapability=100,
+                backpack=[WEAPON_UPGRADE_VOUCHER2],
+            ),
+            role_factory(10020, ROCKET, site.x, site.y, attackRange=10, level=2),
+            role_factory(10030, RAILGUN, 20, 16, attackRange=6, level=2),
+        ],
+    )
+    payload["llmResp"] = "PLAN: tower=1"
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "use",
+        "name": WEAPON_UPGRADE_VOUCHER2,
+        "targetPos": [{"x": 20, "y": 16}],
+    }
+
+
+def test_gold_left_counts_purchases(payload_factory):
+    """同一回合已经发出去的购买指令也要从余额里扣掉
+
+    金币要等回合结算才扣，买券的路径变多之后（武器券/围墙券），
+    两名工人各买一张券同样会超支——复盘里的"金币没扣、东西也没到手"。
+    """
+    turn = Turn.load(payload_factory(gold=UPGRADE_GOLD))
+    build = {"action": "build", "name": ROCKET, "targetPos": []}
+    buy = {"action": "buy", "name": WALL_UPGRADE_VOUCHER, "num": 1}
+
+    assert _gold_left(turn, {}) == UPGRADE_GOLD
+    assert _gold_left(turn, {1: build}) == UPGRADE_GOLD - WEAPON_BUILD_COST
+    # 报文的价格表里没有围墙券，退回任务书4.6.3 的售价(20)
+    assert _gold_left(turn, {1: buy}) == UPGRADE_GOLD - WALL_UPGRADE_GOLD
+
+    # 报文给了售价时按报文的算
+    payload = payload_factory(gold=UPGRADE_GOLD * 2)
+    payload["weaponShopList"] = [{"name": WALL_UPGRADE_VOUCHER, "price": 120}]
+    assert _gold_left(Turn.load(payload), {1: buy}) == UPGRADE_GOLD * 2 - 120
+
+
+def test_strategy_prompt_includes_task_distance(
+    payload_factory, role_factory, monkeypatch,
+):
+    """任务点带上到开拓者的距离，避免 LLM 凭感觉判断"距离远"而放弃任务
+
+    复盘里 LLM 两次以"任务点距离远、风险未知"建议放弃任务，而两个任务点
+    离我方基地只有 11~13 格（586377）。
+    """
+    monkeypatch.setattr(brain, "LLM_PROMPT_ENABLED", True)
+    turn = Turn.load(payload_factory(
+        round_no=1,
+        tasks=[(23, 14)],
+        roles=[role_factory(10010, PIONEER, 20, 16, backPackCapability=40)],
+    ))
+    prompt = _generate_strategy_prompt(turn, {})
+
+    assert "(23,14)" in prompt
+    assert "距我3格" in prompt
+
+
+def test_strategy_prompt_states_tasks_and_gold_ownership(
+    payload_factory, monkeypatch,
+):
+    """prompt 讲清权责：任务由客户端自动执行，富余金币的去处也摊开
+
+    复盘里 LLM 建议"放弃任务/暂不造塔"、客户端却照旧去领任务建塔，
+    建议与执行对不上（586322/586377）；复盘建议同时要求
+    "提示词显式加'前期不存金币'规则"。
+    """
+    monkeypatch.setattr(brain, "LLM_PROMPT_ENABLED", True)
+    prompt = _generate_strategy_prompt(Turn.load(payload_factory(round_no=1)), {})
+
+    assert "不需要建议放弃任务" in prompt
+    assert "不存金币" in prompt
 
 
 # === 鲁棒性 ===
