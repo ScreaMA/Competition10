@@ -457,6 +457,21 @@ TASK_TIMEOUT = TASK_TIMEOUT_ROUNDS
 # 回合还给战斗调度（`_task_abandoned` 里这两条线是或的关系）。
 TASK_API_FAIL_LIMIT = 6
 
+# 沙盒命令被整条掐掉时判题器留在 `lastCmdResult` 里的标记（S1）：一条命令限时
+# 15 秒，被判题器 kill 掉的那一回合输出里没有任何取数证据（`[API]`/`[APIFAIL]`
+# 都没有），`[SCAN]` 也可能还没轮到打印就被掐了——这种输出与"读文件死循环"
+# 长得一模一样。旧判据于是把它归进读文件循环：输出逐字相同、`repeats` 每回合
+# 累加，接上任务后的第 3 个回合就撞 `TASK_LOOP_LIMIT` 被熔断（复盘 PK590252 的
+# R13 整条命令就是 `[TIMEOUT]`）。可超时说明的是"这条命令做得太多"，不是
+# "读不出新东西"：该按取数连败那条更宽的线走（`TASK_API_FAIL_LIMIT`），把重试
+# 与 LLM 兜底留给它，下一回合换一条更省时间的命令去取数（见 `_task_retry_budget`）。
+TASK_TIMEOUT_MARKER = "[TIMEOUT]"
+# 上一回合超时之后，这一回合执行器搜目录的上限（S3 的"读题去重"）：全盘 walk
+# 是整条命令里最慢的一步，超时那一回合已经证明了这一点。重试回合把上限压到
+# 这么小，让命令在 15 秒内跑到"调接口取数"那一步——题干上一回合已经读过一遍，
+# 重试该把预算花在取数上，而不是再扫一遍同一棵目录树（`TASK_EXEC_DIR_BUDGET`）。
+TASK_EXEC_RETRY_DIR_BUDGET = 400
+
 # 提交闸门（S1）：复盘 PK590252 的 R17 提交的是
 # "/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md"
 # ——开拓者把"该读哪个文件"当成了"文件里问的答案"，Judge 判 0 分，任务 2
@@ -3373,7 +3388,7 @@ def _task_fetch_failed(output: str) -> bool:
     """这一份沙盒输出是不是"执行器跑过了、却一次数都没取到"（S1）
 
     执行器的每次请求都会留一行：成功打 `[API]`（`TASK_DATA_MARKER`），失败打
-    `[APIFAIL]`（`TASK_API_FAIL_MARKER`）。输出里一条取数记录都没有时，分三种：
+    `[APIFAIL]`（`TASK_API_FAIL_MARKER`）。输出里一条取数记录都没有时，分四种：
 
         1. 有 `[APIFAIL]`：地址猜错了——沙盒该做的都做了（读文档、拼地址、
            逐个请求），卡住的是候选地址。
@@ -3396,24 +3411,50 @@ def _task_fetch_failed(output: str) -> bool:
     （PK591684 的 R13：`watch=r3/t4/f3`，超时线与取数连败线都还没到），
     主张的"读题成功后必须调 API"因此一次都没轮上。
 
-    两者的止损线不一样（见 `_task_abandoned`）：读文件死循环按同一份输出重复
-    几次熔断（`TASK_LOOP_LIMIT`），后两种按连续几回合取不到数熔断
+    第 4 条是"整条命令被掐掉"（`TASK_TIMEOUT_MARKER`，PK590252 的 R13）：
+    kill 发生在取数证据打出来之前时，输出同样一行取数记录都没有，可它既不是
+    读文件循环（沙盒没有在反复读同一份文件），也不是"猜错了地址"（一个地址
+    都还没试）——是这条命令做得太多、时间花在了找文件上（见 `_task_retry_budget`）。
+
+    第 1/3/4 条的止损线都一样（见 `_task_abandoned`）：读文件死循环按同一份输出
+    重复几次熔断（`TASK_LOOP_LIMIT`），它们按连续几回合取不到数熔断
     （`TASK_API_FAIL_LIMIT`，比前者宽，正是为了把几个回合留给重试与 LLM 兜底）。
-    判据在 `_watch_task` 里用来把后者的 `repeats` 按住不动——否则这几类回合
+    判据在 `_watch_task` 里用来把这几类的 `repeats` 按住不动——否则它们
     会被当成读文件循环提前熔断。
 
     参数:
         output: 上一回合属于本任务的沙盒输出
 
     返回:
-        True 表示执行器跑过了、却没有任何一次取数成功
+        True 表示这一份输出里没有任何取数证据、也不是"在读同一份文件"的死循环
+        （取数全失败 / 执行器没发出请求 / 整条命令被掐掉）
     """
     if TASK_DATA_MARKER in output:
         return False  # 取到数了（哪怕后来又失败），这一回合算有进展
     return (
         TASK_API_FAIL_MARKER in output          # 试过地址，全失败
         or TASK_SCAN_MARKER in output           # 执行器跑过，却一次请求都没发
+        or TASK_TIMEOUT_MARKER in output        # 整条命令被掐了，取数还没轮到
     )
+
+
+def _task_retry_budget(turn: Turn) -> int:
+    """这一回合执行器搜目录的上限（上一回合超时过就压小）
+
+    全盘 walk 是沙盒命令里最慢的一步（`TASK_EXEC_DIR_BUDGET` 就是为它设的上限），
+    上一回合整条命令被掐掉（`TASK_TIMEOUT_MARKER`）说明预算还是花超了。取数
+    证据是任务唯一的进展凭据，重试回合把搜目录的上限压到 `TASK_EXEC_RETRY_DIR_BUDGET`，
+    命令就能在 15 秒内跑到"调接口取数"那一步：题干与接口文档上一回合已经读过
+    一遍，这一回合不该再扫一遍目录树（报告 S3 的"读题去重"）。
+
+    判据看整份 `lastCmdResult`（不像看门狗那样按任务标识认领）：超时是"沙盒这
+    一回合很慢"的证据，不是某个任务的观察值；被掐掉的输出可能连任务标识都没
+    打出来（判题器整份替换成 `[TIMEOUT]`），按任务标识认领的话这种最该压预算的
+    回合反而漏掉。没有超时观察时返回原上限，行为与改造前一致。
+    """
+    if TASK_TIMEOUT_MARKER in (turn.last_cmd_result or ""):
+        return TASK_EXEC_RETRY_DIR_BUDGET
+    return TASK_EXEC_DIR_BUDGET
 
 
 def _watch_task(turn: Turn) -> None:
@@ -3487,6 +3528,9 @@ def _watch_task(turn: Turn) -> None:
     # （PK591783 的 R13：`api=0` 恒 0 却已经 abandoned=yes，任务分与这名
     # 劳动力一起丢掉）。这一回合照旧计入取数连败（`fails` 与输出无关），
     # 由更宽的 `TASK_API_FAIL_LIMIT` 兜底，任务不会因此永远挂在任务点上。
+    # 整条命令被掐掉的那种同理（判据 4，见 `_task_fetch_failed`）：超时只是
+    # 说明这条命令做得太多，下一回合压小搜目录上限重试即可（`_task_retry_budget`），
+    # 不该在第 3 个回合就把任务判死。
     if not output:
         repeats = 0
     elif _task_fetch_failed(output):
@@ -3525,7 +3569,9 @@ def _task_abandoned(turn: Turn) -> bool:
     的 R11–R14 就是这么在接任务后的第 4 个回合被放弃的，`rounds` 才 4、
     `fails` 才 3，两条更宽的线都还没到）；执行器跑过、却连一次请求都没发出去
     的回合同理（PK591684 的 R11–R13，`[SCAN] docs=2 key=yes` 而 `api=0`），
-    `repeats` 同样被按住，交给取数连败那条线。
+    `repeats` 同样被按住，交给取数连败那条线；整条命令被掐掉的回合同样按住
+    `repeats`（`TASK_TIMEOUT_MARKER`，PK590252 的 R13），下一回合用压小的
+    搜目录上限重试（见 `_task_retry_budget`）。
 
     观察值必须是本回合或上一回合记下的（`sandbox_command` 排在 `decide` 之前
     调用时，看到的是上一回合那条），回合号对不上就当作没有观察，免得把别的
@@ -4026,15 +4072,22 @@ def _sandbox_command(turn: Turn) -> str:
     # `_task_answer` 采纳，而执行器里的取数失败时退出码可能是非 0 的。
     # 回合号作为候选地址的轮转量传进去（S1）：取数的地址是照文档猜的，而每回合
     # 算出来的候选清单逐字相同，不轮转就永远只试最前面那 `TASK_API_MAX_CALLS` 条
-    # （复盘里沙盒连着几回合输出逐字相同、api 恒 0，重试等于没重试）
+    # （复盘里沙盒连着几回合输出逐字相同、api 恒 0，重试等于没重试）。
+    # 搜目录的上限同理按上一回合的观察给（S3）：上一回合整条命令被超时掐掉时，
+    # 这一回合少扫一点目录、把时间留给取数那几步（见 `_task_retry_budget`）。
     return (
-        f'echo "{marker}"; {_task_executor(target, turn.round_no)}'
+        f'echo "{marker}";'
+        f" {_task_executor(target, turn.round_no, _task_retry_budget(turn))}"
         f'\necho "{TASK_END_MARKER}"; {scan};'
         f' {_task_dump(turn)}; :'
     )
 
 
-def _task_executor(task_path: str, offset: int = 0) -> str:
+def _task_executor(
+    task_path: str,
+    offset: int = 0,
+    dir_budget: int = TASK_EXEC_DIR_BUDGET,
+) -> str:
     """在沙盒里执行自进化任务的命令片段（读任务文件 -> 调接口取数 -> 打答案）
 
     沙盒里只有基础 shell 与 python，命令一回合只能下一发、限时 15 秒，
@@ -4046,6 +4099,8 @@ def _task_executor(task_path: str, offset: int = 0) -> str:
         offset: 候选地址的轮转量（S1，通常传当前回合号）：候选清单比
             `TASK_API_MAX_CALLS` 长，每回合算出来的清单又逐字相同，不轮转
             就永远只试最前面那几条（见执行器里的 `rotate`）
+        dir_budget: 搜目录的上限（通常 `TASK_EXEC_DIR_BUDGET`；上一回合整条
+            命令被掐掉时压小，见 `_task_retry_budget`）
 
     返回:
         可直接拼进沙盒命令的 shell 片段
@@ -4059,7 +4114,7 @@ def _task_executor(task_path: str, offset: int = 0) -> str:
         .replace("__KEEP__", str(TASK_API_KEEP))
         .replace("__OFFSET__", str(offset))
         .replace("__TIME_BUDGET__", str(TASK_API_TIME_BUDGET))
-        .replace("__DIR_BUDGET__", str(TASK_EXEC_DIR_BUDGET))
+        .replace("__DIR_BUDGET__", str(dir_budget))
         .replace("__QUERY_MAX__", str(TASK_API_QUERY_MAX))
         .replace("__BODY_LIMIT__", str(TASK_API_BODY_LIMIT))
         .replace("__SOLVE_MAX__", str(TASK_SOLVE_MAX))

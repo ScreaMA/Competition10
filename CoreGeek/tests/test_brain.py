@@ -39,6 +39,8 @@ from agent.brain import (
     TASK_DATA_MARKER,
     TASK_DOC_MARKER,
     TASK_END_MARKER,
+    TASK_EXEC_DIR_BUDGET,
+    TASK_EXEC_RETRY_DIR_BUDGET,
     TASK_FILE_END,
     TASK_FILE_EXTS,
     TASK_FILE_MARKER,
@@ -52,6 +54,7 @@ from agent.brain import (
     TASK_SOLUTION_MARKER,
     TASK_SUBMIT_LIMIT,
     TASK_TIMEOUT,
+    TASK_TIMEOUT_MARKER,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
     WALL_BUILD_ROUNDS,
@@ -83,6 +86,7 @@ from agent.brain import (
     _step_toward,
     _stone_demand,
     _task_executor,
+    _task_retry_budget,
     _task_token,
     _tower_site_brief,
     _tower_sites_reachable,
@@ -3590,6 +3594,90 @@ def test_task_survives_scan_output_that_never_calls_the_api(
                     command["targetPos"][0]["x"], command["targetPos"][0]["y"],
                 )
                 assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
+
+
+def test_task_survives_a_timed_out_sandbox_command(payload_factory, role_factory):
+    """整条命令被超时掐掉时也走取数连败线，而不是读文件循环线（S1）
+
+    回归：PK590252 的 R13 整条命令 `[TIMEOUT]`。超时落在取数证据打出来之前时，
+    输出里同样一行 `[API]`/`[APIFAIL]` 都没有（`[SCAN]` 也可能还没轮到打印就被
+    掐了），旧判据只认"输出逐字相同 = 读文件死循环"，接上任务后的第 3 个回合
+    就把任务熔断——可超时说明的是"这条命令做得太多"，重试（下一回合压小搜目录
+    上限去取数，见 `_task_retry_budget`）与 LLM 兜底一次都没轮上。
+
+    这里锁两件事：熔断落在 `TASK_API_FAIL_LIMIT` 那一回合（不是第 3 个回合），
+    且途中每一回合 `repeats` 都没到 `TASK_LOOP_LIMIT`。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    weapon = Pos(9, 24)
+
+    for offset in range(TASK_API_FAIL_LIMIT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        # 判题器掐掉整条命令后留下的形态：任务标识还在，取数证据一个都没有
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task, f"被掐断的半截输出\n{TASK_TIMEOUT_MARKER}\n",
+        )
+        commands, _ = decide(payload)
+
+        if offset == TASK_API_FAIL_LIMIT - 1:
+            # 到取数连败止损线：放弃任务，开拓者回基地跟队
+            assert sandbox_command(payload) == ""
+            assert commands["10011"]["action"] == "move"
+            step = Pos(
+                commands["10011"]["targetPos"][0]["x"],
+                commands["10011"]["targetPos"][0]["y"],
+            )
+            assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+        else:
+            # 还没到止损线：超时不算"读文件循环"，`repeats` 被按在原地
+            assert brain._TASK_WATCH is not None
+            assert brain._TASK_WATCH.repeats < TASK_LOOP_LIMIT
+            assert sandbox_command(payload) != ""
+            command = commands.get("10011")
+            assert command is None or command["action"] == "move"
+
+
+def test_executor_shrinks_the_directory_budget_after_a_timeout(
+    payload_factory, role_factory,
+):
+    """上一回合整条命令被超时掐掉后，重试回合压小搜目录上限（S3 的"读题去重"）
+
+    全盘 walk 是沙盒命令里最慢的一步，也是超时那一回合的时间去处。题干上一回合
+    已经读过一遍，重试该把 15 秒花在"调接口取数"上：搜目录的上限压到
+    `TASK_EXEC_RETRY_DIR_BUDGET`，命令才跑得到取数那几步。没有超时观察的回合
+    沿用原上限（搜不到任务文件与接口文档时还得靠全盘兜底把文档捞回来）。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+
+    timed_out = _stuck_task_payload(
+        payload_factory, role_factory, phase_task, 12,
+    )
+    timed_out["lastCmdResult"] = _sandbox_result(phase_task, f"{TASK_TIMEOUT_MARKER}\n")
+    assert _task_retry_budget(Turn.load(timed_out)) == TASK_EXEC_RETRY_DIR_BUDGET
+    command = sandbox_command(timed_out)
+    # 上限确实压进了执行器脚本（换行收尾，免得匹配上 `DIR_BUDGET = 4000`）
+    assert f"DIR_BUDGET = {TASK_EXEC_RETRY_DIR_BUDGET}\n" in command
+
+    # 正常回合（沙盒跑过、取数失败）：沿用原上限
+    failed = _stuck_task_payload(
+        payload_factory, role_factory, phase_task, 12,
+    )
+    failed["lastCmdResult"] = _sandbox_result(
+        phase_task, f"{TASK_API_FAIL_MARKER} http://localhost:8899 HTTPError 404\n",
+    )
+    assert _task_retry_budget(Turn.load(failed)) == TASK_EXEC_DIR_BUDGET
+    command = sandbox_command(failed)
+    assert f"DIR_BUDGET = {TASK_EXEC_DIR_BUDGET}\n" in command
+
+    # 判题器整份换成 `[TIMEOUT]`（连任务标识都没打出来）时同样压小：这一回合
+    # 最该少扫一点目录，按任务标识认领反而会漏掉它
+    replaced = _stuck_task_payload(
+        payload_factory, role_factory, phase_task, 12,
+    )
+    replaced["lastCmdResult"] = f"{TASK_TIMEOUT_MARKER}\n"
+    assert _task_retry_budget(Turn.load(replaced)) == TASK_EXEC_RETRY_DIR_BUDGET
 
 
 def test_llm_command_round_is_not_a_read_file_loop(
