@@ -76,6 +76,9 @@ WALL_BUILD_PRIORITY = 1000  # 围墙建造优先级
 SELL_BATCH = 10  # 卖给小贩的矿石批次大小
 DUSK_ROUNDS = 5  # 天黑前提前回防的回合数
 MIN_TOWERS_BEFORE_NIGHT = 2  # 入夜前的最低火力：不足时优先抢建而不是回防待命
+# 入夜前的最低围墙段数：复盘里首夜防线只有一座光塔、零段围墙，这里要求
+# 临天黑时再抢铺一段（手里有石材才抢建，没石材仍然按原策略回防）
+MIN_WALLS_BEFORE_NIGHT = 2
 WEAPON_UPGRADE_VOUCHER = "WeaponUpgradeVoucher1"  # 武器升级券（level1->level2）
 UPGRADE_GOLD = 100  # 购买一张武器升级券所需金币
 
@@ -206,6 +209,9 @@ def _decide_day(
 ) -> None:
     """白天策略: 建造、采集、任务
 
+    所有分支跑完后还有一个兜底（`_idle_gather`）：白天还没有任何指令的角色
+    就近采一铲矿，保证不会整回合零动作。
+
     参数:
         turn: 当前回合信息
         commands: 指令输出字典（角色ID -> 指令）
@@ -232,8 +238,8 @@ def _decide_day(
     claimed: set[Pos] = set()
 
     # 天黑前留出回防时间，避免夜晚武器无人操控而空转；
-    # 但防线没达标时（火力不足或一段围墙都没立）先抢建：多一座塔比多一个
-    # 站在武器旁待命的角色更能提升夜晚火力
+    # 但防线没达标时（火力不足或围墙不足两段）先抢建：多一座塔、多一段墙
+    # 比多一个站在武器旁待命的角色更能提升夜晚防御
     dusk = _rounds_to_night(turn) <= DUSK_ROUNDS
     must_build = dusk and _needs_last_build(turn, free_towers, free_walls)
 
@@ -252,6 +258,48 @@ def _decide_day(
         _pioneer_day_logic(
             turn, pioneer, tower_sites, wall_order, claimed, commands,
         )
+
+    # 兜底：走到这里还没有任何指令的角色就近采一铲矿，保证白天不会整回合
+    # 零动作（复盘里的"三个单位原地小步挪动、金币冻结"）。黄昏回防与任务
+    # 待命是有意为之的"原地不动"，不在此列（见 `_idle_gather`）。
+    if not dusk:
+        for unit in turn.controllable():
+            _idle_gather(turn, unit, claimed, commands)
+
+
+def _idle_gather(
+    turn: Turn,
+    unit: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> None:
+    """兜底：没有任何目标的角色就近采一铲矿
+
+    决策的各条分支都会尽量给角色安排动作，但任务点够不到、武器还没建成、
+    地图上一座矿都采不了时，角色会整回合没有任何指令（复盘里的"角色原地
+    挪位、金币连续多回合冻结"）。这里做最后一道兜底——按 石→铁→铜 就近
+    采集，采不到就不下指令，交给下一回合重新判断。
+
+    不打扰的情况:
+        - 本回合已经有指令的角色（决策层已经给了更优先的动作）
+        - 任务进行中的开拓者：任务要求它留在任务点周围一格内，
+          任何移动都可能让任务强制结束
+        - 黄昏（调用方不调用）：回防到武器旁待命比多采一铲矿更重要，
+          武器要有角色操控才会开火
+
+    参数:
+        turn: 当前回合信息
+        unit: 待兜底的角色
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+    """
+    if unit.unit_id in commands:
+        return
+    if unit.kind == PIONEER and turn.phase_task:
+        return
+    for mine_type in SELLABLE_MINES:
+        if _go_mine(turn, unit, mine_type, claimed, commands):
+            return
 
 
 def _worker_day_logic(
@@ -454,6 +502,8 @@ def _pioneer_day_logic(
     任务规则（任务书5章）:
         - 开拓者需在己方任务点周围一格内领取任务
         - 领取后离开任务点周围一格会导致任务强制结束
+        - 任务点2占据两格，站在任意一格旁边都算"在任务点周围一格内"
+          （判定见 `_task_distance`）
         - 任务结束后需要等待冷却，冷却期内 isValid 为 false
         - 自进化类任务需在沙盒中取数后作答，答案经 `submitAnswer` 提交
 
@@ -473,8 +523,9 @@ def _pioneer_day_logic(
     if turn.phase_task:
         task_pos = _nearest_task_position(turn, pioneer.pos)
         if task_pos is not None:
-            if distance(pioneer.pos, task_pos) > 1:
-                step = _step_toward(turn, pioneer, task_pos, claimed)
+            if _task_distance(turn, pioneer.pos, task_pos) > 1:
+                target = _nearest_task_cell(turn, pioneer.pos, task_pos)
+                step = _step_toward(turn, pioneer, target, claimed)
                 if step is not None:
                     commands[pioneer.unit_id] = move_command(step)
                 return
@@ -535,19 +586,57 @@ def _head_to_task(
 ) -> bool:
     """走向任务点，到了就领取任务
 
+    到达判定用任务点的全部格子（见 `_task_distance`）：任务点2占据两格，
+    开拓者站在另一格旁边同样可以领取，不必再绕到报文给出的那一格。
+
     返回:
         True 表示本回合已下达指令（领取或移动）
     """
-    if distance(pioneer.pos, task_pos) <= 1:
+    if _task_distance(turn, pioneer.pos, task_pos) <= 1:
         commands[pioneer.unit_id] = accept_task_command()
         return True
 
-    step = _step_toward(turn, pioneer, task_pos, claimed)
+    step = _step_toward(
+        turn, pioneer, _nearest_task_cell(turn, pioneer.pos, task_pos), claimed,
+    )
     if step is None:
         return False
 
     commands[pioneer.unit_id] = move_command(step)
     return True
+
+
+def _task_point_cells(turn: Turn) -> tuple[Pos, ...]:
+    """己方任务点在地图上占据的全部格子
+
+    任务点2占据两格（任务书4.6.2节），报文与地图里都可能只给出其中一格，
+    因此把 playerTasks 的坐标与地图上本阵营任务点的坐标合并去重。
+    """
+    kinds = _TASK_POINTS_BY_TEAM.get(turn.team_type, ())
+    cells = [task.task_position for task in turn.player_tasks]
+    cells += [pos for pos, kind in turn.zones.items() if kind in kinds]
+    return tuple(dict.fromkeys(cells))
+
+
+def _task_cells_of(turn: Turn, task_pos: Pos) -> tuple[Pos, ...]:
+    """某个任务点占据的格子：报文给出的那一格 + 与它相邻的同阵营任务点格子"""
+    return (task_pos,) + tuple(
+        cell for cell in _task_point_cells(turn)
+        if cell != task_pos and distance(cell, task_pos) <= 1
+    )
+
+
+def _task_distance(turn: Turn, origin: Pos, task_pos: Pos) -> int:
+    """origin 到该任务点的距离（到它的任意一格）"""
+    return min(distance(origin, cell) for cell in _task_cells_of(turn, task_pos))
+
+
+def _nearest_task_cell(turn: Turn, origin: Pos, task_pos: Pos) -> Pos:
+    """任务点里离 origin 最近的一格（两格任务点走最近的那格）"""
+    return min(
+        _task_cells_of(turn, task_pos),
+        key=lambda cell: (distance(origin, cell), cell.x, cell.y),
+    )
 
 
 def _rounds_until_task(turn: Turn) -> int:
@@ -723,8 +812,9 @@ def _needs_last_build(
     """天黑前是否还要抢建（入夜前的火力/防线预算检查）
 
     只在天黑前的最后几个回合使用。火力不够又买得起塔时先补塔，手里有石头
-    却还没立起第一段围墙时先补墙；这两件事都在基地旁边完成，做完再回防
-    也来得及，比整队提前回防更划算。
+    却还没铺够 `MIN_WALLS_BEFORE_NIGHT` 段围墙时先补墙——首夜只有一座光塔、
+    零段围墙时防线没有纵深（复盘里的"首夜崩盘"）。这两件事都在基地旁边
+    完成，做完再回防也来得及，比整队提前回防更划算。
 
     参数:
         turn: 当前回合信息
@@ -741,7 +831,7 @@ def _needs_last_build(
     ):
         return True
 
-    if walls_missing and not turn.walls():
+    if walls_missing and len(turn.walls()) < MIN_WALLS_BEFORE_NIGHT:
         return any(WALL_MATERIAL in worker.backpack for worker in turn.workers())
 
     return False

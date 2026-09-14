@@ -36,6 +36,7 @@ from agent.protocol import (
     CHALLENGER_TASK_1,
     COPPER_MINE,
     DAY_ROUNDS,
+    DEFENDER_TASK_2,
     GATLING,
     IRON_MINE,
     PIONEER,
@@ -716,6 +717,97 @@ def test_economy_worker_skips_vendor_trip_close_to_night(
     assert "10012" not in commands
 
 
+# === 空转兜底与首夜防线（issue #13） ===
+
+
+def test_pioneer_without_task_gathers_instead_of_idling(
+    payload_factory, role_factory,
+):
+    """既没有任务也没有武器时，开拓者就近采矿，而不是原地待着
+
+    回归：复盘里"三个单位原地小步挪动、金币连续多回合冻结"——决策的每条
+    分支都没目标时角色会整回合没有任何指令。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 5, 23, backPackCapability=40)],
+        zones=[(STONE_MINE, 4, 24)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "collect",
+        "targetPos": [{"x": 4, "y": 24}],
+    }
+
+
+def test_idle_gather_keeps_pioneer_on_running_task(
+    payload_factory, role_factory,
+):
+    """任务进行中的开拓者不被兜底支走（离开任务点周围一格会强制结束任务）"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        zones=[(STONE_MINE, 15, 15)],
+        phase_task="自进化类任务：请查询北京天气",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands
+
+
+def test_idle_gather_waits_for_night_instead_of_mining(
+    payload_factory, role_factory,
+):
+    """天黑前回防待命的角色不被兜底支去采矿（夜晚武器要有人操控才会开火）"""
+    payload = payload_factory(
+        round_no=DAY_ROUNDS - 3,  # 距天黑还有4回合
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, 9, 25, backPackCapability=100),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+        zones=[(STONE_MINE, 9, 26)],  # 紧邻石矿，但回防优先
+    )
+    commands, _ = decide(payload)
+
+    assert "10010" not in commands
+
+
+def test_worker_builds_second_wall_before_night(
+    payload_factory, role_factory,
+):
+    """天黑前不足两段围墙时，手里有石头就先补墙，而不是提前回防
+
+    回归：复盘里首夜只有一座光塔、零段围墙，防线没有纵深；以前只要立起
+    一段围墙就算"防线达标"，工人会被提前召回武器旁。
+    """
+    order = _calc_wall_order(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=DAY_ROUNDS - 3,  # 距天黑还有4回合
+        gold=0,
+        roles=[
+            role_factory(
+                10010, WORKER, 13, 27, backPackCapability=100,
+                backpack=[WALL_MATERIAL],
+            ),
+            # 已经立起的一段围墙（不在施工顺位首位，工人仍该去补更靠前的一段）
+            role_factory(10020, WALL, order[-1].x, order[-1].y),
+            role_factory(10030, GATLING, 9, 24, attackRange=4),
+        ],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 13, "y": 26}],
+        "name": WALL,
+    }
+
+
 # === 任务系统 ===
 
 
@@ -891,6 +983,41 @@ def test_pioneer_uses_map_task_point_without_task_data(
     assert command["action"] == "move"
     step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
     assert distance(step, Pos(14, 14)) < distance(before, Pos(14, 14))
+
+
+def test_pioneer_accepts_task_from_second_cell(payload_factory, role_factory):
+    """任务点2占据两格（任务书4.6.2）：站在另一格旁边同样能领任务
+
+    回归：以前只按报文给出的那一格算距离，开拓者站在任务点另一格旁边
+    （距离 2）会继续绕路，白白多跑几个回合。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        team_type="defender",
+        roles=[role_factory(10011, PIONEER, 28, 18, backPackCapability=40)],
+        tasks=[(26, 17)],
+        zones=[(DEFENDER_TASK_2, 26, 17), (DEFENDER_TASK_2, 27, 17)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {"action": "acceptTask"}
+
+
+def test_pioneer_holds_task_from_second_cell(payload_factory, role_factory):
+    """任务点在另一格旁边时原地待命，不再来回挪位"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        team_type="defender",
+        roles=[role_factory(10011, PIONEER, 28, 18, backPackCapability=40)],
+        tasks=[(26, 17)],
+        zones=[(DEFENDER_TASK_2, 26, 17), (DEFENDER_TASK_2, 27, 17)],
+        phase_task="自进化类任务：请阅读task_1_beijing.md",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands
 
 
 # === 自进化任务（沙盒作答） ===
