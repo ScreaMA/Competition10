@@ -6270,14 +6270,41 @@ def test_answer_value_rejects_a_pure_harness_banner():
     """整份输出都是脚本状态行时没有答案可交（S1，PK591930 的 R14）
 
     自检横幅不是答案：交上去判 0，还白占一次提交额度（`TASK_SUBMIT_LIMIT`）。
-    只看"每一行都是状态行"，正常答案里夹一行状态行不受影响。
+    判据是"自检行占了多数"，正常答案里夹一行状态行不受影响。
     """
     assert brain._answer_value("[ OK ] 全部通过 (6/6)") == ""
     assert brain._answer_value("[FAIL] 3/6 用例未过") == ""
     assert brain._answer_value("[ OK ] 全部通过 (6/6)\n[FAIL] 3/6 用例未过") == ""
-    # 夹了一行真数据的输出不算"只有状态行"
+    # 夹了一行真数据的输出不算"只有自检行"
     assert brain._answer_value("[ OK ] 全部通过 (6/6)\n北京故宫") == (
         "[ OK ] 全部通过 (6/6)\n北京故宫"
+    )
+
+
+def test_answer_value_rejects_a_check_log_with_a_summary_line():
+    """校验脚本的"逐项状态 + 收尾小结"不是答案（S1，PK591993 的 R14）
+
+    复盘里 `./check` 的这一整段被当成答案交了上去（`submitAnswer [FAIL] 4/6
+    通过，2 失败…`），任务判负还烧掉一次提交额度。小结行不带方括号，只认
+    "每一行都是状态行"的旧判据拦不住它；`4/6 通过，2 失败` 里的计数是它和
+    正经答案的区别，所以判据限定在带统计量的短行上。
+    """
+    check_log = (
+        "[FAIL] config/alpha.conf 第 3 行 port 应为 8080\n"
+        "[FAIL] config/alpha.conf 第 6 行缺少 name\n"
+        "4/6 通过，2 失败"
+    )
+    assert brain._answer_value(check_log) == ""
+    # 逐项状态行之外还夹着别的细节行时，自检行仍然占多数
+    assert brain._answer_value(
+        "[FAIL] config/alpha.conf 第 3 行\n"
+        "  - 期望 8080，实际 alpha-app\n"
+        "4/6 通过，2 失败",
+    ) == ""
+    # 没有计数的"通过/失败"只是行文，带数字的普通答案同样照旧放行
+    assert brain._answer_value("2024年通过验收") == "2024年通过验收"
+    assert brain._answer_value('{"city": "北京", "count": 7}') == (
+        '{"city": "北京", "count": 7}'
     )
 
 
@@ -6327,6 +6354,37 @@ def test_task_answer_skips_a_pure_harness_banner(payload_factory, role_factory):
     payload = _llm_task_payload(
         payload_factory, role_factory, phase_task, 13,
         evidence="[ OK ] 全部通过 (6/6)\n",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_task_answer_skips_a_check_log_with_a_summary_line(
+    payload_factory, role_factory,
+):
+    """LLM 命令跑的是校验脚本时不把它的回显当答案（S1，PK591993 的 R14）
+
+    复盘里 `./check` 的"逐项 [FAIL] + 一行小结"被整段交了上去
+    （`submitAnswer "[FAIL] 4/6 通过，2 失败…"`），任务判负；小结行没有方括号，
+    只认状态行的判据拦不住，这一整段必须留在沙盒里。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_alpha.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: ./check"
+    decide(payload)
+    sandbox_command(payload)
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        evidence=(
+            "[FAIL] config/alpha.conf 第 3 行 port 应为 8080\n"
+            "[FAIL] config/alpha.conf 第 6 行缺少 name\n"
+            "4/6 通过，2 失败\n"
+        ),
     )
     commands, _ = decide(payload)
 

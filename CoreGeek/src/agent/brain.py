@@ -686,11 +686,25 @@ TASK_ANSWER_VALUE = re.compile(
     re.IGNORECASE,
 )
 # 一眼就是"脚本状态行"的形态（`[ OK ] 全部通过 (6/6)`、`[FAIL] 3/6 用例未过`）：
-# 整份输出全是这种行时说明沙盒这一趟只打了个状态就收工，没有任何答案可交，
-# 交上去同样判 0（S1）。只在"每一行都是状态行"时才判定，答案里出现一行
-# `[OK] xxx` 不会被误伤。
+# 这种行占了多数时说明沙盒这一趟只打了个状态就收工，没有任何答案可交，
+# 交上去同样判 0（S1，判定见 `_task_harness_only`）。
 TASK_HARNESS_LINE = re.compile(
     r"^\s*\[\s*(?:OK|PASS|FAIL|ERROR|WARN|DONE)\s*\]\s*[^\r\n]*$",
+    re.IGNORECASE,
+)
+# 自检脚本的"小结行"（`4/6 通过，2 失败`、`FAILED (failures=2)`、
+# `4 passed, 2 failed`）：`./check` 这类校验脚本逐项打完 `[FAIL]` 之后，
+# 收尾就是这么一行不带方括号的统计——只认 `TASK_HARNESS_LINE` 的话，
+# "逐项状态 + 小结"这种最常见的回显一条都拦不住（复盘 PK591993 的 R14：
+# 整段自检回显被当成答案交了上去，Judge 判 0、还烧掉一次提交额度）。
+#
+# 判据限定在"带统计量的短行"上（`N/M`、`failures=N`、`N passed/failed`）：
+# 光凭"通过/失败"两个字认会把 `2024年通过验收` 这类正经答案误伤掉，
+# 而自检小结一定带着 `4/6` 这样的计数。
+TASK_HARNESS_SUMMARY = re.compile(
+    r"^\s*[^\r\n]{0,32}?"
+    r"(?:\d+\s*/\s*\d+|failures?\s*[=:]\s*\d+|\d+\s+(?:passed|failed)\b)"
+    r"[^\r\n]{0,24}$",
     re.IGNORECASE,
 )
 
@@ -5084,14 +5098,28 @@ def _task_token(phase_task: str) -> str:
 
 
 def _task_harness_only(text: str) -> bool:
-    """输出是不是"只打了个状态就收工"（S1）
+    """输出是不是"只打了个自检结果就收工"（S1）
 
-    每一行都是 `[ OK ]` / `[FAIL]` 这类脚本状态行时，这一趟沙盒没有任何答案
-    可言（复盘 PK591930 的 R14：自检横幅被整行当成答案交了上去）。只看
-    "每一行都是"，正常答案里夹一行状态行不受影响。
+    自检脚本的回显由两类行组成：逐项的状态行（`[ OK ]` / `[FAIL]`，
+    `TASK_HARNESS_LINE`）与收尾的小结行（`4/6 通过，2 失败`，
+    `TASK_HARNESS_SUMMARY`）。这两类行占了多数时，这一趟沙盒只是把自检
+    结果打了回来，没有任何答案可言——复盘 PK591930 的 R14 把一整行自检横幅
+    当成答案交了上去，PK591993 的 R14 交的是"逐项 [FAIL] + 一行小结"，
+    Judge 两次都判 0。
+
+    判据是"自检行占了多数"（而不是原来的"每一行都是"）：脚本的小结行不带
+    方括号，只认方括号的话"逐项 [FAIL] + 小结"这种最常见的形态一条都拦不住。
+    反过来，"横幅 + 一行真数据"（`[ OK ] 全部通过 (6/6)\\n北京故宫`，自检行
+    只占一半）仍然照旧放行，正常答案里夹一行状态行不会被误伤。
     """
     lines = [line for line in text.splitlines() if line.strip()]
-    return bool(lines) and all(TASK_HARNESS_LINE.match(line) for line in lines)
+    if not lines:
+        return False
+    noise = sum(
+        1 for line in lines
+        if TASK_HARNESS_LINE.match(line) or TASK_HARNESS_SUMMARY.match(line)
+    )
+    return noise * 2 > len(lines)
 
 
 def _answer_value(text: str) -> str:
@@ -5102,8 +5130,9 @@ def _answer_value(text: str) -> str:
     fc1e78eb2a5a` 原样提交）。这里按"输出里有没有点名答案的标记"收一道：
 
         - 有 `TOKEN: <值>` / `答案：<值>` 这类显式标记时只交标记后的那个值；
-        - 整份输出都是脚本状态行（`_task_harness_only`）时没有答案可交，
-          返回空串（调用方据此不提交，省下一次提交额度与一个任务回合）；
+        - 输出以脚本自检行（逐项状态行加收尾小结行）为主（`_task_harness_only`）
+          时没有答案可交，返回空串（调用方据此不提交，省下一次提交额度与一个
+          任务回合）；
         - 其余情况原样返回，行为与改造前一致（答案长什么样无法正面判定，
           不在这里猜）。
 
@@ -5144,9 +5173,10 @@ def _task_answer(turn: Turn) -> str | None:
         5. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
            "该读哪个文件"当成了答案。
     闸门都过完之后还要按 `_answer_value` 收一道（S1）：输出里点名了
-    `TOKEN:`/`答案：` 时只交标记后的那个值，整份输出都是脚本状态行时干脆不交
-    （PK591930 的 R14 把 `[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a` 整行
-    交了上去，Judge 判 0）。
+    `TOKEN:`/`答案：` 时只交标记后的那个值，输出以脚本自检行（逐项状态行加
+    收尾小结行）为主时干脆不交（PK591930 的 R14 把
+    `[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a` 整行交了上去，PK591993 的
+    R14 交的是"逐项 [FAIL] + `4/6 通过，2 失败`"，Judge 都判 0）。
     走 LLM 那条路时输出里没有文档指纹可比，另有一道按"文档长什么样"判定的
     闸门（`_task_doc_body`，PK590836 的 R15 交的是 API 文档正文）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
@@ -5165,8 +5195,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     `short_or_missing` / `echo_task_text`（答案就是任务原文）/
     `error_body`（答案是接口的错误响应体）/ `doc_text`（答案是沙盒里那份文档的
     原文）/ `path_answer`（答案是一条文件路径）/ `doc_body`（答案是 Markdown
-    文档的正文，见 `_task_doc_body`）/ `harness_only`（答案区里只有脚本状态行，
-    没有答案可交，见 `_answer_value`）。
+    文档的正文，见 `_task_doc_body`）/ `harness_only`（答案区里只有脚本自检
+    回显——逐项状态行加收尾小结行，没有答案可交，见 `_answer_value`）。
     """
     if not turn.phase_task:
         return None, "no_task"
