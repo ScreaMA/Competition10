@@ -377,14 +377,16 @@ TASK_API_BODY_LIMIT = 400  # 单个响应体最多带回的字符数
 TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一）
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
-# 全盘兜底找接口文档时的文件名特征（S1，复盘 PK591809）：任务根目录里的
+# 兜底找接口文档时的文件名特征（S1，复盘 PK591809）：任务根目录里的
 # `.md` 首先命中的就是任务文件自己（任务书就是 `.md`，同样落在
 # `TASK_API_DOC_NAMES` 里），所以近处搜到的"文档"可能一份接口说明都不含，
 # 取数地址与鉴权 Key 都读不到——`[SCAN] docs=2 urls=1 key=no` 那个形态里，
 # `urls` 只剩本地接口那一条兜底，取数只能一路 404 到止损。手上这几份文档里
-# 一个本地接口地址都没有时，到全盘再找一遍（见执行器里的这段），但只认
-# 名字里写着"接口/文档"的那些：比 `\.md$` 窄得多，免得又把 /usr 下的库文档
-# 与任务文件自己捞回来占满名额。
+# 一个本地接口地址都没有时，或者读回来的"文档"全是任务文件自己时（复盘
+# PK591990 的 `docs=2 urls=2 key=yes` 却 `api=0 fail=8`：地址与 Key 都是从
+# 题面里抄来的，接口文档一次都没读到），按这几个名字再找一遍（见执行器里的
+# 那段），但只认名字里写着"接口/文档"的那些：比 `\.md$` 窄得多，免得又把
+# /usr 下的库文档与任务文件自己捞回来占满名额。
 TASK_DOC_WIDE_NAMES = (
     r"api", r"interface", r"swagger", r"openapi", r"readme", r"doc",
     r"接口", r"说明", r"文档",
@@ -4864,18 +4866,37 @@ doc_files = find_files(DOC_NAMES, 6, doc_roots, DOC_PRUNE)
 if not doc_files:
     doc_files = find_files(DOC_NAMES, 6, ("/",), DOC_PRUNE)
 doc_text = "\\n".join(read(path) for path in doc_files)
-# 近处这几份文档里连一个本地接口地址都没抓到（S1，复盘 PK591809 的
-# `[SCAN] docs=2 urls=1 key=no`）时，到全盘再找一遍接口文档并进来：任务
+# 接口文档的兜底搜索（S1）：下面两种形态都说明"接口文档还没读到"——任务
 # 根目录里的 `.md` 首先命中的是任务文件自己（任务书就是 `.md`），上面那条
-# `if not doc_files` 的兜底因此永远触发不了——接口文档不在任务树里时一次都
-# 读不到，`endpoints` 只剩本地接口那一行兜底，取数只能一路 404 到止损
-# （`api=0`、答案区永远为空）。只认 `WIDE_DOC_NAMES` 那几种名字，避免把
-# 无关的 `.md` 再捞一堆回来。
-if not re.search(r"https?://(?:localhost|127\\.0\\.0\\.1)", doc_text):
+# `if not doc_files` 的兜底因此永远触发不了；接口文档一份没读到，`endpoints`
+# 只剩本地接口那一行兜底或题面里抄来的地址，取数只能一路 404 到止损
+# （`api=0`、答案区永远为空）。
+#   1. 近处这几份文档里连一个本地接口地址都没抓到（复盘 PK591809 的
+#      `[SCAN] docs=2 urls=1 key=no`）；
+#   2. 近处搜回来的"文档"全是任务文件自己（复盘 PK591990 的 `[SCAN] docs=2
+#      urls=2 key=yes` 却 `api=0 fail=8`：两个任务点各有一份任务文件，
+#      `DOC_NAMES` 的 `\\.md$` 命中的就是它们，`urls`/`key` 是从题面里抄来的，
+#      旧判据据此以为"本地接口地址已经抓到"而跳过兜底，真正的接口文档一次
+#      都没读进来，8 个候选地址全打在题面猜出来的路径上）。
+# 只认 `WIDE_DOC_NAMES` 那几种名字（比 `\\.md$` 窄得多），避免把无关的 `.md`
+# 与 /usr 下的库文档再捞一堆回来；搜索顺序是"先任务树、后全盘"——全盘 walk
+# 是整条命令里最慢的一步（见 `_task_retry_budget`），任务树里找得到就不必
+# 再扫一遍全盘。
+task_names = {os.path.basename(path) for path in files}
+near_docs = [
+    path for path in doc_files if os.path.basename(path) not in task_names
+]
+has_local = re.search(r"https?://(?:localhost|127\\.0\\.0\\.1)", doc_text) is not None
+if not near_docs or not has_local:
     wide = [
-        path for path in find_files(WIDE_DOC_NAMES, 6, ("/",), DOC_PRUNE)
+        path for path in find_files(WIDE_DOC_NAMES, 6, doc_roots, DOC_PRUNE)
         if path not in doc_files
     ]
+    if not wide and not has_local:
+        wide = [
+            path for path in find_files(WIDE_DOC_NAMES, 6, ("/",), DOC_PRUNE)
+            if path not in doc_files
+        ]
     if wide:
         doc_files += wide
         doc_text += "\\n" + "\\n".join(read(path) for path in wide)
