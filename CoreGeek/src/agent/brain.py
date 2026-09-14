@@ -756,6 +756,10 @@ def _worker_day_logic(
     # 顺路补的额外目标。计划每回合现算（模块本身不存跨回合状态），下面的
     # 采集顺序与额外目标都从这里取。
     day = _day_plan(turn, worker)
+    # V4 的站位分工：0=R1 开拓者 / 1=R2 石工 / 2=R3 铜矿工人。
+    # 铜矿工人只管挖矿与变现，不砌墙、不拆墙（V4："对于铜矿工人，我们不需要
+    # 执行新建墙的步骤，并且其没有拆墙能力"）。
+    role = _stand_role(turn, worker)
 
     # 防守方的开局防线（S3）：塔位优先的建造分支会把工人一直占在基地旁等金币，
     # 首段围墙因此要等到金币花光（R8~R10）才开工，甚至整局一段都没有。这里让
@@ -763,7 +767,7 @@ def _worker_day_logic(
     # 坐标（先来敌方向）陆续铺到 `WALL_PLAN_SEGMENTS` 段，塔交给另一名工人照建
     # （只剩一名工人时不动——一双手还是先建塔）。
     if (
-        economy
+        role == 1  # V4：砌墙是石工（R2）的活，铜矿工人(R3)不新建墙
         and len(turn.workers()) >= 2
         and turn.team_type == "defender"
         and len(turn.walls()) < WALL_PLAN_SEGMENTS
@@ -859,7 +863,7 @@ def _worker_day_logic(
     # 如果有石头,去建造围墙（认领成功就记进 claimed：几名工人自然分头铺不同
     # 段，而不是都奔向优先级最高的那一段，白走一趟还互相挡路；位置都被其他
     # 角色占住时继续往下走,别空转）
-    if stones >= WALL_STONE_COST:
+    if role != 2 and stones >= WALL_STONE_COST:
         sites = _retry_sites(
             turn, worker, [site for site in walls_missing if site not in claimed],
         )
@@ -888,10 +892,12 @@ def _worker_day_logic(
         return
 
     # 最后一招（V4）：正事一件都办不成时，拆开挡在路上的残墙开路
-    # （一级墙血量低于一半就算"已经破了"，拆穿它走捷径，过去后再补回来）
-    _demolish_weak_wall(
-        turn, worker, _nearest_zone(turn, STONE_MINE, worker.pos), commands,
-    )
+    # （一级墙血量低于一半就算"已经破了"，拆穿它走捷径，过去后再补回来）。
+    # 铜矿工人没有拆墙能力，这一步跳过。
+    if role != 2:
+        _demolish_weak_wall(
+            turn, worker, _nearest_zone(turn, STONE_MINE, worker.pos), commands,
+        )
 
 
 def _gold_critical(turn: Turn) -> bool:
@@ -1091,7 +1097,10 @@ def _queue_order(turn: Turn, plan: DayPlan | None = None) -> tuple[str, ...]:
     queue = plan.queue if plan is not None else _work_queue(
         turn, _stone_demand(turn, _wall_holes(turn)),
     )
-    return tuple(dict.fromkeys(queue + SELLABLE_MINES))
+    # 铜矿工人的队列里没有石材（V4：他不砌墙，也就不需要石料）：兜底链同样
+    # 把石头放到最后——"挖石头可能反而有反作用"，只有实在没别的矿可挖时才捡
+    tail = SELLABLE_MINES if STONE_MINE in queue else INCOME_MINES + (STONE_MINE,)
+    return tuple(dict.fromkeys(queue + tail))
 
 
 def _queue_targets(
@@ -1152,6 +1161,42 @@ def _route_rounds(
     return rounds
 
 
+def _copper_return_plan(turn: Turn, worker: Unit) -> tuple[int, Pos | None]:
+    """铜矿工人一天的收尾：PLE 是小贩（V4）
+
+    铜矿工人不砌墙也不拆墙（没有施工任务），所以他的 PT 只是"从最后一站回到
+    落脚点"的路程，PLE 直接取小贩——V4 原话："对于铜矿工人…我们直接将其 PLE
+    设置为小贩，并计算小贩到 K0 点的时间为 PT"。第 4 天起的采购日再把武器商店
+    接在小贩之后（V4：武器商店必须在一天的最后、且在小贩之后）。
+
+    参数:
+        turn: 当前回合信息
+        worker: 铜矿工人
+
+    返回:
+        (PT, PLE) 二元组；地图上没有小贩时退回自己的站位
+    """
+    vendor = _nearest_zone(turn, VENDOR, worker.pos)
+    if vendor is None:
+        return 0, _stand_for(turn, worker)
+
+    rounds = 0
+    last = vendor
+    if (
+        _game_day(turn) >= FIXER_CARRIER_DAY
+        and worker.backpack.count(WALL_FIXER) < FIXER_STOCK
+    ):
+        shop = _nearest_zone(turn, WEAPON_SHOP, vendor)
+        if shop is not None:
+            rounds += distance(vendor, shop) + WALL_BUILD_ROUNDS
+            last = shop
+
+    hold = _dusk_stand(turn, worker)
+    if hold is not None:
+        rounds += distance(last, hold)
+    return rounds, vendor
+
+
 def _repair_plan(
     turn: Turn,
     worker: Unit,
@@ -1164,6 +1209,8 @@ def _repair_plan(
     （V4："以 PLE 为起点、R2 位置为终点执行修墙"）。没有破洞时 PT=0，
     PLE 照旧取 R2。
 
+    铜矿工人（R3）不施工：他的 PLE 与 PT 走 `_copper_return_plan`。
+
     参数:
         turn: 当前回合信息
         worker: 当前决策的工人
@@ -1172,6 +1219,9 @@ def _repair_plan(
     返回:
         (PT, PLE) 二元组
     """
+    if _stand_role(turn, worker) == 2:
+        return _copper_return_plan(turn, worker)
+
     stand = _stand_for(turn, worker)
     if not holes:
         return 0, stand
@@ -1206,22 +1256,28 @@ def _plan_extras(
     if total_rounds >= DAY_PLAN_LIMIT:
         return ()
 
+    copper = _stand_role(turn, worker) == 2
     extras: list[str] = []
-    if COPPER_MINE in queue or any(
-        worker.backpack.count(kind) for kind in SELLABLE_MINES
+    # 铜矿工人的 PLE 本身就是小贩（`_copper_return_plan`），不必再单列一个目标
+    if not copper and (
+        COPPER_MINE in queue
+        or any(worker.backpack.count(kind) for kind in SELLABLE_MINES)
     ):
         extras.append(VENDOR)
     if worker.health < MEDICINE_HP:
         extras.append(MEDICINE)
-    if (
-        _game_day(turn) >= FIXER_RESTOCK_DAY
-        and worker.backpack.count(WALL_FIXER) < FIXER_STOCK
-    ):
-        extras.append(WEAPON_SHOP)
+    if worker.backpack.count(WALL_FIXER) < FIXER_STOCK:
+        # 天数门槛与 `_stock_fixers` 保持一致：石工第 3 天起、铜工第 4 天起；
+        # 计划层先按门槛列出来，免得把"今天买不到的东西"排进优先级
+        restock_day = FIXER_CARRIER_DAY if copper else FIXER_RESTOCK_DAY
+        if _game_day(turn) >= restock_day:
+            extras.append(WEAPON_SHOP)
     # 铁矿/石头排在最后：这两个矿种本来就在 `_queue_order` 的兜底链里
-    # （队列里没有时按 铜->铁->石 顺延），列在这里是为了让计划本身完整
+    # （队列里没有时按 铜->铁->石 顺延），列在这里是为了让计划本身完整。
+    # 铜矿工人不挖石头（V4："挖石头可能反而有反作用"）。
     extras.append(IRON_MINE)
-    extras.append(STONE_MINE)
+    if not copper:
+        extras.append(STONE_MINE)
     return tuple(extras)
 
 
@@ -1238,7 +1294,10 @@ def _day_plan(turn: Turn, worker: Unit) -> DayPlan:
     反映进来。
     """
     holes = _wall_holes(turn)
-    stone_mines = _stone_demand(turn, holes)
+    # V4 的分工：石工（R2）按 AR 挖石料，铜矿工人（R3）整条队列都是铜/铁
+    # ——"挖石头可能反而有反作用"（石料归石工管，铜工去挖石只会白占回合）
+    copper = _stand_role(turn, worker) == 2
+    stone_mines = 0 if copper else _stone_demand(turn, holes)
     repair_rounds, end_point = _repair_plan(turn, worker, holes)
     origin = end_point if end_point is not None else worker.pos
 
@@ -1256,6 +1315,24 @@ def _day_plan(turn: Turn, worker: Unit) -> DayPlan:
         route_rounds = candidate_rounds
 
     total_rounds = repair_rounds + route_rounds
+
+    # V4 的 n−1 回退：背包里压着一批卖不掉的矿石、计划却排不下"去小贩"时，
+    # 把队列目标一个个砍掉，直到腾得出这一趟（V4："Dnum=n 通过、n+1 不通过，
+    # 但 n 时无法再额外添加一个到达小贩后售卖的环节，则需要将 n 再次-1"）。
+    # 至少留一个目标：砍到没事做不如先去把矿卖掉。
+    carried = sum(worker.backpack.count(kind) for kind in SELLABLE_MINES)
+    while (
+        len(queue) > 1
+        and carried >= SELL_BATCH
+        and VENDOR not in _plan_extras(turn, worker, tuple(queue), total_rounds)
+    ):
+        queue.pop()
+        route_rounds = _route_rounds(
+            origin, _queue_targets(turn, tuple(queue), origin),
+            end_point, STONE_PER_MINE,
+        )
+        total_rounds = repair_rounds + route_rounds
+
     return DayPlan(
         holes=holes,
         stone_mines=stone_mines,
@@ -1299,9 +1376,33 @@ def _plan_extra_action(
             return True
         if target == MEDICINE and _take_medicine(turn, worker, claimed, commands):
             return True
-        if target == WEAPON_SHOP and _stock_fixers(turn, worker, claimed, commands):
+        if (
+            target == WEAPON_SHOP
+            and _shop_is_last_stop(turn, worker)
+            and _stock_fixers(turn, worker, claimed, commands)
+        ):
             return True
     return False
+
+
+def _shop_is_last_stop(turn: Turn, worker: Unit) -> bool:
+    """去武器商店是不是"当天最后一站"（V4 的先后硬约束）
+
+    V4 要求商店必须排在一天的最后、且在小贩之后（"必须一天中的最后时间抵达
+    武器商店位于小贩之后"）。判断口径：剩下的白天回合刚好只够"走到商店 +
+    回落脚点"——再多就说明还有正事（挖矿、修墙、卖矿）没干完，这一回合不
+    该往商店跑。顺路（已经站在店旁）时不设门槛。
+    """
+    shop = _nearest_zone(turn, WEAPON_SHOP, worker.pos)
+    if shop is None:
+        return False
+    if distance(worker.pos, shop) <= 1:
+        return True
+    hold = _dusk_stand(turn, worker) or _stand_for(turn, worker)
+    cost = distance(worker.pos, shop)
+    if hold is not None:
+        cost += distance(shop, hold)
+    return _rounds_to_night(turn) <= cost + 1
 
 
 def _take_medicine(

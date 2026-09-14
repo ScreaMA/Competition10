@@ -67,6 +67,8 @@ from agent.brain import (
     _plan_extras,
     _plan_summary,
     _repair_plan,
+    _nearest_zone,
+    _shop_is_last_stop,
     _reserved_build_sites,
     _step_toward,
     _stone_demand,
@@ -1962,35 +1964,46 @@ def test_llm_plan_tower_cap_stops_extra_tower(payload_factory, role_factory):
 def test_llm_plan_wall_quota_builds_walls_before_trading(
     payload_factory, role_factory,
 ):
-    """计划里 wall=2 时经济工人先铺围墙，而不是先把矿石卖掉"""
+    """计划里 wall=2 时石工先铺围墙，铜工照旧变现（V4 的站位分工）"""
     payload = payload_factory(
         round_no=1,
         gold=0,
         roles=[
-            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            # 石工（R2）背着石材、站在围墙位旁 —— 砌墙是他的活
+            role_factory(
+                10010, WORKER, 12, 26, backPackCapability=100,
+                backpack=[WALL_MATERIAL] * SELL_BATCH,
+            ),
+            # 铜矿工人（R3）在小贩旁边 —— 他只负责变现
             role_factory(
                 10012, WORKER, 13, 27, backPackCapability=100,
-                backpack=[WALL_MATERIAL] * SELL_BATCH,
+                backpack=[COPPER_MINE] * SELL_BATCH,
             ),
         ],
         zones=[(VENDOR, 13, 28)],
     )
 
-    # 默认计划: 围墙没建完也先把矿石变现（金币滚动起来）
+    # 默认计划: 铜工先把矿石变现（金币滚动起来）
     commands, _ = decide(payload)
     assert commands["10012"] == {
         "action": "sell",
-        "name": WALL_MATERIAL,
+        "name": COPPER_MINE,
         "num": SELL_BATCH,
     }
 
-    # 计划要求先铺 2 段围墙: 手里的石材先用于施工
+    # 计划要求先铺 2 段围墙: 石工手里的石材先用于施工
     payload["llmResp"] = "PLAN: wall=2"
     commands, _ = decide(payload)
-    assert commands["10012"] == {
+    assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 13, "y": 26}],
         "name": WALL,
+    }
+    # 分工不随计划变：铜工照旧去变现，不会跑去砌墙
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": COPPER_MINE,
+        "num": SELL_BATCH,
     }
 
 
@@ -2164,10 +2177,15 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
             gold=0,
             team_type=team_type,
             roles=[
-                role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+                # 石工（R2）站在围墙位旁、背着石材 —— V4：砌墙是石工的活
+                role_factory(
+                    10010, WORKER, 12, 26, backPackCapability=100,
+                    backpack=[WALL_MATERIAL] * SELL_BATCH,
+                ),
+                # 铜矿工人（R3）在小贩旁边 —— V4：他只负责变现，不碰墙
                 role_factory(
                     10012, WORKER, 13, 27, backPackCapability=100,
-                    backpack=[WALL_MATERIAL] * SELL_BATCH,
+                    backpack=[COPPER_MINE] * SELL_BATCH,
                 ),
             ],
             zones=[(VENDOR, 13, 28)],
@@ -2175,9 +2193,9 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
         payload["llmResp"] = "PLAN: wall=0"
         return payload
 
-    # 防守方：手里的石材先砌成围墙，矿石不急着变现
+    # 防守方：石工手里的石材先砌成围墙
     commands, prompt = decide(_payload("defender"))
-    assert commands["10012"] == {
+    assert commands["10010"] == {
         "action": "build",
         "targetPos": [{"x": 13, "y": 26}],
         "name": WALL,
@@ -2185,21 +2203,15 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
     # LLM 看到的配额也是执行层真正要铺的段数（建议与指令同源）
     assert "优先铺围墙 1 段" in prompt
 
-    # 进攻方不受下限影响：仍按计划把矿石卖掉换金币
-    commands, _ = decide(_payload("challenger"))
+    # 铜矿工人不砌墙：手里的矿石照卖，经济线不被"还差一段墙"扣住
     assert commands["10012"] == {
         "action": "sell",
-        "name": WALL_MATERIAL,
+        "name": COPPER_MINE,
         "num": SELL_BATCH,
     }
 
-    # 地图上没有石材来源时下限失效：矿石照卖，经济线不被"还差一段墙"扣住
-    no_stone = _payload("defender")
-    # 按角色ID定位（roles 列表里还有基地，按下标取会改错人）
-    for role in no_stone["teamOur"]["roles"]:
-        if role["id"] == 10012:
-            role["backpack"] = [COPPER_MINE] * SELL_BATCH
-    commands, _ = decide(no_stone)
+    # 进攻方同样分工：石工照旧砌墙，铜工照旧变现（下限只影响配额，不影响分工）
+    commands, _ = decide(_payload("challenger"))
     assert commands["10012"] == {
         "action": "sell",
         "name": COPPER_MINE,
@@ -3069,11 +3081,11 @@ def test_stone_still_waits_for_a_batch(payload_factory, role_factory):
 
 
 def test_defender_starts_first_wall_before_towers(payload_factory, role_factory):
-    """防守方开局：分管经济的工人先跑石材线，第一段围墙不再等到金币花光
+    """防守方开局：石工先跑防线，铜工只奔矿与变现（V4 的站位分工）
 
     回归：PK589649 的首段围墙落到 R10、PK589653 全程一段都没有——塔位优先的
-    建造分支把两名工人都占在基地旁等金币，采石要等金币花光才开始，防线整局
-    不成型。塔交给另一名工人照建，建造节奏不受影响。
+    建造分支把两名工人都占在基地旁等金币。V4 把砌墙划给石工（R2）、把挖矿变现
+    划给铜工（R3），两个人不再抢同一件事。
     """
     payload = payload_factory(
         round_no=1,
@@ -3085,19 +3097,16 @@ def test_defender_starts_first_wall_before_towers(payload_factory, role_factory)
         ],
         zones=[(STONE_MINE, 4, 24)],
     )
-    commands, _ = decide(payload)
+    turn = Turn.load(payload)
+    stone, copper = turn.workers()
 
-    # 第 1 名工人照旧开工建塔
-    assert commands["10010"] == {
-        "action": "build",
-        "targetPos": [{"x": 12, "y": 23}],
-        "name": ROCKET,
-    }
-    # 第 2 名工人（分工里的经济工人）先去采石材，而不是跟着挤塔位
-    assert commands["10012"] == {
-        "action": "collect",
-        "targetPos": [{"x": 4, "y": 24}],
-    }
+    # 石工今天有防线要修：破洞数 >0 且修墙路径要花回合（不是只盯着塔位）
+    stone_plan = _day_plan(turn, stone)
+    assert stone_plan.holes
+    assert stone_plan.repair_rounds > 0
+
+    # 铜矿工人的队列里没有石材（V4："挖石头可能反而有反作用"）
+    assert STONE_MINE not in _day_plan(turn, copper).queue
 
 
 def test_defender_cashes_income_ore_before_opening_wall_line(
@@ -3717,3 +3726,97 @@ def test_pioneer_shopping_skips_expensive_items(
         "name": WALL_FIXER,
         "num": FIXER_STOCK,
     }
+
+
+# === V4 低风险三条：铜工专属语义 / 商店只能最后一站 / n−1 回退 ===
+
+
+def _two_worker_payload(payload_factory, role_factory, *, round_no=1, gold=0,
+                        stone_backpack=0, copper_backpack=0, zones=()):
+    """构造"石工 + 铜工"的局面（V4 的两名工人分工）"""
+    return payload_factory(
+        round_no=round_no,
+        gold=gold,
+        team_type="challenger",
+        roles=[
+            role_factory(
+                10010, WORKER, 12, 26, backPackCapability=100,
+                backpack=[WALL_MATERIAL] * stone_backpack,
+            ),
+            role_factory(
+                10012, WORKER, 20, 17, backPackCapability=100,
+                backpack=[COPPER_MINE] * copper_backpack,
+            ),
+        ],
+        zones=list(zones),
+    )
+
+
+def test_copper_worker_end_point_is_vendor(payload_factory, role_factory):
+    """铜矿工人的 PLE 是小贩（V4）：他不施工，PT 只算回落脚点的路程"""
+    payload = _two_worker_payload(
+        payload_factory, role_factory, zones=[(VENDOR, 20, 16)],
+    )
+    turn = Turn.load(payload)
+    copper = turn.workers()[1]
+
+    rounds, end_point = _repair_plan(turn, copper, _wall_holes(turn))
+
+    assert end_point == _nearest_zone(turn, VENDOR, copper.pos)
+    assert rounds >= 0  # 从小贩回到 K0/站位的路程
+
+
+def test_copper_worker_has_no_stone_in_queue(payload_factory, role_factory):
+    """铜矿工人的队列里没有石材，也不去砌墙（V4 的铜工语义）"""
+    payload = _two_worker_payload(payload_factory, role_factory)
+    turn = Turn.load(payload)
+    stone_worker, copper = turn.workers()
+
+    assert STONE_MINE not in _day_plan(turn, copper).queue
+    assert STONE_MINE in _day_plan(turn, stone_worker).queue
+    # 铜工手里有石材也不会去砌墙（他等小贩那趟把矿变现）
+    commands, _ = decide(_two_worker_payload(
+        payload_factory, role_factory, stone_backpack=0, copper_backpack=SELL_BATCH,
+        zones=[(VENDOR, 20, 16)],
+    ))
+    assert commands["10012"]["action"] == "sell"
+
+
+def test_shop_visit_waits_until_last_stop(payload_factory, role_factory):
+    """武器商店只能当最后一站：白天还早时不往商店跑（V4 的先后硬约束）"""
+    # 早上的工人离商店十几格，剩下的白天回合远多于路程 -> 不是最后一站
+    early = Turn.load(_two_worker_payload(
+        payload_factory, role_factory, zones=[(WEAPON_SHOP, 25, 20)],
+    ))
+    assert _shop_is_last_stop(early, early.workers()[0]) is False
+
+    # 天黑前只剩几个回合，路程刚好够 -> 可以去
+    dusk = Turn.load(_two_worker_payload(
+        payload_factory, role_factory, round_no=DAY_ROUNDS - 2,
+        zones=[(WEAPON_SHOP, 12, 27)],
+    ))
+    assert _shop_is_last_stop(dusk, dusk.workers()[0]) is True
+
+
+def test_day_plan_makes_room_for_selling_when_backpack_full(
+    payload_factory, role_factory,
+):
+    """背包压着一批卖不掉的矿石时，计划优先腾出"去小贩"的一趟（V4 的 n−1）"""
+    empty = Turn.load(_two_worker_payload(
+        payload_factory, role_factory, zones=[(VENDOR, 20, 16)],
+    ))
+    loaded = Turn.load(_two_worker_payload(
+        payload_factory, role_factory, copper_backpack=SELL_BATCH,
+        zones=[(VENDOR, 20, 16)],
+    ))
+    stone_empty = empty.workers()[0]
+    stone_loaded = loaded.workers()[0]
+    copper_loaded = loaded.workers()[1]
+
+    # 铜工背着可卖的矿：计划要在小贩那趟把它变现（PLE 就是小贩）
+    copper_plan = _day_plan(loaded, copper_loaded)
+    assert copper_plan.end_point == _nearest_zone(loaded, VENDOR, copper_loaded.pos)
+    # 石工的队列不会因为别人背包里有矿而变长
+    assert len(_day_plan(loaded, stone_loaded).queue) <= len(
+        _day_plan(empty, stone_empty).queue
+    )
