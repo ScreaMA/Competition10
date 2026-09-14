@@ -38,6 +38,7 @@ from agent.brain import (
     TASK_API_KEEP,
     TASK_DATA_MARKER,
     TASK_DOC_MARKER,
+    TASK_EMPTY_MARKER,
     TASK_END_MARKER,
     TASK_EXEC_DIR_BUDGET,
     TASK_EXEC_RETRY_DIR_BUDGET,
@@ -6187,6 +6188,22 @@ def _executor_fetch_loop():
     return match.group(0)
 
 
+def _executor_empty_body():
+    """从生成的沙盒脚本里取出空结果集的判定（`empty_body`，S1）
+
+    取数循环里新增的那道判定（`if empty_body(body): … continue`）是循环的一
+    部分，切片一跑就得有这个绑定；这里把真身取出来而不是塞个假函数，顺带也就
+    验了生成脚本里那段（转义过的）模式串真的能用。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(r"def empty_body\(body\):.*?(?=\ndef api_key\()", script, re.S)
+    assert match
+    namespace: dict = {"re": re, "EMPTY_PAIR": brain.TASK_EMPTY_JSON_PAIR_TEXT}
+    exec(match.group(0), namespace)  # noqa: S102
+    return namespace["empty_body"]
+
+
 def test_executor_calls_the_api_without_a_task_file(capsys):
     """一份任务文件都没找到时，执行器照样把接口地址试一遍（S1，PK591783 的 R11–R12）
 
@@ -6233,6 +6250,10 @@ def test_executor_calls_the_api_without_a_task_file(capsys):
         "DATA": TASK_DATA_MARKER,
         "SOLUTION": TASK_SOLUTION_MARKER,
         "SOLUTION_END": TASK_SOLUTION_END,
+        # 取数循环里的空结果集判定（S1）：切片一跑就得有这个绑定，
+        # 否则循环第一圈就 NameError
+        "empty_body": _executor_empty_body(),
+        "EMPTY": TASK_EMPTY_MARKER,
         "TASK_PATH": "task_1_alpha.md",
         "doc_text": "接口文档：GET http://localhost:8899/api/city",
         "urls": ["http://localhost:8899/api/city"],
@@ -6289,6 +6310,9 @@ def _run_fetch_loop(files, task_path, doc_text, urls, fetch, clock):
         "DATA": TASK_DATA_MARKER,
         "SOLUTION": TASK_SOLUTION_MARKER,
         "SOLUTION_END": TASK_SOLUTION_END,
+        # 同上：空结果集判定要在命名空间里（S1）
+        "empty_body": _executor_empty_body(),
+        "EMPTY": TASK_EMPTY_MARKER,
         "TASK_PATH": task_path,
         "doc_text": doc_text,
         "urls": urls,
@@ -6452,6 +6476,9 @@ def test_executor_without_task_file_still_asks_with_the_task_query_word():
         "DATA": TASK_DATA_MARKER,
         "SOLUTION": TASK_SOLUTION_MARKER,
         "SOLUTION_END": TASK_SOLUTION_END,
+        # 取数循环里的空结果集判定（S1）：切片一跑就得有这个绑定
+        "empty_body": _executor_empty_body(),
+        "EMPTY": TASK_EMPTY_MARKER,
         "TASK_PATH": "task_1_beijing.md",
         "doc_text": "接口文档：GET http://localhost:8899/weather?city=",
         "urls": ["http://localhost:8899/weather?city="],
@@ -6808,4 +6835,259 @@ def test_cached_junk_answer_is_not_submitted(payload_factory, role_factory):
         phase_task=phase_task,
     )
     assert brain._cached_answer(Turn.load(payload)) is None
+
+
+# === issue #191：零条记录的空 JSON 不能当答案交（PK592107 的 R15）===
+
+
+def test_empty_result_matches_a_zero_record_json():
+    """整条答案就是一段零条记录的 JSON 时才判定命中（S1，PK592107 的 R15）
+
+    接口对没对上的查询词回的是 200 + `{"total_count": 0, "data": []}`，前面
+    几道闸门一条都拦不住：它不是错误体（没有错误键、没有状态码），不是沙盒
+    文档的原文，也不是一句 `not found`。开拓者把它当答案交上去，Judge 判 0
+    还烧掉一次提交额度。
+    """
+    for text in (
+        '{"total_count": 0, "data": []}',
+        '{"total_count":0,"items":[]}',
+        '{"count": 0}',
+        '{"code": 0, "success": false, "data": []}',
+        "[]",
+        "{}",
+        "[ ]",
+        '{\n  "total_count": 0,\n  "data": []\n}',
+    ):
+        assert brain._task_empty_answer(text), text
+
+
+def test_empty_result_leaves_real_answers_alone():
+    """真正的答案不受影响（S1）：零这个数字、空值出现在长句里都不算空结果集
+
+    判据是"整条答案就是一段 JSON，且摘掉所有空值键值对之后什么都不剩"：
+    带内容的答案摘完总会有值留下来，非 JSON 答案（`count: 0`）与"带引号的
+    零"（`"0"`）一律不认。
+    """
+    for text in (
+        "北京故宫",
+        '{"city": "北京", "count": 7}',
+        '{"count": 0, "city": "北京"}',
+        '{"total_count": 0, "data": [{"name": "故宫"}]}',
+        '[{"name": "故宫"}]',
+        "0",
+        "count: 0",
+        '{"count": "0"}',
+        "total_count=0",
+        "今天查到 total_count: 0 条记录",
+        "",
+    ):
+        assert not brain._task_empty_answer(text), text
+
+
+def test_task_answer_is_not_submitted_when_it_is_an_empty_result(
+    payload_factory, role_factory,
+):
+    """答案区里只有一段零条记录的 JSON 时不提交（S1，PK592107 的 R15）
+
+    回归：`{"total_count": 0, "data": []}` 交上去 Judge 判 0，下一回合复位
+    重来，整个任务窗口就那么空转掉了。同一个局面换成真正的取数结果照样交卷
+    ——闸门不误伤正常答案。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    payload = _stuck_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"total_count": 0, "data": []}',
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 这个查询词没对上：沙盒命令照旧下发，下一回合换候选地址接着取数
+    assert sandbox_command(payload) != ""
+    # 日志里能一眼看到原因（`task_brief` 的状态字段）
+    assert "state=empty_result" in brain.task_brief(Turn.load(payload))
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": '{"city": "北京", "count": 7}',
+    }
+
+
+def test_llm_command_output_that_is_an_empty_result_is_not_submitted(
+    payload_factory, role_factory,
+):
+    """LLM 的命令只打回一段零条记录的 JSON 时不能交卷（S1，PK592107 的 R15）
+
+    `CMD:` 的输出与沙盒执行器那条路各装一道闸门（见 `_llm_command_answer`）：
+    少装一道，空结果集就照旧会被当成答案交上去。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: curl -s http://localhost:8899/heritage?city=beijing"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        evidence='{"total_count": 0, "data": []}',
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_cached_empty_result_is_not_submitted(payload_factory, role_factory):
+    """空结果集既不进答案缓存，也不会从缓存里被秒交（S1）
+
+    缓存是跨任务点的：一段 `{"total_count": 0, "data": []}` 被记下来之后，
+    下一个任务点一到手就会被当成答案秒交，同样是 0 分。
+    """
+    phase_task = "请阅读task_1_alpha.md"
+    # 执行器把这段空壳当成"取到的数"记进了缓存（改造前就是这么记的）
+    brain._remember_task_answers(
+        "[exitCode:0]\n[TASK]上一个任务\n"
+        "[API] http://localhost:8899/heritage?city=alpha => 32\n"
+        f"{TASK_SOLUTION_MARKER}task_1_alpha.md\n"
+        '{"total_count": 0, "data": []}\n'
+        f"{TASK_SOLUTION_END}\n"
+    )
+    assert "task_1_alpha.md" not in brain._TASK_ANSWER_CACHE  # 空结果不进缓存
+
+    payload = payload_factory(
+        round_no=16,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    turn = Turn.load(payload)
+    assert brain._cached_answer(turn) is None
+
+    # 缓存里已经有了的那种（老缓存 / 别的写入路径）同样要挡住
+    brain._TASK_ANSWER_CACHE["task_1_alpha.md"] = '{"total_count": 0, "data": []}'
+    assert brain._cached_answer(turn) is None
+
+
+def test_fetch_failure_classification_includes_empty_results():
+    """只取回空结果集的回合按"取数失败"归类（S1，PK592107 的 R15）
+
+    归类错了两条止损线都会跟着错：算"有进展"的话取数连败永远到不了线
+    （`fails` 每回合清零），开拓者会在任务点空转到超时；算"读文件死循环"
+    的话接任务后的第 3 个回合就熔断，LLM 兜底一次都没轮上。
+    """
+    scan = f"{TASK_SCAN_MARKER} tasks=1 docs=2 urls=2 key=yes"
+    assert brain._task_fetch_failed(
+        f"{scan}\n{TASK_EMPTY_MARKER} http://localhost:8899/a"
+    )
+    # 有一个地址真的取到了数，这一回合就算有进展
+    assert not brain._task_fetch_failed(
+        f"{scan}\n{TASK_EMPTY_MARKER} http://localhost:8899/a\n"
+        f"{TASK_DATA_MARKER} http://localhost:8899/b => 32"
+    )
+    assert not brain._task_fetch_failed("")
+
+
+def test_task_brief_counts_empty_results_as_failures(payload_factory, role_factory):
+    """日志上的 fail 计数把空结果集也算进去（S1）
+
+    不计的话日志是 `api=0 fail=0`，看上去像"执行器根本没发请求"——上一轮的
+    复盘就是这么把它误读成"从不执行 API 查询"的，下一轮又只能靠猜。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 11,
+        evidence=f"{TASK_SCAN_MARKER} tasks=1 docs=2 urls=2 key=yes\n"
+                 f"{TASK_EMPTY_MARKER} http://localhost:8899/heritage?city=beijing",
+    )
+
+    brief = brain.task_brief(Turn.load(payload))
+
+    assert "api=0" in brief
+    assert "fail=1" in brief
+
+
+def test_task_executor_marks_empty_result_bodies():
+    """执行器把"有响应但零条记录"的正文打成 `[EMPTY]`，不算取到的数（S1）
+
+    沙盒没法在单测里跑（只生成命令），所以断言生成出来的脚本本身：要有单独
+    的判定函数与标记，且取数的两段循环都走这道判定——少一处，那段空壳就会被
+    收进 `bodies`、打进 `[SOLUTION]` 段（PK592107 的 R15）。
+    """
+    command = _task_executor("task_1_beijing.md")
+
+    assert "def empty_body(body):" in command
+    assert f"EMPTY = '{TASK_EMPTY_MARKER}'" in command
+    assert command.count("if empty_body(body):") == 2
+    assert command.count("print(EMPTY, url)") == 2
+    # 判定用的模式串与决策侧共用一份（`repr` 注入，免得两边各写一遍转义）
+    assert repr(brain.TASK_EMPTY_JSON_PAIR_TEXT) in command
+
+
+def test_executor_empty_body_matches_zero_record_json():
+    """执行器侧的判定与决策侧同源（S1）
+
+    沙盒里跑的是生成出来的脚本，模式串还是在那段三引号里转义过的——这里把
+    真身取出来跑一遍，确认它认得出空壳、也放得过正常数据。
+    """
+    empty_body = _executor_empty_body()
+
+    for text in (
+        '{"total_count": 0, "data": []}',
+        "[]",
+        "{}",
+        '{"count": 0}\n',
+    ):
+        assert empty_body(text), text
+    for text in (
+        '{"city": "北京", "count": 7}',
+        "not found",
+        '{"data": [1, 2]}',
+        '{"total_count": 0, "data": [{"name": "故宫"}]}',
+    ):
+        assert not empty_body(text), text
+
+
+def test_executor_skips_empty_result_bodies(capsys):
+    """取回的是一段零条记录的 JSON 时不算取到数：打 `[EMPTY]`、换下一个地址（S1）
+
+    复盘 PK592107 的 R15：接口 200 + `{"total_count": 0, "data": []}`，执行器
+    把它收进 `bodies`、打进 `[SOLUTION]` 段，决策侧于是把这段空壳交了卷（Judge
+    判 0，还白占一次提交额度）。空壳不该进答案段，这一个取数名额要留给后面的
+    候选地址。
+    """
+    asked: list[str] = []
+
+    class _Time:
+        """冻结时间：deadline 判定不参与这条测试"""
+
+        @staticmethod
+        def time():
+            return 0.0
+
+    def _fetch(url, headers):
+        asked.append(url)
+        return '{"total_count": 0, "data": []}'
+
+    _run_fetch_loop(
+        files=["/tmp/selfEvolutionTask/1/task_1_alpha.md"],
+        task_path="task_1_alpha.md",
+        doc_text="接口文档：GET http://localhost:8899/api/city",
+        urls=["http://localhost:8899/api/city"],
+        fetch=_fetch,
+        clock=_Time,
+    )
+
+    out = capsys.readouterr().out
+    assert TASK_EMPTY_MARKER in out            # 这一趟没取到数，留了诊断
+    assert TASK_DATA_MARKER not in out         # 空壳不算"取数成功"
+    assert TASK_SOLUTION_MARKER not in out     # 空壳不进答案段
+    assert len(asked) > 1                      # 取数名额留给后面的候选地址
 
