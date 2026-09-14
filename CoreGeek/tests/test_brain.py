@@ -31,12 +31,14 @@ from agent.brain import (
     LlmPlan,
     _calc_tower_sites,
     _calc_wall_order,
+    _closest_step,
     _generate_strategy_prompt,
     _gold_left,
     _llm_plan,
     _pair_controllers_and_weapons,
     _plan_summary,
     _reserved_build_sites,
+    _step_toward,
     _task_token,
     _tower_site_brief,
     _valid_stand_cells,
@@ -2323,6 +2325,75 @@ def test_llm_defend_yields_to_enemy_side(payload_factory, role_factory, monkeypa
     }
     # prompt 报出的布防方位与执行层同一套判定（建议与指令同源）
     assert "布防方位 敌方来路 up/left" in prompt
+
+
+# === 塔位认领与通路人满（issue #34） ===
+
+
+def test_second_worker_follows_claimed_tower_site(
+    payload_factory, role_factory,
+):
+    """塔位都被赶路的同伴认领后，后一名工人跟着走，而不是掉头去采矿
+
+    回归：R2 型空过回合（PK586411/536/619/647 连续四场复发）——工人朝塔位
+    赶路时会顺手把塔位认领下来（防止几个人挤同一座塔），剩下的工人一个空位
+    都挑不到，整回合被派去采矿，于是"PLAN 承诺 tower=2、roleCommandMap 却
+    全为 move、无 build，金币 50 闲置到天亮"。
+    """
+    rocket = Pos(12, 23)  # 唯一还没建成的那座塔位
+    payload = payload_factory(
+        round_no=2,
+        gold=WEAPON_BUILD_COST * 3,
+        roles=[
+            role_factory(10010, WORKER, 15, 30, backPackCapability=100),
+            role_factory(10012, WORKER, 16, 30, backPackCapability=100),
+            role_factory(10020, RAILGUN, 10, 22, attackRange=6),
+            role_factory(10030, GATLING, 9, 23, attackRange=3),
+        ],
+        zones=[(STONE_MINE, 17, 30)],  # 紧邻第 2 名工人：旧实现会就地采石
+    )
+    commands, _ = decide(payload)
+
+    # 第 1 名工人认领塔位并向它移动
+    assert commands["10010"]["action"] == "move"
+    # 第 2 名工人跟着奔向同一座塔，而不是把这一回合花在采石上
+    assert commands["10012"]["action"] == "move"
+    step = Pos(
+        commands["10012"]["targetPos"][0]["x"],
+        commands["10012"]["targetPos"][0]["y"],
+    )
+    assert distance(step, rocket) < distance(Pos(16, 30), rocket)
+
+
+def test_step_toward_keeps_progress_when_first_step_claimed(
+    payload_factory, role_factory,
+):
+    """队友认领了最顺路的那一步时仍然朝目标走，不再判定"目标走不通"
+
+    回归：`_step_toward` 只按落脚点换路，"落在别人认领格子上的第一步"被整体
+    跳过；所有落脚点的第一步都被认领时旧实现返回 None，调用方据此判定"目标
+    走不通"，于是工人掉头去采矿、开拓者原地发呆（issue #34 的"计划承诺建塔、
+    指令里一条 build 都没有"）。
+    """
+    payload = payload_factory(
+        gold=0,
+        roles=[role_factory(10010, WORKER, 15, 30, backPackCapability=100)],
+    )
+    turn = Turn.load(payload)
+    worker = turn.workers()[0]
+    target = Pos(12, 23)  # 第 1 座塔位
+
+    # 本体这一回合能走的相邻格，除 (16,29) 外全被队友认领：落脚点都走得到，
+    # 只是通往它们的每一步都被占了，这时仍然朝目标方向走
+    claimed = set(get_neighbors(worker.pos)) - {Pos(16, 29)}
+    assert _step_toward(turn, worker, target, claimed) == Pos(16, 29)
+
+    # 离目标更近的相邻格全被认领时原地待命，不再折返（复盘里"工人
+    # (30,7)→(31,6)→(30,7) 两回合原地打转"）
+    assert _closest_step(
+        turn, worker, target,
+        {Pos(14, 29), Pos(15, 29), Pos(16, 29)}, False,
+    ) is None
 
 
 # === 鲁棒性 ===
