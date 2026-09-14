@@ -16,6 +16,7 @@ from agent.brain import (
     LLM_PLAN_TEMPLATE,
     LLM_PROMPT_PER_DAY,
     SELL_BATCH,
+    STATION_UPGRADE_VOUCHER,
     STONE_BATCH,
     TASK_END_MARKER,
     TASK_FILE_END,
@@ -24,6 +25,7 @@ from agent.brain import (
     TASK_PROBE_MARKER,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
+    WALL_FIXER,
     WALL_UPGRADE_GOLD,
     WALL_UPGRADE_VOUCHER,
     WEAPON_UPGRADE_VOUCHER,
@@ -41,6 +43,7 @@ from agent.brain import (
     _step_toward,
     _task_token,
     _tower_site_brief,
+    _tower_sites_reachable,
     _valid_stand_cells,
     decide,
     sandbox_command,
@@ -2008,7 +2011,10 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
 
     # 地图上没有石材来源时下限失效：矿石照卖，经济线不被"还差一段墙"扣住
     no_stone = _payload("defender")
-    no_stone["teamOur"]["roles"][1]["backpack"] = [COPPER_MINE] * SELL_BATCH
+    # 按角色ID定位（roles 列表里还有基地，按下标取会改错人）
+    for role in no_stone["teamOur"]["roles"]:
+        if role["id"] == 10012:
+            role["backpack"] = [COPPER_MINE] * SELL_BATCH
     commands, _ = decide(no_stone)
     assert commands["10012"] == {
         "action": "sell",
@@ -2421,3 +2427,177 @@ def test_decide_with_real_sample():
                 assert set(pos) == {"x", "y"}
         if command["action"] == "attack":
             assert isinstance(command["controllerId"], str)
+
+
+# === 战术参考 T2/T3/T4 ===
+
+
+def test_tower_layout_each_reachable(payload_factory, role_factory):
+    """T2：默认地图上，规划出的三座塔每座都有人能走到旁边操控"""
+    turn = Turn.load(payload_factory(
+        roles=[role_factory(10010, WORKER, 5, 23, backPackCapability=100)],
+    ))
+    sites = _calc_tower_sites(turn)
+
+    assert len(sites) == 3
+    assert _tower_sites_reachable(turn, sites)
+
+
+def test_tower_sites_reachable_rejects_sealed_site(payload_factory, role_factory):
+    """T2：塔位八邻域全被围墙占住时判为不可达（塔建了也没人操控得了）"""
+    sealed = Pos(20, 20)
+    ring = [
+        Pos(sealed.x + dx, sealed.y + dy)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        if (dx, dy) != (0, 0)
+    ]
+    roles = [
+        role_factory(40000 + index, WALL, pos.x, pos.y)
+        for index, pos in enumerate(ring)
+    ]
+    roles.append(role_factory(10010, WORKER, 5, 23, backPackCapability=100))
+    turn = Turn.load(payload_factory(roles=roles))
+
+    assert not _tower_sites_reachable(turn, (sealed,))
+
+
+def test_tower_sites_reachable_rejects_walled_off_site(payload_factory, role_factory):
+    """T2：塔位周边可站人、但被围墙围成孤岛时同样判为不可达"""
+    sealed = Pos(20, 20)
+    # 以 sealed 为中心、半径2的封闭方框（16 段围墙）
+    box = [
+        Pos(sealed.x + dx, sealed.y + dy)
+        for dx in range(-2, 3)
+        for dy in range(-2, 3)
+        if max(abs(dx), abs(dy)) == 2
+    ]
+    roles = [
+        role_factory(40000 + index, WALL, pos.x, pos.y)
+        for index, pos in enumerate(box)
+    ]
+    roles.append(role_factory(10010, WORKER, 5, 23, backPackCapability=100))
+    turn = Turn.load(payload_factory(roles=roles))
+
+    # 塔旁有空格，但角色在方框外，走不进去
+    assert not _tower_sites_reachable(turn, (sealed,))
+
+
+def _payload_with_station_voucher(payload_factory, role_factory, station_health: int):
+    """构造"塔已满级、基地残血、工人拿着基地升级券在旁边"的局面"""
+    payload = payload_factory(
+        round_no=1,
+        gold=100,
+        roles=[
+            # 三座塔建在规划位上且已满级 -> 武器升级分支不会抢钱
+            role_factory(10020, ROCKET, 12, 23, level=3, health=2000),
+            role_factory(10030, RAILGUN, 10, 22, level=3, health=2000),
+            role_factory(10040, GATLING, 9, 23, level=3, health=2000),
+            role_factory(
+                10010, WORKER, 9, 23 + 1, backPackCapability=100,
+                backpack=[STATION_UPGRADE_VOUCHER],
+            ),
+        ],
+    )
+    payload["llmResp"] = "PLAN: wall=0"
+    for role in payload["teamOur"]["roles"]:
+        if role["roleType"] == "station":
+            role["health"] = station_health
+    return payload
+
+
+def test_station_upgrade_when_low_health(payload_factory, role_factory):
+    """T3：基地残血时用基地升级券（回满血 + 顺便升级）"""
+    # 1500 的 40%，低于 60% 阈值
+    payload = _payload_with_station_voucher(payload_factory, role_factory, 600)
+
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "use",
+        "name": STATION_UPGRADE_VOUCHER,
+        "targetPos": [{"x": 10, "y": 24}],
+    }
+
+
+def test_station_upgrade_skipped_when_healthy(payload_factory, role_factory):
+    """T3：基地血量健康时不用券（券要留给残血保命）"""
+    payload = _payload_with_station_voucher(payload_factory, role_factory, 1500)
+
+    commands, _ = decide(payload)
+
+    assert STATION_UPGRADE_VOUCHER not in str(commands.get("10010", ""))
+
+
+def _payload_with_damaged_walls(payload_factory, role_factory, damage_at,
+                                worker_pos: Pos, **worker_kw):
+    """构造"塔已满级、围墙已铺满、其中几段残血"的局面"""
+    order = _calc_wall_order(Turn.load(payload_factory()))
+    roles = [
+        role_factory(
+            40000 + index, WALL, pos.x, pos.y,
+            health=400 if pos in damage_at else 1000,
+        )
+        for index, pos in enumerate(order)
+    ]
+    # 三座塔建在规划位上且已满级：否则"建塔/升级武器"会先花掉金币，
+    # 轮不到围墙修复这条分支
+    roles.extend([
+        role_factory(10020, ROCKET, 12, 23, level=3, health=2000),
+        role_factory(10030, RAILGUN, 10, 22, level=3, health=2000),
+        role_factory(10040, GATLING, 9, 23, level=3, health=2000),
+    ])
+    roles.append(
+        role_factory(10010, WORKER, worker_pos.x, worker_pos.y, **worker_kw)
+    )
+    payload = payload_factory(round_no=1, gold=0, roles=roles)
+    payload["llmResp"] = "PLAN: wall=0"
+    return payload
+
+
+def test_repair_walls_with_fixer(payload_factory, role_factory):
+    """T4：三段以上残血围墙时用围墙修复包回满"""
+    damaged = {Pos(13, 26), Pos(12, 26), Pos(11, 26)}
+    payload = _payload_with_damaged_walls(
+        payload_factory, role_factory, damaged,
+        Pos(13, 25), backPackCapability=100, backpack=[WALL_FIXER],
+    )
+
+    commands, _ = decide(payload)
+    command = commands["10010"]
+
+    assert command["action"] == "use"
+    assert command["name"] == WALL_FIXER
+    # 目标是残血墙里"周围残血墙最多"的那一段
+    target = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    assert target in damaged
+
+
+def test_repair_walls_skipped_when_few_damaged(payload_factory, role_factory):
+    """T4：残血墙不足三段时不值得跑一趟"""
+    damaged = {Pos(13, 26), Pos(12, 26)}
+    payload = _payload_with_damaged_walls(
+        payload_factory, role_factory, damaged,
+        Pos(13, 25), backPackCapability=100, backpack=[WALL_FIXER],
+    )
+
+    commands, _ = decide(payload)
+
+    assert WALL_FIXER not in str(commands.get("10010", ""))
+
+
+def test_repair_walls_buys_fixer_when_missing(payload_factory, role_factory):
+    """T4：背包里没有修复包时先去武器商店买"""
+    damaged = {Pos(13, 26), Pos(12, 26), Pos(11, 26)}
+    payload = _payload_with_damaged_walls(
+        payload_factory, role_factory, damaged,
+        Pos(5, 23), backPackCapability=100,
+    )
+    payload["teamOur"]["goldNum"] = 50
+    payload["mapInfo"]["zones"].append(
+        {"neutralType": WEAPON_SHOP, "pos": {"x": 6, "y": 23}},
+    )
+
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {"action": "buy", "name": WALL_FIXER, "num": 1}

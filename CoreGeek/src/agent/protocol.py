@@ -43,6 +43,22 @@ TOWER_DAMAGE_BY_LEVEL = {
     ROCKET: (20, 40, 60),
 }
 
+# 建筑满血表（任务书4.5.1节）。报文只给当前 health 与 level，
+# 判断"残血"必须靠等级反查满血值；决策（残血用升级券/修复包）与
+# 日志（hp=当前/满血）共用这一张表。
+STATION_FULL_HEALTH = {1: 1500, 2: 3000, 3: 4500}
+WALL_FULL_HEALTH = {1: 1000, 2: 1500, 3: 2000}
+
+
+def station_full_health(level: int) -> int:
+    """基地该等级的满血值（level 越界时退回 level1）"""
+    return STATION_FULL_HEALTH.get(level, STATION_FULL_HEALTH[1])
+
+
+def wall_full_health(level: int) -> int:
+    """围墙该等级的满血值（level 越界时退回 level1）"""
+    return WALL_FULL_HEALTH.get(level, WALL_FULL_HEALTH[1])
+
 # 矿石类型
 STONE_MINE = "stone"
 IRON_MINE = "iron"

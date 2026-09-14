@@ -27,6 +27,7 @@
 import os
 import re
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any
 
 from .grid import next_step, get_neighbors, cells_in_range
@@ -40,11 +41,15 @@ from .protocol import (
     WORKER,
     PIONEER,
     STATION,
+    LAND,
     GATLING,
     RAILGUN,
     ROCKET,
     WALL,
     TOWER_TYPES,
+    # 建筑满血表（任务书4.5.1，与日志共用）
+    station_full_health,
+    wall_full_health,
     # 矿石
     STONE_MINE,
     IRON_MINE,
@@ -84,10 +89,40 @@ from .protocol import (
 # "武器优先级表（rocket 优先）…避免低射程 gatling"。
 # 塔型与塔位在这里一一绑定（`_worker_day_logic` 按下标取），
 # "说建哪座塔"与"建的是哪种武器"因此不会再脱节。
-TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)  # 武器建造顺序
+#
+# 战术参考（T1，已完成仅存档）：聊天记录建议"2 导弹 1 电磁 或 3 导弹"，
+# 但同型号能否重复建造待确认（任务书只写"自由选择搭配"，没有例子），
+# 所以当前仍是三种各一座、按射程排序。确认可重复建造后改成
+# `(ROCKET, ROCKET, RAILGUN)` 即可。
+TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)  # 武器建造顺序（按射程由远及近）
 STONE_BATCH = 3  # 工人采集石头的批次大小（越小围墙越早开工）
 WALL_BUILD_PRIORITY = 1000  # 围墙建造优先级
 SELL_BATCH = 10  # 卖给小贩的矿石批次大小
+
+# 建筑满血表在 protocol.py（日志与决策共用，任务书 4.5.1 节）：
+# 基地 1500/3000/4500，围墙 1000/1500/2000。判断"残血"靠这张表反查。
+
+# 基地升级券（战术参考 T3）：商店售价 100/150 金，
+# "基地快没血了给基地用一下升级券，这样血可以回满还顺便升级了"——
+# 等于用一张券同时买到"满血复活"和"更高的血量上限"，性价比极高。
+STATION_UPGRADE_VOUCHER = "StationUpgradeVoucher1"   # level1->level2
+STATION_UPGRADE_VOUCHER2 = "StationUpgradeVoucher2"  # level2->level3
+STATION_UPGRADE_GOLD = 100
+STATION_UPGRADE_GOLD2 = 150
+STATION_UPGRADE_VOUCHERS = {
+    1: (STATION_UPGRADE_VOUCHER, STATION_UPGRADE_GOLD),
+    2: (STATION_UPGRADE_VOUCHER2, STATION_UPGRADE_GOLD2),
+}
+# 基地血量低于满血的这个比例时才考虑用券（用早了浪费，用晚了基地已经没了）
+STATION_LOW_HP_RATIO = 0.6
+
+# 围墙修复包（战术参考 T4）：售价仅 10 金，使用后把目标围墙回满血
+# （任务书 4.6.3："目标坐标所在围墙回满血"；聊天里提到 3×3 能一次奶 5 段墙，
+#  所以站位要挑"3×3 内残血墙最多"的位置，两种口径都能吃到最大收益）。
+WALL_FIXER = "WallFixer"
+WALL_FIXER_GOLD = 10
+WALL_FIXER_RADIUS = 1  # 覆盖范围半径（3×3）
+WALL_REPAIR_MIN_TARGETS = 3  # 至少 3 段残血墙才值得跑一趟
 DUSK_ROUNDS = 5  # 天黑前提前回防的回合数
 MIN_TOWERS_BEFORE_NIGHT = 2  # 入夜前的最低火力：不足时优先抢建而不是回防待命
 # 开局回合数：每个游戏日的前几个回合内塔数有硬下限，不受 LLM 计划影响
@@ -551,6 +586,18 @@ def _worker_day_logic(
     # （围墙配额还没铺满时先铺墙，金币留到围墙立起来再花）
     if (not walls_missing or economy) and not wall_quota:
         if _upgrade_weapon_with_gold(
+            turn, worker, claimed, commands, allow=plan.upgrade,
+        ):
+            return
+        # 基地残血时优先保命：一张券同时买到"回满血"和"更高血量上限"
+        # （战术参考 T3，聊天记录："基地快没血了给基地用一下升级券"）
+        if _upgrade_station_when_low(
+            turn, worker, claimed, commands, allow=plan.upgrade,
+        ):
+            return
+        # 围墙被打残时用 10 金的修复包回满，比拆了重建省石材也省回合
+        # （战术参考 T4；10 金的修复包排在 20 金的围墙升级券之前）
+        if _repair_walls(
             turn, worker, claimed, commands, allow=plan.upgrade,
         ):
             return
@@ -1141,11 +1188,45 @@ def _spend_on_upgrade(
 
     # 2. 金币足够且计划允许: 去武器商店买最便宜的那张券
     #    （背包满了买不了，券进不来，先卖矿腾地方）
+    _, voucher, _ = options[0]
+    return _go_buy_item(
+        turn, worker, claimed, commands, voucher,
+        _item_price(turn, voucher), allow=allow, reserve=reserve,
+    )
+
+
+def _go_buy_item(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    item: str,
+    price: int,
+    *,
+    allow: bool,
+    reserve: int = 0,
+) -> bool:
+    """去武器商店买一件道具：已经在店旁就直接买，否则走过去
+
+    背包满时买不进来（任务书4.6.3：背包空间不足则购买失败），先由调用方
+    去卖矿腾地方；金币不足或计划不允许时不出门。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        item: 道具名（如 WallFixer / StationUpgradeVoucher1）
+        price: 售价（来自 weaponShopList，取不到时用兜底价）
+        allow: 是否允许本回合花钱买
+        reserve: 买之前要留下的金币（给更高优先级的支出留钱）
+
+    返回:
+        True 表示本回合已下达指令（购买或移动）
+    """
     if not allow or worker.backpack_full:
         return False
-
-    _, voucher, _ = options[0]
-    if _gold_left(turn, commands) < reserve + _item_price(turn, voucher):
+    if _gold_left(turn, commands) < reserve + price:
         return False
 
     shop = _nearest_zone(turn, WEAPON_SHOP, worker.pos)
@@ -1153,12 +1234,170 @@ def _spend_on_upgrade(
         return False
 
     if distance(worker.pos, shop) <= 1:
-        commands[worker.unit_id] = buy_command(voucher)
+        commands[worker.unit_id] = buy_command(item)
         return True
 
     if not _can_return_before_dusk(turn, worker, shop):
         return False
     step = _step_toward(turn, worker, shop, claimed)
+    if step is not None:
+        commands[worker.unit_id] = move_command(step)
+        return True
+    return False
+
+
+def _station_full_health(level: int) -> int:
+    """基地该等级的满血值（任务书4.5.1：level1/2/3 = 1500/3000/4500）"""
+    return station_full_health(level)
+
+
+def _upgrade_station_when_low(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    *,
+    allow: bool = True,
+) -> bool:
+    """基地残血时用基地升级券：回满血 + 顺便升级（战术参考 T3）
+
+    聊天记录原话："基地快没血了给基地用一下升级券，这样血可以回满还顺便升级"。
+    一张 100/150 金的券同时买到"满血复活"和"更高的血量上限"，是守卫基地
+    最划算的一笔支出；满级（level3）或血量还健康时不做。
+
+    券名与价格取自任务书4.6.3（StationUpgradeVoucher1/2 = 100/150 金），
+    `docs/request.txt` 的 weaponShopList 里也确认在售。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        allow: 是否允许本回合买券（已有的券不受限制）
+
+    返回:
+        True 表示本回合已下达指令（用券、买券或移动）
+    """
+    station = turn.station()
+    if station is None or not station.is_alive or station.level >= 3:
+        return False
+    if station.health > _station_full_health(station.level) * STATION_LOW_HP_RATIO:
+        return False
+
+    options = _upgrade_options(
+        worker, (station,), STATION_UPGRADE_VOUCHERS, claimed,
+    )
+    if not options:
+        return False
+    return _spend_on_upgrade(
+        turn, worker, claimed, commands, options, allow=allow, reserve=0,
+    )
+
+
+def _wall_full_health(level: int) -> int:
+    """围墙该等级的满血值（任务书4.5.1：level1/2/3 = 1000/1500/2000）"""
+    return wall_full_health(level)
+
+
+def _damaged_walls(turn: Turn) -> tuple[Unit, ...]:
+    """掉血的围墙（报文只给 health，满血值按等级查任务书4.5.1）"""
+    return tuple(
+        wall for wall in turn.walls()
+        if wall.health < _wall_full_health(wall.level)
+    )
+
+
+def _best_repair_spot(
+    turn: Turn,
+    damaged: tuple[Unit, ...],
+    origin: Pos,
+) -> Unit | None:
+    """挑一段"周围残血墙最密集"的围墙作为修复目标
+
+    任务书 4.6.3 写的是"目标坐标所在围墙回满血"（单体口径），聊天记录说的是
+    "3×3 一次奶 5 段"（群体口径）。两者取交集：目标定在残血墙最密集处——
+    单体口径下奶到最该奶的那一段，群体口径下一次覆盖最多段
+    （截图 `新版站位-角落WallFixer.png` 的角落站位正是这个意思）。
+
+    参数:
+        turn: 当前回合信息
+        damaged: 残血围墙
+        origin: 决策单位的当前位置（同分时取更近的）
+
+    返回:
+        修复目标围墙；没有残血墙时返回 None
+    """
+    if not damaged:
+        return None
+
+    occupied = {wall.pos for wall in damaged}
+
+    def coverage(wall: Unit) -> int:
+        """以该墙为中心 WALL_FIXER_RADIUS 范围内还有多少段残血墙（含自己）"""
+        return sum(
+            1 for pos in occupied
+            if distance(wall.pos, pos) <= WALL_FIXER_RADIUS
+        )
+
+    return min(
+        damaged,
+        key=lambda wall: (
+            -coverage(wall),                 # 覆盖越多越好
+            distance(origin, wall.pos),      # 越近越好
+            wall.health,                     # 血越少越优先
+            wall.pos.x, wall.pos.y,
+        ),
+    )
+
+
+def _repair_walls(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    *,
+    allow: bool = True,
+) -> bool:
+    """用围墙修复包把残血围墙回满（战术参考 T4）
+
+    围墙被打残后原本只能拆了重建（费石材又费回合），修复包只要 10 金
+    （任务书4.6.3），把目标围墙直接回满血。残血墙少于
+    `WALL_REPAIR_MIN_TARGETS` 段时不值得跑一趟——拆了重建更省。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        allow: 是否允许本回合买修复包
+
+    返回:
+        True 表示本回合已下达指令（使用、购买或移动）
+    """
+    damaged = _damaged_walls(turn)
+    if len(damaged) < WALL_REPAIR_MIN_TARGETS:
+        return False
+
+    target = _best_repair_spot(turn, damaged, worker.pos)
+    if target is None:
+        return False
+
+    # 手里没有修复包: 先去武器商店买一张（背包满了买不进来，交给卖矿分支）
+    if WALL_FIXER not in worker.backpack:
+        return _go_buy_item(
+            turn, worker, claimed, commands, WALL_FIXER,
+            _item_price(turn, WALL_FIXER), allow=allow,
+        )
+
+    # 修复包要站在待修复围墙一格范围内使用（任务书4.6.3）
+    if distance(worker.pos, target.pos) <= 1:
+        commands[worker.unit_id] = use_command(WALL_FIXER, target.pos)
+        claimed.add(target.pos)
+        return True
+
+    if not _can_return_before_dusk(turn, worker, target.pos):
+        return False
+    step = _step_toward(turn, worker, target.pos, claimed)
     if step is not None:
         commands[worker.unit_id] = move_command(step)
         return True
@@ -1926,6 +2165,105 @@ def _footprint_distance(pos: Pos, footprint: tuple[Pos, ...]) -> int:
     return min(distance(pos, cell) for cell in footprint)
 
 
+def _bfs_reachable(
+    turn: Turn,
+    starts: frozenset[Pos],
+    goals: frozenset[Pos],
+    blocked: set[Pos],
+) -> bool:
+    """从 starts 出发能否走到 goals 里任意一格（八方向BFS，blocked 视为墙）
+
+    只在塔位校验里用，所以单独写一个小 BFS，不复用 A*（A* 要顺带算代价与
+    路径，这里只关心连通性）。
+
+    参数:
+        turn: 当前回合信息（取地图边界）
+        starts: 起点集合
+        goals: 目标格集合
+        blocked: 不可通行格
+
+    返回:
+        True 表示至少有一个目标格可达
+    """
+    if not starts or not goals:
+        return False
+    frontier = [pos for pos in starts if pos not in blocked]
+    seen = set(frontier)
+    while frontier:
+        current = frontier.pop()
+        if current in goals:
+            return True
+        for neighbor in get_neighbors(current):
+            if neighbor in seen or neighbor in blocked:
+                continue
+            if not turn.land(neighbor):
+                continue
+            seen.add(neighbor)
+            frontier.append(neighbor)
+    return False
+
+
+def _tower_sites_reachable(turn: Turn, sites: tuple[Pos, ...]) -> bool:
+    """校验塔位布局：三座塔都建成后，每座塔旁是否仍有可达的操控落脚点
+
+    塔本身是障碍物（任务书4.1：建筑阻挡移动）。塔位选错会把基地 6×6 区域的
+    通道切断，出现"塔在、但操控者走不过去"的情况——聊天记录原话：
+    "很容易出现炮塔把路堵住然后有一个炮塔碰不到的情况"，那样等于白扔 25 金，
+    夜里还少一门火力。
+
+    做法:
+        1. 把候选布局里的三座塔临时视为已建成（加入阻挡集）
+        2. 对每座塔，取它八邻域里可通行、且不被其它塔占住的格子作为候选落脚点
+        3. 用 BFS 校验"至少有一个角色能走到其中某格"
+
+    参数:
+        turn: 当前回合信息
+        sites: 候选塔位布局（未建成，按建造顺序）
+
+    返回:
+        True 表示每座塔都存在可达的操控位
+    """
+    if not sites:
+        return True
+
+    movers = turn.controllable()
+    blocked: set[Pos] = {pos for pos, kind in turn.zones.items() if kind != LAND}
+    blocked.update(sites)  # 候选塔位按"已经建成"处理
+    blocked.update(turn.occupied_cells())
+    for enemy in turn.enemies:
+        if enemy.is_alive:
+            blocked.update(turn.footprint(enemy))
+    for robot in turn.robots:
+        if robot.is_alive:
+            blocked.add(robot.pos)
+    # 角色自己占的格子不算障碍（它们会走开）
+    for unit in movers:
+        blocked.discard(unit.pos)
+
+    starts = frozenset(unit.pos for unit in movers)
+    if not starts:
+        station = turn.station()
+        if station is None:
+            return True
+        starts = frozenset(
+            neighbor
+            for cell in station_footprint(station.pos)
+            for neighbor in get_neighbors(cell)
+            if neighbor not in blocked and turn.land(neighbor)
+        )
+
+    for site in sites:
+        stands = frozenset(
+            neighbor for neighbor in get_neighbors(site)
+            if neighbor not in blocked and turn.land(neighbor)
+        )
+        if not stands:
+            return False  # 这座塔被邻居格堵死，谁都站不到旁边
+        if not _bfs_reachable(turn, starts, stands, blocked):
+            return False
+    return True
+
+
 def _calc_tower_sites(
     turn: Turn,
     preferred: str | None = None,
@@ -1976,8 +2314,15 @@ def _calc_tower_sites(
         TOWER_SIDES.index(item[0]),
     ))
 
-    # 取前3个位置
-    return tuple(pos for _, pos in sites[:3])
+    # 按优先级取前3个位置；若这个布局会把某座塔堵到"没人能操控"，
+    # 换下一个组合重试（四方位取三，最多 4 种组合，穷举成本可忽略）
+    ranked = [pos for _, pos in sites]
+    for combo in combinations(ranked, 3):
+        layout = tuple(combo)
+        if _tower_sites_reachable(turn, layout):
+            return layout
+    # 所有组合都不可达（例如基地被围墙围死）时退回原顺序，行为与改造前一致
+    return tuple(ranked[:3])
 
 
 def _enemy_sides(turn: Turn) -> frozenset[str]:
