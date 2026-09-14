@@ -46,6 +46,7 @@ from agent.brain import (
     TASK_PROBE_LIMIT,
     TASK_PROBE_MARKER,
     TASK_ROOTS,
+    TASK_SCAN_MARKER,
     TASK_SOLUTION_END,
     TASK_SOLUTION_MARKER,
     TASK_SUBMIT_LIMIT,
@@ -3532,6 +3533,87 @@ def test_task_survives_repeated_failed_fetches_until_fail_limit(
                 commands["10011"]["targetPos"][0]["y"],
             )
             assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+
+
+def test_task_survives_scan_output_that_never_calls_the_api(
+    payload_factory, role_factory,
+):
+    """执行器跑过却一次请求都没发时，同样走取数连败线而不是读文件循环线（S1）
+
+    回归：PK591684 的 R11–R13 与 PK591772 的 R12–R13。沙盒输出里
+    `[SCAN] docs=2 urls=2 key=yes`、`[exitCode:0]` 全都正常，任务文件与接口
+    文档都读到了，可 `api=0`、一行 `[APIFAIL]` 也没有——执行器确实开工了
+    （`[SCAN]` 是它打的第一行），却连一次请求都没发出去（没找到任务文件，
+    取数循环整段跳过）。旧判据只认"有 `[APIFAIL]`"，这种回合于是被归进
+    "沙盒没在取数"：输出逐字相同，`repeats` 每回合累加，接上任务后的第 3 个
+    回合就撞上 `TASK_LOOP_LIMIT` 被熔断（PK591684 的 R13：`watch=r3/t4/f3`，
+    超时线与取数连败线都还远），重试与 LLM 兜底一次都没轮上。
+
+    这里锁两件事：熔断发生在 `TASK_API_FAIL_LIMIT` 那一回合（不是第 3 个
+    回合），且途中每一回合 `repeats` 都没到 `TASK_LOOP_LIMIT`。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    weapon = Pos(9, 24)
+
+    for offset in range(TASK_API_FAIL_LIMIT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        # 逐字相同的执行器输出：读到了文档，却一条取数记录都没有
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task,
+            f"{TASK_SCAN_MARKER} tasks=0 docs=2 urls=2 key=yes\n"
+            f"{TASK_DOC_MARKER} 自进化任务 A-1 查询北京文化遗产\n"
+            f"{TASK_END_MARKER}\npwd\n/\ntask_1_beijing.md\n",
+        )
+        commands, _ = decide(payload)
+
+        if offset == TASK_API_FAIL_LIMIT - 1:
+            # 到取数连败止损线：放弃任务，开拓者回基地跟队
+            assert sandbox_command(payload) == ""
+            assert commands["10011"]["action"] == "move"
+            step = Pos(
+                commands["10011"]["targetPos"][0]["x"],
+                commands["10011"]["targetPos"][0]["y"],
+            )
+            assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+        else:
+            # 还没到止损线：任务还在做，开拓者守在任务点旁，不把文档当答案交
+            assert brain._TASK_WATCH is not None
+            assert brain._TASK_WATCH.repeats < TASK_LOOP_LIMIT
+            assert sandbox_command(payload) != ""
+            command = commands.get("10011")
+            assert command is None or command["action"] == "move"
+            if command is not None and command["action"] == "move":
+                step = Pos(
+                    command["targetPos"][0]["x"], command["targetPos"][0]["y"],
+                )
+                assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
+
+
+def test_scan_output_without_api_calls_counts_as_fetch_failure():
+    """判据 3：`[SCAN]` 在、取数记录不在 = 取数失败；读到数就不算（S1）
+
+    这个判据只用来决定看门狗按哪条止损线走，所以两边界都要锁住：执行器真
+    取到数时（`[API]` 在）不能误判成失败，否则一个正常取数的任务会被算进
+    取数连败、提前放弃。
+    """
+    scan_only = (
+        f"{TASK_SCAN_MARKER} tasks=0 docs=2 urls=2 key=yes\n"
+        f"{TASK_DOC_MARKER} 自进化任务 A-1\n{TASK_END_MARKER}\n"
+    )
+    assert brain._task_fetch_failed(scan_only) is True
+    # 试过地址但全失败：老判据，照旧算失败
+    assert brain._task_fetch_failed(
+        f"{TASK_API_FAIL_MARKER} http://localhost:8899/x HTTPError 404\n",
+    ) is True
+    # 取到过数：哪怕后面还跟着失败，这一回合也算有进展
+    assert brain._task_fetch_failed(
+        f"{TASK_DATA_MARKER} http://localhost:8899/x => 40\n"
+        f"{TASK_API_FAIL_MARKER} http://localhost:8899/y HTTPError 404\n",
+    ) is False
+    # 沙盒只回读了任务文件（没有执行器痕迹）：仍是读文件死循环那条线
+    assert brain._task_fetch_failed("请阅读task_1_beijing.md，获取任务信息\n") is False
 
 
 def _executor_rotate():
