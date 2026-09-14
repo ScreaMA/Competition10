@@ -709,6 +709,21 @@ TASK_HARNESS_SUMMARY = re.compile(
     r"[^\r\n]{0,24}$",
     re.IGNORECASE,
 )
+# 取数失败的短回显（S1）：地址没命中时接口回的就是一句 `not found`，执行器把它
+# 当成"有响应的正文"打进 `[SOLUTION]` 段——复盘 PK592029 的 R16 交上去的正是
+# 这一行（`submitAnswer not found`），Judge 判 0 还烧掉一次提交额度
+# （`TASK_SUBMIT_LIMIT`）。它既不是沙盒里那份文档的原文（没有指纹可比），也不带
+# 错误键与状态码（`TASK_ERROR_BODY` 认的是 `404 Not Found` 这种带码的写法），
+# 前面几道闸门一条都拦不住。
+# 判据是"整个答案就是这几个词"（全匹配）：答案是一段取数结果（JSON、短字符串、
+# 一条记录），不会整条就等于一句取数诊断；`not found 是英文里的否定说法` 这类
+# 含它的长句也整条匹配不上，不会被误伤。
+TASK_JUNK_ANSWER = re.compile(
+    r"^(?:not[ _-]*found|no[ _-]*(?:data|result)s?|"
+    r"未找到|没有找到|找不到|无数据|无结果|查无(?:此)?(?:数据|结果)?)"
+    r"[\s.。!！?？]*$",
+    re.IGNORECASE,
+)
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -4258,6 +4273,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
     # 同样的闸门，两条取答案的路不能只有一条装了）。
     if _task_error_body(answer):
         return None
+    if _task_junk_answer(answer):
+        return None  # LLM 把一句取数失败的回显当成了答案（S1）
     return answer
 
 
@@ -4295,6 +4312,8 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
     answer = _answer_value(answer)
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
+    if _task_junk_answer(answer):
+        return None  # 命令只把取数失败的短回显打了出来（S1）
     return answer
 
 
@@ -5253,7 +5272,9 @@ def _task_answer(turn: Turn) -> str | None:
     `TOKEN:`/`答案：` 时只交标记后的那个值，输出以脚本自检行（逐项状态行加
     收尾小结行）为主时干脆不交（PK591930 的 R14 把
     `[ OK ] 全部通过 (6/6) | TOKEN: fc1e78eb2a5a` 整行交了上去，PK591993 的
-    R14 交的是"逐项 [FAIL] + `4/6 通过，2 失败`"，Judge 都判 0）。
+    R14 交的是"逐项 [FAIL] + `4/6 通过，2 失败`"，Judge 都判 0）；
+    收窄之后还要过 `_task_junk_answer`（S1）：整条答案就是一句取数失败的
+    短回显（`not found`）时同样不能交——PK592029 的 R16 交的正是这一行。
     走 LLM 那条路时输出里没有文档指纹可比，另有一道按"文档长什么样"判定的
     闸门（`_task_doc_body`，PK590836 的 R15 交的是 API 文档正文）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
@@ -5273,7 +5294,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     `error_body`（答案是接口的错误响应体）/ `doc_text`（答案是沙盒里那份文档的
     原文）/ `path_answer`（答案是一条文件路径）/ `doc_body`（答案是 Markdown
     文档的正文，见 `_task_doc_body`）/ `harness_only`（答案区里只有脚本自检
-    回显——逐项状态行加收尾小结行，没有答案可交，见 `_answer_value`）。
+    回显——逐项状态行加收尾小结行，没有答案可交，见 `_answer_value`）/
+    `junk_answer`（整个答案就是一句取数失败的短回显，见 `_task_junk_answer`）。
     """
     if not turn.phase_task:
         return None, "no_task"
@@ -5320,6 +5342,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     answer = _answer_value(answer)
     if not answer:
         return None, "harness_only"  # 答案区里只有脚本状态行，没有答案可交
+    if _task_junk_answer(answer):
+        return None, "junk_answer"  # 交上去的是一句取数失败的短回显（S1）
     if len(answer) < TASK_ANSWER_MIN_LEN:
         return None, "short_or_missing"
     return answer, "ok"
@@ -5366,6 +5390,30 @@ def _task_error_body(answer: str) -> bool:
         True 表示这条答案是错误体的正文，不能提交
     """
     return TASK_ERROR_BODY.search(answer) is not None
+
+
+def _task_junk_answer(answer: str) -> bool:
+    """答案是不是一句"取数失败"的短回显（S1）
+
+    地址没命中时接口把 `not found` 这类诊断当正文回过来，执行器照旧打进
+    `[SOLUTION]` 段，决策侧于是把它当成"取到的数"交上去——复盘 PK592029 的
+    R16 提交的就是这一行（`submitAnswer not found`，Judge 判 0，还白占一次
+    提交额度，见 `TASK_SUBMIT_LIMIT`）。同一个任务窗口里 R14 已经交过一次
+    自检横幅，两次 0 分把提交额度用完了以后，真正取到的答案反而交不上去。
+
+    判定只用"整个答案就是这几个词"（`TASK_JUNK_ANSWER` 全匹配），不做
+    "答案应该长什么样"的正面判定：任务千变万化，正常答案（`北京故宫`、
+    `{"city": "北京"}`）不会整条就等于一句取数诊断，而含这几个词的句子
+    （`not found 是英文里的否定说法`）同样整条匹配不上。
+
+    参数:
+        answer: 待提交的答案内容
+
+    返回:
+        True 表示这条答案是一句取数失败的短回显，不能提交
+    """
+    text = answer.strip()
+    return "\n" not in text and TASK_JUNK_ANSWER.match(text) is not None
 
 
 def _task_doc_body(answer: str) -> bool:
@@ -5555,6 +5603,8 @@ def _cached_answer(turn: Turn) -> str | None:
     里拦一道的话，这条路就绕过去了。三道闸门过完再按 `_answer_value` 收成
     答案本体（S1）：`[ OK ] 全部通过 (6/6) | TOKEN: <值>` 这种"横幅 + 答案
     标记"的一整段在新任务到手时会被秒交，Judge 判 0 还烧掉一次提交额度。
+    取数失败留下的短回显（`not found`）同样在这里挡住（`_task_junk_answer`）：
+    缓存是跨任务点的，一条 `not found` 会跟着下一个任务一起被秒交。
     """
     target = _task_file(turn.phase_task)
     if target is None:
@@ -5564,6 +5614,8 @@ def _cached_answer(turn: Turn) -> str | None:
         return None
     if _task_doc_body(answer):
         return None  # 缓存里那条"答案"是一份文档的正文，同样不能交（S2）
+    if _task_junk_answer(answer):
+        return None  # 缓存里那条"答案"是一句取数失败的短回显（S1）
     return _answer_value(answer) or None  # 只有脚本状态行时算没有答案（S1）
 
 
