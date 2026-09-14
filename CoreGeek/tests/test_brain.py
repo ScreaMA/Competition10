@@ -4593,6 +4593,48 @@ def test_executor_refine_url_cuts_junk_in_host():
     assert refine("http://localhost:8899 x") == "http://localhost:8899"
 
 
+def _executor_queries():
+    """从生成的沙盒脚本里取出查询词与候选地址的构造（`queries` + `candidates`）"""
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    skips = re.search(r"SKIP_WORDS = \([^)]*\)", script)
+    body = re.search(r"def queries\(text, name\):.*?\n    return out\n", script, re.S)
+    assert skips and body
+    namespace: dict = {
+        "BASE": brain.TASK_API_DEFAULT,
+        "QUERY_MAX": brain.TASK_API_QUERY_MAX,
+        "SUFFIXES": brain.TASK_API_PATH_SUFFIXES,
+    }
+    prelude = "import os\nimport re\n" + skips.group(0) + "\n"
+    exec(prelude + body.group(0), namespace)  # noqa: S102
+    return namespace["queries"], namespace["candidates"]
+
+
+def test_executor_query_words_drop_task_file_stem():
+    """查询词取文件名里有信息量的一段，不再用整段任务文件名（PK590884/PK590920）
+
+    两份报告的 P0-1 里，沙盒整轮 404 的诊断行都是
+    `[APIFAIL] http://localhost:8899/task_1_alpha`：任务文件的整段词干被当成
+    "查询词"拼进了样例地址。文档问的是城市名，拿文件名去问只会 404，而
+    `QUERY_MAX` 只有两个名额，它先占掉一个，文档里真正有用的词就上不了场。
+    """
+    queries, _ = _executor_queries()
+
+    # task_1_beijing.md -> beijing：文件名里的英文词才是文档要的查询值
+    assert queries("请查询该城市的文化遗产", "task_1_alpha.md") == ["alpha"]
+    # 正文里再提到一次这个文件名时，同样不该把它当成查询词
+    assert queries("请阅读task_1_alpha.md", "task_1_alpha.md") == ["alpha"]
+
+
+def test_executor_candidates_never_append_task_file_stem():
+    """候选地址里不再有"根地址 + 任务文件名"这条必然 404 的拼接"""
+    _, candidates = _executor_queries()
+
+    out = candidates("请查询该城市的文化遗产", "task_1_alpha.md", [])
+    assert f"{brain.TASK_API_DEFAULT}/task_1_alpha" not in out
+    assert f"{brain.TASK_API_DEFAULT}/alpha" in out
+
+
 def test_executor_api_fail_reports_status_and_body(capsys):
     """取数失败的诊断行带上 HTTP 状态码与响应体（#77 的 S1）
 
