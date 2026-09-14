@@ -4405,6 +4405,13 @@ def candidates(text, name, urls):
     路径（见 `swap_path`）。后一种排在清单末尾：它只在样例确实是个模板时才
     有意义，而清单会被 `TASK_API_MAX_CALLS` 截断——真到截断那一步，该先
     保住的是文档里那几条样例与根地址那几个兜底后缀。
+
+    样例里的查询值还常常是空的：文档写成 `.../weather?city=<城市名>` 时，
+    `endpoints` 的地址正则在 `<` 处截断，抓到的就是 `.../weather?city=`；
+    文档本来就写成空值（`?city=`）时同样是这个形状。旧写法要求 `=` 后面
+    "至少有一个字符"（`[^&/]+`），空值样例因此一个带查询词的候选都生不出来
+    ——请求照原样发出去，问的是空查询词，接口只会回一行取数失败的诊断
+    （复盘里"读题成功、却一个回合接一个回合取不到数"的又一种成因）。
     """
     urls = urls or [BASE]
     values = queries(text, name)
@@ -4414,7 +4421,7 @@ def candidates(text, name, urls):
             out.append(url)
         for value in values:
             variant = (
-                re.sub(r"=([^&/]+)", "=" + value, url, count=1)
+                re.sub(r"=([^&/]*)", "=" + value, url, count=1)
                 if "=" in url
                 else url.rstrip("/") + "/" + value
             )
@@ -4513,12 +4520,17 @@ for path in files[:SOLVE_MAX]:
 # （见 `_task_fetch_failed` 的判据 3）。
 if not calls:
     name = os.path.basename(TASK_PATH or "")
-    if not re.search(r"\\.(md|txt|json|csv|log)$", name, re.I):
+    # 查询词的来源：任务描述里点名的那份任务文件（`queries`：task_1_beijing.md
+    # -> beijing）。沙盒里没找到这份文件时，它是唯一还握在手里的查询词来源，
+    # 漏传就等于拿文档正文里随手挑的英文词去填样例地址（`?city=` 那类模板
+    # 只有填对了才取得到数）。目录名不是文件名，不传。
+    query = name if re.search(r"\\.(md|txt|json|csv|log)$", name, re.I) else ""
+    if not query:
         # 任务描述里没点名文件时 `TASK_PATH` 可能是任务根目录：那不是一份任务
         # 文件，答案段只能挂一个占位名（决策侧按“描述里没给文件名”取第一段）
         name = "task"
     bodies = []
-    for url in rotate(candidates(doc_text, "", urls), KEEP, OFFSET):
+    for url in rotate(candidates(doc_text, query, urls), KEEP, OFFSET):
         if calls >= MAX_CALLS or time.time() > deadline:
             break
         calls += 1

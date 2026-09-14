@@ -5359,6 +5359,34 @@ def test_executor_candidates_leave_real_paths_alone():
     ]
 
 
+def test_executor_candidates_fill_an_empty_query_sample():
+    """样例地址的查询值是空的时候也要把查询词填进去（S1）
+
+    文档写成 `GET http://localhost:8899/heritage?city=<城市名>` 时，`endpoints`
+    的地址正则在 `<` 处截断，抓到的样例就是 `...?city=`；文档本来就写成空值
+    （`...?city=`）时也是同一形状。旧写法要求 `=` 后面"至少有一个字符"
+    （`[^&/]+`），空值样例一个带查询词的候选都生不出来——请求照原样发出去，
+    问的是空查询词，接口只会回一行取数失败的诊断，任务分照旧是 0。
+    """
+    _, candidates = _executor_queries()
+
+    out = candidates(
+        "请查询该城市的文化遗产", "task_1_beijing.md",
+        ["http://localhost:8899/heritage?city="],
+    )
+    # 样例本身照旧排在最前（先照文档原样试一次），带查询词的候选紧随其后
+    assert out[0] == "http://localhost:8899/heritage?city="
+    assert "http://localhost:8899/heritage?city=beijing" in out
+
+    # 样例里已经写了查询值时行为不变：换成任务自己的那一个
+    out = candidates(
+        "请查询该城市的文化遗产", "task_1_beijing.md",
+        ["http://localhost:8899/heritage?city=alpha"],
+    )
+    assert "http://localhost:8899/heritage?city=beijing" in out
+    assert "http://localhost:8899/heritage?city=alpha" in out
+
+
 def test_executor_api_fail_reports_status_and_body(capsys):
     """取数失败的诊断行带上 HTTP 状态码与响应体（#77 的 S1）
 
@@ -5664,3 +5692,63 @@ def test_executor_without_task_file_keeps_a_usable_solution_name(capsys):
     out = capsys.readouterr().out
     assert f"{TASK_SOLUTION_MARKER}task\n" in out
     assert brain.TASK_ROOTS[0] not in out.split(TASK_SOLUTION_MARKER)[1].split("\n")[0]
+
+
+def test_executor_without_task_file_still_asks_with_the_task_query_word():
+    """没有任务文件时，查询词仍然取自任务描述里点名的那份文件（S1）
+
+    兜底那一次取数用的是接口文档里的样例地址，而样例常常是个模板
+    （`.../weather?city=`，见 `candidates`）：真正的查询词要靠 `queries` 填进去，
+    最可靠的来源就是任务文件名（`task_1_beijing.md` -> `beijing`）。沙盒里
+    没有这份文件时，这个名字是唯一还握在手里的查询词来源——漏传就只能拿
+    文档正文里随手挑的英文词（`GET`、`weather` 这类）去填样例，地址拼不对，
+    任务照旧 0 分（复盘里"读题成功、api 恒 0"就是这么来的）。
+    """
+    _, candidates = _executor_queries()
+    rotate = _executor_rotate()
+    asked: list[str] = []
+
+    class _Time:
+        """冻结时间：deadline 判定不参与这条测试"""
+
+        @staticmethod
+        def time():
+            return 0.0
+
+    def _fetch(url, headers):
+        asked.append(url)
+        return ""
+
+    namespace = {
+        "os": os,
+        "re": re,
+        "time": _Time,
+        "files": [],  # 沙盒里一份任务文件都没找到
+        "read": lambda path: "",
+        "rotate": rotate,
+        "candidates": candidates,
+        "fetch": _fetch,
+        "SOLVE_MAX": brain.TASK_SOLVE_MAX,
+        "KEEP": brain.TASK_API_KEEP,
+        "OFFSET": 0,
+        "MAX_CALLS": brain.TASK_API_MAX_CALLS,
+        "TIME_BUDGET": brain.TASK_API_TIME_BUDGET,
+        "DATA": TASK_DATA_MARKER,
+        "SOLUTION": TASK_SOLUTION_MARKER,
+        "SOLUTION_END": TASK_SOLUTION_END,
+        "TASK_PATH": "task_1_beijing.md",
+        "doc_text": "接口文档：GET http://localhost:8899/weather?city=",
+        "urls": ["http://localhost:8899/weather?city="],
+    }
+    exec(_executor_fetch_loop(), namespace)  # noqa: S102
+
+    # 问的是任务自己的查询词，而不是把样例里那个空查询词原样发出去
+    assert "http://localhost:8899/weather?city=beijing" in asked
+
+    # 描述里没点名文件（`TASK_PATH` 是任务根目录）时照旧不拿目录名当查询词：
+    # 候选清单与文档正文里挑出来的词一致，不会多出一条以目录名结尾的地址
+    asked.clear()
+    namespace["TASK_PATH"] = brain.TASK_ROOTS[0]
+    exec(_executor_fetch_loop(), namespace)  # noqa: S102
+
+    assert all(not url.endswith("selfEvolutionTask") for url in asked)
