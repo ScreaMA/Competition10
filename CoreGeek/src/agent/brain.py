@@ -499,6 +499,8 @@ def _worker_day_logic(
 
     建造位一旦认领（`claimed`）就归该工人：多个工人会分头去建不同的塔/
     围墙段，而不是几个人同时奔着同一个位置去，白走一趟还互相挡路。
+    认领只是"排队"不是"独占"：一个空位都挑不到时仍然跟着已经有人赶去的塔走
+    （见 `_tower_picks`），不会整队掉头去采集。
 
     `plan` 是LLM建议落下来的有界计划（见 `_llm_plan`）：今天要保证几座塔、
     先铺几段围墙、能不能买升级券。默认计划与改造前的行为完全一致；计划里的
@@ -530,14 +532,7 @@ def _worker_day_logic(
     ):
         # 就近认领: 每个工人挑离自己最近的那座塔，两个工人自然分头开工，
         # 而不是都盯着建造顺序表里的第一座（都挤过去的结果是另一座塔整局没人管）
-        picks = sorted(
-            (
-                (distance(worker.pos, site), index, site)
-                for index, site in enumerate(tower_sites)
-                if site in towers_missing and site not in claimed
-            ),
-            key=lambda pick: pick[:2],
-        )
+        picks = _tower_picks(worker, tower_sites, towers_missing, claimed)
         picks = _retry_sites(turn, worker, picks)
         if picks:
             for _, index, site in picks:
@@ -598,6 +593,48 @@ def _worker_day_logic(
     if _gather_logic(turn, worker, claimed, commands, prefer_stone=wall_quota):
         return
     _trade_logic(turn, worker, claimed, commands)
+
+
+def _tower_picks(
+    worker: Unit,
+    tower_sites: tuple[Pos, ...],
+    sites_missing: list[Pos],
+    claimed: set[Pos],
+) -> list[tuple[int, int, Pos]]:
+    """工人这一回合可以奔的塔位（就近排序,没人认领的优先）
+
+    先挑没人认领的塔位：第一个工人朝塔位赶路时就会把它认领下来，其他人自然
+    分头去建别的塔。但"认领"只是排队，不是独占——一个空位都挑不到时（塔位被
+    队友认领完了，或者只剩最后一座塔），允许跟着已经有人赶去的塔位走，
+    谁先到谁施工。
+
+    复盘里的 R2 型空过回合就是这么来的：`towers_missing` 里剩下的塔位全被
+    队友认领，后一名工人挑不到任何塔位，整回合被派去采矿——计划承诺的塔在
+    指令里一条都看不到，金币 50 闲置到天亮（issue #34：PK586411/536/619/647
+    连续四场复发）。跟着走最多两人奔同一座塔（到场的那个开工，另一个下一回合
+    自然改去别处），比整队掉头去采集划算得多。
+
+    参数:
+        worker: 当前决策的工人（用于按距离排序）
+        tower_sites: 武器工事的规划位置（按建造顺序）
+        sites_missing: 尚未建成、且这一回合没被占住的塔位
+        claimed: 已被其他角色认领的目标集合
+
+    返回:
+        (距离, 塔位下标, 坐标) 列表，距离升序；没有待建塔位时为空
+    """
+    free = [
+        (distance(worker.pos, site), index, site)
+        for index, site in enumerate(tower_sites)
+        if site in sites_missing and site not in claimed
+    ]
+    if not free:
+        free = [
+            (distance(worker.pos, site), index, site)
+            for index, site in enumerate(tower_sites)
+            if site in sites_missing
+        ]
+    return sorted(free, key=lambda pick: pick[:2])
 
 
 def _retry_sites(
@@ -1721,9 +1758,15 @@ def _step_toward(
     *,
     inside_only: bool = False,
 ) -> Pos | None:
-    """计算向目标移动的下一步"""
+    """计算向目标移动的下一步
+
+    先把目标周围可停留的格子按优先级试一遍（见 `_valid_stand_cells`）；
+    落脚点都能走到、只是最顺路的那一步被队友认领时，退而走"朝目标最近的
+    一步"（见 `_closest_step`），而不是判定目标不可达。
+    """
     # 计算可停留的格子
     stand_cells = _valid_stand_cells(turn, unit, target, claimed, inside_only)
+    reachable = False
 
     for stand in stand_cells:
         # 已经在目标位置
@@ -1732,13 +1775,75 @@ def _step_toward(
 
         # 计算路径
         step = next_step(turn, unit, stand)
-        if step is None or step in claimed:
+        if step is None:
+            continue
+        reachable = True
+        if step in claimed:
             continue
 
         claimed.add(step)
         return step
 
+    # 落脚点走得到、第一步只是被队友认领时，不能就此认定"目标走不通"：
+    # 旧实现返回 None，调用方于是改做别的事（工人掉头去采矿、开拓者原地发呆），
+    # 复盘里的"计划说建塔、指令里一条 build 都没有"就是这么来的（issue #34）。
+    if reachable:
+        return _closest_step(turn, unit, target, claimed, inside_only)
     return None
+
+
+def _closest_step(
+    turn: Turn,
+    unit: Unit,
+    target: Pos,
+    claimed: set[Pos],
+    inside_only: bool,
+) -> Pos | None:
+    """退路：在本体可走、没人认领的相邻格里挑一个离目标最近的
+
+    只作 `_step_toward` 的兜底用：A* 找到的落脚点都可达，但通往它们的第一步
+    落在队友这一回合认领的格子上（同一回合多个角色会一起抢相邻格）时，
+    仍然朝目标方向走一步，而不是原地判定"走不通"。
+
+    目标已经不比当前格更近的相邻格一律不选：等距或变远的移动只是折返
+    （复盘里"工人 (30,7)→(31,6)→(30,7) 两回合原地打转"），
+    这时返回 None、由调用方按"原地待命"处理。白天同样不踩武器塔/围墙的
+    建造点（站上去会把那一格占住，见 `_valid_stand_cells`）。
+
+    参数:
+        turn: 当前回合信息
+        unit: 移动的单位
+        target: 目标位置
+        claimed: 已被其他角色认领的格子
+        inside_only: 为 True 时只保留基地周围1格范围内的格子
+
+    返回:
+        本回合要移动到的格子；没有更近的可站位置时返回 None
+    """
+    station = turn.station()
+    footprint = station_footprint(station.pos) if station else ()
+    blocked = turn.blocked(unit)
+    build_sites = _reserved_build_sites(turn) if turn.is_day else frozenset()
+    here = distance(unit.pos, target)
+
+    best: Pos | None = None
+    for pos in get_neighbors(unit.pos):
+        if not turn.land(pos) or pos in blocked or pos in claimed:
+            continue
+        if pos in build_sites:
+            continue
+        if inside_only and _footprint_distance(pos, footprint) > 1:
+            continue
+        if distance(pos, target) >= here:
+            continue
+        if best is None or (distance(pos, target), pos.x, pos.y) < (
+            distance(best, target), best.x, best.y,
+        ):
+            best = pos
+
+    if best is not None:
+        claimed.add(best)
+    return best
 
 
 def _valid_stand_cells(
