@@ -34,6 +34,7 @@ from agent.brain import (
     STONE_RESERVE_MIN,
     TASK_API_FAIL_LIMIT,
     TASK_API_FAIL_MARKER,
+    TASK_API_KEEP,
     TASK_DATA_MARKER,
     TASK_DOC_MARKER,
     TASK_END_MARKER,
@@ -3475,6 +3476,123 @@ def test_task_loop_breaker_releases_pioneer_after_repeated_sandbox_output(
     assert distance(step, weapon) < distance(Pos(14, 14), weapon)
     # 放弃之后不再下发读文件命令（避免把同一个死循环再跑一遍）
     assert sandbox_command(payload) == ""
+
+
+def test_task_survives_repeated_failed_fetches_until_fail_limit(
+    payload_factory, role_factory,
+):
+    """沙盒在取数、只是地址全猜错时，不按"读文件死循环"提前熔断（S1）
+
+    回归：PK591771/PK591786 的 R11–R14，沙盒读题成功（key=yes、docs=2）但
+    8 次请求全 404（api=0、fail=8）。地址是照文档猜的、猜法又是确定性的，
+    同一份任务文件每回合算出来的候选清单逐字相同，输出因此逐字相同——看门狗
+    r0→r3 于是撞上 `TASK_LOOP_LIMIT`（3），任务在接上后的第 4 个回合就被熔断
+    （`rounds` 才 4、`fails` 才 3，取数连败线与超时线都还没到），LLM 兜底只
+    来得及问两次，剩下的任务窗连同两个任务点一起作废。这种回合该走取数连败
+    止损线（`TASK_API_FAIL_LIMIT`，比读文件循环线宽）：熔断发生在它到线的那
+    一回合，而不是第 3 个回合。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    weapon = Pos(9, 24)
+
+    for offset in range(TASK_API_FAIL_LIMIT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        # 每回合试的是同一批地址（清单逐字相同），8 次请求全部 404
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task,
+            "".join(
+                f"{TASK_API_FAIL_MARKER} http://localhost:8899/api/task/1"
+                " HTTPError 404\n"
+                for _ in range(8)
+            ),
+        )
+        commands, _ = decide(payload)
+
+        if offset < TASK_API_FAIL_LIMIT - 1:
+            # 读文件循环线到不了：沙盒这一回合真在取数（`[APIFAIL]` 是取数证据）
+            assert brain._TASK_WATCH is not None
+            assert brain._TASK_WATCH.repeats < TASK_LOOP_LIMIT
+            assert sandbox_command(payload) != ""  # 任务还在做，没有被提前止损
+            command = commands.get("10011")
+            assert command is None or command["action"] == "move"
+            if command is not None and command["action"] == "move":
+                step = Pos(
+                    command["targetPos"][0]["x"],
+                    command["targetPos"][0]["y"],
+                )
+                assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
+        else:
+            # 到取数连败止损线：放弃任务，开拓者回基地跟队
+            assert sandbox_command(payload) == ""
+            assert commands["10011"]["action"] == "move"
+            step = Pos(
+                commands["10011"]["targetPos"][0]["x"],
+                commands["10011"]["targetPos"][0]["y"],
+            )
+            assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+
+
+def _executor_rotate():
+    """从生成的沙盒脚本里取出候选地址的轮转函数（`rotate`）"""
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(
+        r"def rotate\(items, keep, offset\):.*?(?=\nfiles = task_files\(\))",
+        script, re.S,
+    )
+    assert match
+    namespace: dict = {}
+    exec(match.group(0), namespace)  # noqa: S102
+    return namespace["rotate"]
+
+
+def test_executor_rotates_fallback_candidates_across_rounds():
+    """重试要换地址：候选清单按回合轮转，文档样例永远排在最前面（S1）
+
+    复盘里沙盒连着几个回合输出逐字相同、api 恒 0——每回合算出来的候选清单
+    一样，被 `TASK_API_MAX_CALLS` 截断后试的还是同一批地址，重试等于把同一批
+    猜错的地址又试了一遍。轮转只动兜底的那一段，文档里给出的样例地址照旧最先试。
+    """
+    rotate = _executor_rotate()
+    items = ["doc", "doc/city", "a", "b", "c"]
+
+    # 前 keep 条（文档给出的样例地址）固定不动，其余按回合号轮转
+    assert rotate(items, 2, 0) == items
+    assert rotate(items, 2, 1) == ["doc", "doc/city", "b", "c", "a"]
+    assert rotate(items, 2, 2) == ["doc", "doc/city", "c", "a", "b"]
+    assert rotate(items, 2, 3) == items  # 转满一圈回到原样
+
+    # 没有兜底候选时不动，轮转也不会把清单里的地址弄丢或弄重
+    assert rotate(items[:2], 2, 3) == items[:2]
+    assert sorted(rotate(items, 2, 1)) == sorted(items)
+
+
+def test_sandbox_command_passes_round_number_to_the_executor(
+    payload_factory, role_factory,
+):
+    """沙盒命令把当前回合号传进执行器当轮转量（S1）
+
+    轮转量必须是"这一回合"的回合号：两回合拿到同一个量，候选清单就还是逐字
+    相同，多出来的重试回合等于白等。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    commands = {}
+    for round_no in (13, 14):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, round_no,
+        )
+        commands[round_no] = sandbox_command(payload)
+
+    for round_no, command in commands.items():
+        assert command != ""
+        assert f"KEEP = {TASK_API_KEEP}" in command
+        assert f"OFFSET = {round_no}" in command
+        # 清单必须真的过一遍轮转函数，否则注入的回合号没有任何作用
+        assert "for url in rotate(candidates(text, name, urls), KEEP, OFFSET):" in command
+
+    assert commands[13] != commands[14]  # 两回合试的地址不再是同一批
 
 
 def test_abandoned_task_still_submits_the_answer_in_hand(

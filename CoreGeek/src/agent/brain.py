@@ -366,6 +366,10 @@ TASK_ECHO_RUN = r"[一-鿿]{6,}"  # 任务描述里的中文长句（复读判�
 TASK_API_DEFAULT = "http://localhost:8899"  # 沙盒内的本地接口
 TASK_API_TIMEOUT = 1  # 单次取数超时（秒），整条沙盒命令限时 15 秒
 TASK_API_MAX_CALLS = 8  # 一条命令里最多请求几次（本地接口，失败也是立刻返回）
+# 候选地址里固定排在最前面的条数（S1，见执行器的 `rotate`）：文档给出的样例
+# 地址优先级最高，每回合都该先试；候选清单被 `TASK_API_MAX_CALLS` 截断时，
+# 轮转只发生在这一小段之后的兜底候选上。
+TASK_API_KEEP = 2
 TASK_API_TIME_BUDGET = 8  # 取数阶段的时间上限（秒），留出找文件与回读的余量
 TASK_EXEC_DIR_BUDGET = 4000  # 全盘找文件时最多进几个目录（防止 walk 慢过 15 秒）
 TASK_API_QUERY_MAX = 2  # 每个接口地址最多试几个查询词
@@ -489,7 +493,8 @@ class TaskWatch:
         round_no: 记下这条观察的回合号
         output: 当时那份属于本任务的沙盒输出（没有输出时为空串）
         rounds: 这个任务已经占用开拓者的回合数
-        repeats: 当前这份输出已经连续出现了几次
+        repeats: 当前这份输出已经连续出现了几次（沙盒真在取数的回合不累计，
+            见 `_task_fetch_failed`）
         probes: 到这个回合为止发出去的沙盒探测命令数（见 `TASK_PROBE_LIMIT`）
         submits: 到这个回合为止打算交上去的答卷数（见 `TASK_SUBMIT_LIMIT`）
         fails: 到这个回合为止连续取数全失败的回合数（见 `TASK_API_FAIL_LIMIT`）
@@ -3351,6 +3356,28 @@ def _task_output(turn: Turn) -> str:
     return ""
 
 
+def _task_fetch_failed(output: str) -> bool:
+    """这一份沙盒输出是不是"真去取数了、但一次都没取到"（S1）
+
+    执行器的每次请求都会留一行：成功打 `[API]`（`TASK_DATA_MARKER`），失败打
+    `[APIFAIL]`（`TASK_API_FAIL_MARKER`）。两个标记都不在，说明沙盒这一回合
+    根本没走到取数那一步（只把任务文件读回来就交差了），那是读文件死循环；
+    只有 `[APIFAIL]` 则是"地址猜错了"——沙盒该做的都做了，卡住的是候选地址。
+
+    两者的止损线不一样（见 `_task_abandoned`）：读文件死循环按同一份输出重复
+    几次熔断（`TASK_LOOP_LIMIT`），猜错地址按连续几回合取不到数熔断
+    （`TASK_API_FAIL_LIMIT`）。判据在 `_watch_task` 里用来把后者的 `repeats`
+    按住不动——否则一局里猜地址的回合会被当成读文件循环提前熔断。
+
+    参数:
+        output: 上一回合属于本任务的沙盒输出
+
+    返回:
+        True 表示输出里只有取数失败的诊断、没有任何一次取数成功
+    """
+    return TASK_API_FAIL_MARKER in output and TASK_DATA_MARKER not in output
+
+
 def _watch_task(turn: Turn) -> None:
     """刷新任务看门狗（每回合由 `decide` 调用一次）
 
@@ -3368,6 +3395,9 @@ def _watch_task(turn: Turn) -> None:
         - `fails`：这一回合的沙盒输出里既没有取数证据（`TASK_DATA_MARKER`），
           手里也攒不出一份答卷，说明这一趟取数又白跑了（S1 的取数连败上限）。
           只数白天的回合：夜里开拓者本来就要回防，任务已经被强制结束。
+
+    `repeats`（同一份输出连续出现了几次，读文件死循环的判据）只在沙盒**没在
+    取数**的回合上累计：见下面的说明与 `_task_fetch_failed`。
 
     参数:
         turn: 当前回合信息
@@ -3401,9 +3431,18 @@ def _watch_task(turn: Turn) -> None:
         )
         return
 
-    # 又读到同一份输出说明这一回合没有任何进展，往上累计；换了新输出则重新数
+    # 又读到同一份输出说明这一回合没有任何进展，往上累计；换了新输出则重新数。
+    # 但"沙盒真去取数了、只是没取到数"不算没有进展（S1）：地址是照文档猜的，
+    # 而猜法是确定性的——同一份任务文件每回合算出同一批候选地址、撞同一批
+    # 404，输出因此逐字相同，`repeats` 于是必然到线：复盘 PK591771/PK591786
+    # 里 R11 下发沙盒命令、R12–R14 三回合回读同一份输出，任务就在 R14 被熔断
+    # （watch=r3/t4，而 `rounds` 才 4、`fails` 才 3，两条更宽的止损线都还没到）。
+    # 这种回合该归"取数连败"（`TASK_API_FAIL_LIMIT`）管：它比读文件循环线宽，
+    # LLM 兜底（`TASK_LLM_MAX_PROMPTS`）才有机会把六次求助跑完。
     if not output:
         repeats = 0
+    elif _task_fetch_failed(output):
+        repeats = 1
     elif output == previous.output:
         repeats = previous.repeats + 1
     else:
@@ -3429,6 +3468,12 @@ def _task_abandoned(turn: Turn) -> bool:
     这名劳动力也一起白搭；另一批复盘（PK590916/PK591014）里卡住的则不是
     死循环而是取数连败——沙盒每回合都换一批 404 的地址，`repeats` 到不了线，
     只能靠取数连败这条（或超时线）兜底。
+
+    第一条线只认"沙盒没在取数"的那种重复（见 `_task_fetch_failed`）：猜地址
+    猜错的回合输出同样逐字相同（猜法是确定性的），但它有取数失败的诊断在手，
+    该走第二条的取数连败线而不是被当成读文件循环提前熔断（PK591771/PK591786
+    的 R11–R14 就是这么在接任务后的第 4 个回合被放弃的，`rounds` 才 4、
+    `fails` 才 3，两条更宽的线都还没到）。
 
     观察值必须是本回合或上一回合记下的（`sandbox_command` 排在 `decide` 之前
     调用时，看到的是上一回合那条），回合号对不上就当作没有观察，免得把别的
@@ -3838,15 +3883,18 @@ def _sandbox_command(turn: Turn) -> str:
     scan = "pwd; ls -a -- . 2>&1 | head -40"
     # 执行器片段以 heredoc 结束符收尾，换行后再接诊断与回读；
     # 末尾的 `:` 保证整条命令的退出码为 0：输出带 `[exitCode:0]` 才会被
-    # `_task_answer` 采纳，而执行器里的取数失败时退出码可能是非 0 的
+    # `_task_answer` 采纳，而执行器里的取数失败时退出码可能是非 0 的。
+    # 回合号作为候选地址的轮转量传进去（S1）：取数的地址是照文档猜的，而每回合
+    # 算出来的候选清单逐字相同，不轮转就永远只试最前面那 `TASK_API_MAX_CALLS` 条
+    # （复盘里沙盒连着几回合输出逐字相同、api 恒 0，重试等于没重试）
     return (
-        f'echo "{marker}"; {_task_executor(target)}'
+        f'echo "{marker}"; {_task_executor(target, turn.round_no)}'
         f'\necho "{TASK_END_MARKER}"; {scan};'
         f' {_task_dump(turn)}; :'
     )
 
 
-def _task_executor(task_path: str) -> str:
+def _task_executor(task_path: str, offset: int = 0) -> str:
     """在沙盒里执行自进化任务的命令片段（读任务文件 -> 调接口取数 -> 打答案）
 
     沙盒里只有基础 shell 与 python，命令一回合只能下一发、限时 15 秒，
@@ -3855,6 +3903,9 @@ def _task_executor(task_path: str) -> str:
 
     参数:
         task_path: 任务描述里点名的任务文件（沙盒路径或文件名）
+        offset: 候选地址的轮转量（S1，通常传当前回合号）：候选清单比
+            `TASK_API_MAX_CALLS` 长，每回合算出来的清单又逐字相同，不轮转
+            就永远只试最前面那几条（见执行器里的 `rotate`）
 
     返回:
         可直接拼进沙盒命令的 shell 片段
@@ -3865,6 +3916,8 @@ def _task_executor(task_path: str) -> str:
         .replace("__BASE__", repr(TASK_API_DEFAULT))
         .replace("__TIMEOUT__", str(TASK_API_TIMEOUT))
         .replace("__MAX_CALLS__", str(TASK_API_MAX_CALLS))
+        .replace("__KEEP__", str(TASK_API_KEEP))
+        .replace("__OFFSET__", str(offset))
         .replace("__TIME_BUDGET__", str(TASK_API_TIME_BUDGET))
         .replace("__DIR_BUDGET__", str(TASK_EXEC_DIR_BUDGET))
         .replace("__QUERY_MAX__", str(TASK_API_QUERY_MAX))
@@ -3914,6 +3967,8 @@ TASK_PATH = __TASK_PATH__
 BASE = __BASE__
 TIMEOUT = __TIMEOUT__
 MAX_CALLS = __MAX_CALLS__
+KEEP = __KEEP__
+OFFSET = __OFFSET__
 TIME_BUDGET = __TIME_BUDGET__
 DIR_BUDGET = __DIR_BUDGET__
 QUERY_MAX = __QUERY_MAX__
@@ -4249,6 +4304,27 @@ def candidates(text, name, urls):
     return out
 
 
+def rotate(items, keep, offset):
+    """把候选地址里"兜底的那一段"按回合轮转（前 keep 条固定不动，S1）
+
+    自进化任务的接口地址是靠"读文档 -> 拼地址"猜的，而猜法是确定性的：同一份
+    任务文件每回合算出来的候选清单逐字相同，被 MAX_CALLS 截断后每回合试的还是
+    同一批地址、撞同一批 404，沙盒输出因此逐字相同——复盘 PK591771/PK591786
+    的 R11–R14 就是这样：读题成功（key=yes、docs=2）但 api 恒 0、fail=8，
+    重试了几个回合等于把同一批猜错的地址又试了一遍。
+
+    文档给出的样例地址优先级最高（`candidates` 把它们排在清单最前面），前 keep
+    条每回合照旧先试；其余候选按回合号轮转，转上几个回合整份清单都能覆盖到。
+
+    offset 为 0（拿不到回合号）或清单不比 keep 长时原样返回。
+    """
+    if offset <= 0 or keep >= len(items):
+        return items
+    head, tail = items[:keep], items[keep:]
+    shift = offset % len(tail)
+    return head + tail[shift:] + tail[:shift]
+
+
 files = task_files()
 # 接口文档的搜索范围（S2）：任务根目录与各任务文件所在目录优先，系统文档树
 # （/usr/share/doc 这类）整段跳过——复盘 PK590252 的 R14/R16 两次读回来的
@@ -4287,7 +4363,7 @@ for path in files[:SOLVE_MAX]:
     name = os.path.basename(path)
     text = read(path)
     bodies = []
-    for url in candidates(text, name, urls):
+    for url in rotate(candidates(text, name, urls), KEEP, OFFSET):
         if calls >= MAX_CALLS or time.time() > deadline:
             break
         calls += 1
