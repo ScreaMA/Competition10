@@ -1988,6 +1988,27 @@ def test_task_text_answer_matches_only_document_prefixes():
     assert not brain._task_text_answer("", result)
 
 
+def test_task_doc_body_matches_only_markdown_documents():
+    """`_task_doc_body` 的判定边界：只拦"首行就是标题"的文档正文（S2）
+
+    这条闸门补的是 `_task_text_answer` 的盲区：走 LLM 那条路时沙盒输出里
+    没有 `[DOC]`/`[TASK_FILE]` 指纹，`cat 文档` 打回来的正文没人比得了。
+    复盘 PK590836 的 R15 交上去的正是
+    `# 国家文化遗产数字档案查询系统 — API 参考文档…`（Judge 判 0，还烧掉
+    一次提交额度）。取到的数据一律放行。
+    """
+    assert brain._task_doc_body(_DOC_TEXT)
+    assert brain._task_doc_body("# 国家文化遗产数字档案查询系统 — API 参考文档")
+    # 取数取到的数据 / 短答案 -> 放行
+    assert not brain._task_doc_body('{"city": "北京", "items": [7]}')
+    assert not brain._task_doc_body("故宫 7")
+    assert not brain._task_doc_body("")
+    # 单行、标题里也没有"文档"字样 -> 放行（不误伤以井号开头的短答案）
+    assert not brain._task_doc_body("#7 号坑位")
+    # 多行但首行不是标题 -> 放行（数据里带井号注释是正常的）
+    assert not brain._task_doc_body("城市 结果\n# 注释\n北京 7\n")
+
+
 def test_cached_doc_text_is_not_submitted(payload_factory, role_factory):
     """缓存里那条"答案"是文档原文时不能进缓存（提交闸门不能只拦一条路）
 
@@ -3645,6 +3666,32 @@ def test_task_answer_from_llm_command_output(payload_factory, role_factory):
     assert "晴" in commands["10011"]["taskAnswer"]
 
 
+def test_llm_command_output_that_is_a_document_is_not_submitted(
+    payload_factory, role_factory,
+):
+    """LLM 的 `cat 文档` 把接口文档打回来时不能交卷（PK590836 的 R15）
+
+    这条路上沙盒输出里没有 `[DOC]`/`[TASK_FILE]` 指纹，`_task_text_answer`
+    没有可比的东西，只能按"文档长什么样"拦一道（`_task_doc_body`）。交一次
+    判 0 分、还烧掉一次提交额度，宁可这一回合不交、等下一份沙盒输出。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: cat /tmp/selfEvolutionTask/1-unknown-api/API.md"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13, evidence=_DOC_TEXT,
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
 def test_task_answer_from_llm_direct_answer(payload_factory, role_factory):
     """LLM 直接给答案时不必绕沙盒，下一回合就交卷"""
     brain._TASK_LLM_STATE.clear()
@@ -4431,6 +4478,17 @@ def test_task_brief_reports_reason_codes(payload_factory, role_factory):
     assert "state=ok" in brief
     assert "api=1" in brief
 
+    # 答案是文档正文、输出里又没有 `[DOC]`/`[TASK_FILE]` 指纹可比（LLM 那条路
+    # 的形态）时，改由"文档长什么样"的闸门拦下：state=doc_body（S2）
+    turn = Turn.load(_task_payload(
+        payload_factory, role_factory, phase_task, 14,
+        output=f"{TASK_DATA_MARKER} http://localhost:8899/docs => 4\n"
+               f"{TASK_SOLUTION_MARKER}task_1_beijing.md\n"
+               f"{_DOC_TEXT}\n{TASK_SOLUTION_END}\n",
+    ))
+    brief = brain.task_brief(turn)
+    assert "state=doc_body" in brief
+
 
 def test_task_brief_without_task(payload_factory):
     """没有任务时不打任务字段（避免日志里出现无意义的行）"""
@@ -4444,19 +4502,24 @@ def test_executor_template_has_no_placeholders():
     assert re.findall(r"__[A-Z_]+__", command) == []
 
 
+def _executor_refine_url():
+    """从生成的沙盒脚本里取出 URL 净化部分（`HOST_SAFE` + `cut_host` + `refine_url`）"""
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(r"HOST_SAFE = \(.*?(?=\ndef endpoints\()", script, re.S)
+    assert match
+    namespace: dict = {}
+    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    return namespace["refine_url"]
+
+
 def test_executor_refine_url_survives_cjk_and_backticks():
     """沙盒执行器的 URL 净化：中文标点/反引号不再让 urllib 抛 InvalidURL（#67）
 
     复盘里 R12–R17 连续 6 回合 `APIFAIL ... ），API InvalidURL`，任务因此
     8 个回合读不到题面。这里直接从生成的脚本里取出 refine_url 验证行为。
     """
-    command = _task_executor("task_1_beijing.md")
-    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
-    match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
-    assert match
-    namespace: dict = {}
-    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
-    refine = namespace["refine_url"]
+    refine = _executor_refine_url()
 
     assert refine("http://localhost:8899/weather?city=北京。") == (
         "http://localhost:8899/weather?city=%E5%8C%97%E4%BA%AC"
@@ -4464,6 +4527,28 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+def test_executor_refine_url_cuts_junk_in_host():
+    """主机名里混进来的行文要被截断（PK590836/PK590849 的 R12–R17）
+
+    复盘里的诊断行是 `[APIFAIL] http://localhost:8899`），API InvalidURL`：
+    文档把本地接口写在句子里，端口后面紧跟反引号与全角标点，整段连一个 `/`
+    都没有，urlsplit 于是把它全当成 netloc；`quote` 只覆盖 path/query，
+    杂质原样进了地址——只剥两端的标点救不回来（末尾是 ASCII 的 `API`，没得剥）。
+    `cut_host` 在第一个不属于主机名的字符处截断，地址回到本地接口的本相。
+    """
+    refine = _executor_refine_url()
+
+    assert refine("http://localhost:8899`），API") == "http://localhost:8899"
+    assert refine("http://localhost:8899（本地接口）") == "http://localhost:8899"
+    # 查询词里的中文在主机名之外，照旧百分号编码，不受截断影响
+    assert refine("http://localhost:8899?city=北京") == (
+        "http://localhost:8899?city=%E5%8C%97%E4%BA%AC"
+    )
+    # 主机名整段都是杂质时拼不出地址：宁可不试，也不交一个注定 InvalidURL 的地址
+    assert refine("http://`），API") == ""
+    assert refine("http://localhost:8899 x") == "http://localhost:8899"
 
 
 def test_executor_api_fail_reports_status_and_body(capsys):
