@@ -548,6 +548,17 @@ TASK_ERROR_BODY = re.compile(
 TASK_DOC_MARKER = "[DOC]"  # 执行器读到的接口文档开头（诊断行，供答案闸门比对）
 TASK_TEXT_HINT = 120  # 文档指纹取开头这些字符（空白归一化后）
 TASK_TEXT_HINT_MIN = 30  # 指纹短于这个长度不作数：太短的串容易误伤正常答案
+# 答案"长得像文档"的判定（S2）：`_task_text_answer` 拿沙盒输出里的文档指纹
+# 比对，而指纹只在执行器跑过的那一轮里才有（`[DOC]` 行、`[TASK_FILE]` 段）。
+# 走 LLM 那条路时（`CMD: <命令>` 的输出就是答案）输出里没有指纹，一条
+# `cat 接口文档.md` 的输出会被原样交上去——复盘 PK590836 的 R15 交的正是
+# `# 国家文化遗产数字档案查询系统 — API 参考文档…` 这份文档原文，Judge 判 0，
+# 且每交一次就烧掉一次提交额度。文档有自己的长相：首行是 Markdown 标题
+# （`# 标题`），正文里还常点名"参考文档""版本"这类字样。答案是一段数据
+# （`{"city":"北京"}` / `故宫`），不会长成这样，所以这条闸门只认"首行就是
+# 标题"这一种形态，误伤面小到可以忽略。
+TASK_DOC_HEAD = re.compile(r"^\s{0,3}#{1,6}\s")
+TASK_DOC_WORDS = ("参考文档", "接口文档", "API 文档", "使用说明", "文档版本", "版本历史")
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -3353,6 +3364,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None  # 把任务原文当答案交上去 = 又一次 0 分
     if _task_text_answer(answer, turn.last_cmd_result):
         return None  # 把喂给 LLM 的那份文档原文抄回来，同样不是答案（S1）
+    if _task_doc_body(answer):
+        return None  # LLM 抄的是一份文档的正文，不是一个答案（S2）
     if _task_path_answer(answer):
         return None  # "ANSWER: <任务文件的路径>" 同样不是答案（S1）
     return answer
@@ -3377,6 +3390,8 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None  # 命令把接口的错误提示打了出来，这一趟同样没取到数
     if _task_text_answer(answer, turn.last_cmd_result):
         return None  # 命令把沙盒里的文档原文打了出来（`cat 文档`），不是答案
+    if _task_doc_body(answer):
+        return None  # 命令把一份文档的正文打了出来（`cat 文档`），不是答案（S2）
     if _task_path_answer(answer):
         return None  # 命令只把任务文件的路径打了出来，不算取到数
     return answer
@@ -3622,16 +3637,56 @@ def task_files():
     return named + others
 
 
+# 主机名（authority）里允许出现的字符：RFC 3986 的那一套。反引号、引号、
+# 全角标点、中文都不在其中——它们只会来自文档的行文，不是地址的一部分。
+HOST_SAFE = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    ".-_~%!$&()*+,;=:@[]"
+)
+
+
+def cut_host(text):
+    """在主机名的第一个非法字符处截断（S1）
+
+    文档把地址写在句子里时，杂质常常紧跟在端口后面：`http://localhost:8899`），API`
+    里连一个 `/` 都没有，整段会被 urlsplit 当成 netloc，而 `quote` 只覆盖
+    path/query，反引号与全角标点原样进了 URL，urlopen 于是抛 InvalidURL
+    ——复盘 PK590836/PK590849 里 R12–R17 连续多个回合的
+    `[APIFAIL] http://localhost:8899`），API InvalidURL` 就是这一条：只剥两端
+    的标点救不了它（末尾是 ASCII 的 `API`，没得剥）。
+    主机名只允许 `HOST_SAFE` 里的字符，第一个非法字符连同它后面的行文一起丢掉
+    ——`），API` 是文档的句子，不是地址。
+
+    只看 authority（`//` 之后到第一个 `/?#` 之前）：`?city=北京` 这类中文
+    查询词不在 authority 里，它由 `refine_url` 的 quote 做百分号编码，照旧可用。
+    """
+    start = text.find("//")
+    if start < 0:
+        return text
+    start += 2
+    end = len(text)
+    for sep in ("/", "?", "#"):
+        pos = text.find(sep, start)
+        if pos >= 0:
+            end = min(end, pos)
+    for index in range(start, end):
+        if text[index] not in HOST_SAFE:
+            return text[:index]
+    return text
+
+
 def refine_url(raw):
     """把文档里抓到的地址整成 urlopen 能吃的形式（整不出来就返回空串）
 
     文档是中文的，地址常写在句子中间或反引号里，尾随的全角标点、引号会让
     urllib 直接抛 `InvalidURL`——复盘 #67 里 R12–R17 连续 6 回合
     `APIFAIL ... ），API InvalidURL`（URL 含反引号+中文）就是这么来的，
-    任务因此 8 个回合读不到题面、最终 0 分。这里做两件事：
+    任务因此 8 个回合读不到题面、最终 0 分。这里做三件事：
 
     1. 剥掉两端的标点/引号/括号（含全角）
-    2. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
+    2. 主机名里混进来的杂质（反引号、全角标点、中文）在第一个非法字符处截断
+       （见 `cut_host`）
+    3. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
     """
     text = raw.strip()
     trim = "`'\\\"、，。；：？！,.;:!?)]}>（）【】《》“”‘’"
@@ -3639,6 +3694,9 @@ def refine_url(raw):
         text = text[:-1]
     while text and text[0] in trim:
         text = text[1:]
+    text = cut_host(text)
+    while text and text[-1] in trim:
+        text = text[:-1]
     if not text:
         return ""
     try:
@@ -3649,7 +3707,13 @@ def refine_url(raw):
         return ""
     path = urllib.parse.quote(parts.path, safe="/%:@&=+$,-_.!~*'()")
     query = urllib.parse.quote(parts.query, safe="=&%:@+$,-_.!~*'()")
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+    url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+    # 拼完再体检一次：urlopen 能吃的地址全是可打印 ASCII。走到这里还带非
+    # ASCII，说明上面哪一步没盖住，这个地址干脆不试——宁可不取数，也不让它
+    # 再去撞一次 InvalidURL，把一个回合的沙盒白烧掉。
+    if any(ord(char) < 33 or ord(char) > 126 for char in url):
+        return ""
+    return url
 
 
 def endpoints(doc_text):
@@ -3922,6 +3986,8 @@ def _task_answer(turn: Turn) -> str | None:
            R13 交的就是接口文档原文，它是"取数取到了文档页"而不是答案；
         5. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
            "该读哪个文件"当成了答案。
+    走 LLM 那条路时输出里没有文档指纹可比，另有一道按"文档长什么样"判定的
+    闸门（`_task_doc_body`，PK590836 的 R15 交的是 API 文档正文）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
@@ -3937,7 +4003,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     `exit_nonzero`（命令失败）/ `no_api_data`（取不到数）/ `error_in_output` /
     `short_or_missing` / `echo_task_text`（答案就是任务原文）/
     `error_body`（答案是接口的错误响应体）/ `doc_text`（答案是沙盒里那份文档的
-    原文）/ `path_answer`（答案是一条文件路径）。
+    原文）/ `path_answer`（答案是一条文件路径）/ `doc_body`（答案是 Markdown
+    文档的正文，见 `_task_doc_body`）。
     """
     if not turn.phase_task:
         return None, "no_task"
@@ -3975,6 +4042,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
         return None, "error_body"  # 交上去的是接口的错误提示，不是答案
     if _task_text_answer(answer, result):
         return None, "doc_text"  # 交上去的是沙盒里那份文档的原文，不是答案
+    if _task_doc_body(answer):
+        return None, "doc_body"  # 交上去的是一份 Markdown 文档的正文（S2）
     if _task_path_answer(answer):
         return None, "path_answer"  # 交上去的是一条路径：文件里问的答案还没拿到
     return answer, "ok"
@@ -4021,6 +4090,35 @@ def _task_error_body(answer: str) -> bool:
         True 表示这条答案是错误体的正文，不能提交
     """
     return TASK_ERROR_BODY.search(answer) is not None
+
+
+def _task_doc_body(answer: str) -> bool:
+    """答案是不是一份 Markdown 文档的正文（S2）
+
+    `_task_text_answer` 靠沙盒输出里的文档指纹判定"复读文档"，而指纹来自
+    执行器（`[DOC]` 行）与 `_task_dump` 的回读段（`[TASK_FILE]`），只在执行器
+    跑过的那一轮里才有。LLM 给的 `CMD: <命令>` 跑完之后，输出区里就是命令的
+    原始 stdout，没有任何指纹可比——一条 `cat 接口文档.md` 的输出于是被原样
+    当成答案交上去（复盘 PK590836 的 R15：`# 国家文化遗产数字档案查询系统 —
+    API 参考文档…`，Judge 判 0）。这里按"文档长什么样"补一道闸门：
+
+        - 首行是 Markdown 标题（`# 标题`，允许前三格缩进）
+        - 并且正文不止一行，或者标题里就点名了"参考文档""版本"这类字样
+
+    两条同时成立才拦。答案是一段取数结果（JSON、短字符串、一条记录），
+    不会以 `# ` 起头又接着写好些行；反过来，单行的 `# xxx` 也放行，免得把
+    某个恰好以井号开头的短答案误伤掉。
+
+    参数:
+        answer: 待提交的答案内容
+
+    返回:
+        True 表示这条答案是一份文档的正文，不能提交
+    """
+    lines = [line for line in answer.splitlines() if line.strip()]
+    if not lines or not TASK_DOC_HEAD.match(lines[0]):
+        return False
+    return len(lines) > 1 or any(word in lines[0] for word in TASK_DOC_WORDS)
 
 
 def _task_text_hints(result: str) -> list[str]:
@@ -4141,6 +4239,7 @@ def _remember_task_answers(result: str) -> None:
     沙盒里那份文档的原文同样不进缓存（`_task_text_answer`）：`/docs` 这类
     地址把文档页当正文返回时，`[API]` 证据是有的，但缓存下来的仍然是文档
     ——下一个任务点一到手就会把它当答案秒交（PK590851 的 R13 正是这么交的）。
+    文档正文（`_task_doc_body`）同理。
 
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
@@ -4156,6 +4255,7 @@ def _remember_task_answers(result: str) -> None:
             and answer
             and TASK_DATA_MARKER in evidence
             and not _task_text_answer(answer, result)
+            and not _task_doc_body(answer)
         ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
@@ -4172,10 +4272,11 @@ def _cached_answer(turn: Turn) -> str | None:
     任务描述里没点名文件时返回 None：探测出来的文件名与任务描述的对应关系
     不确定，宁可多花一个来回执行一次，也不拿别的任务的答案去作答。
 
-    缓存里那条答案本身也要过 `_task_path_answer` 与 `_task_error_body` 两道
-    闸门：缓存是在执行器输出上直接建的（`_remember_task_answers`），同一份
-    "答案"从这里出去同样可能是一条文件路径或一段接口错误提示——提交闸门只在
-    `_task_answer` 里拦一道的话，这条路就绕过去了。
+    缓存里那条答案本身也要过 `_task_path_answer`、`_task_error_body` 与
+    `_task_doc_body` 三道闸门：缓存是在执行器输出上直接建的
+    （`_remember_task_answers`），同一份"答案"从这里出去同样可能是一条文件
+    路径、一段接口错误提示或者一份文档的正文——提交闸门只在 `_task_answer`
+    里拦一道的话，这条路就绕过去了。
     """
     target = _task_file(turn.phase_task)
     if target is None:
@@ -4183,6 +4284,8 @@ def _cached_answer(turn: Turn) -> str | None:
     answer = _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
     if answer is None or _task_path_answer(answer) or _task_error_body(answer):
         return None
+    if _task_doc_body(answer):
+        return None  # 缓存里那条"答案"是一份文档的正文，同样不能交（S2）
     return answer
 
 
