@@ -599,7 +599,17 @@ TASK_ERROR_BODY = re.compile(
     r"\s\S+:\s*command not found\b|"
     r"\bNo such file or directory\b|"
     r"\bEndpoint not found\b|"
-    r"\bFailed writing body\b",
+    r"\bFailed writing body\b|"
+    # 脚本跑不起来时的 stderr（S1）：命令调的是沙盒里的现成脚本（`./check`
+    # 这类校验脚本）时，脚本本身有毛病的话输出里一行取数结果都没有，只有
+    # `/bin/sh^M: bad interpreter`（CRLF 行尾，见 `_crlf_safe_command`，复盘
+    # PK591009 的 R14）、`sh: 1: ./check: not found`（脚本不在/没有执行位）或
+    # `unexpected EOF while looking for matching`（脚本里引号不配对）。这几句
+    # 都是 shell 自己的诊断，正常取数结果不会长成这样，命中即不提交。
+    r"\bbad interpreter\b|"
+    r"\bcannot execute\b|"
+    r"\bunexpected EOF while looking for matching\b|"
+    r"\b\S+:\s*\d+:\s*\S+:\s*not found\b",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -3511,11 +3521,114 @@ def _shell_command_ok(command: str) -> bool:
     return all(command.count(quote) % 2 == 0 for quote in ('"', "'"))
 
 
+# 沙盒里被调用的脚本可能是 CRLF 行尾（S1）：任务自带的校验脚本按 Windows 换行
+# 落地时，内核 exec 会把 `\r` 一起读进 shebang，整条命令只换来一行
+# `/bin/sh^M: bad interpreter`——复盘 PK591009 的 R14 就是这么白烧掉一个任务
+# 回合的（沙盒输出里没有任何取数结果，答案区只能是空的，任务分继续挂零）。
+# 命令是 LLM 给的、脚本是沙盒里的，两头都不归我们管，只能在下发前把脚本的
+# 行尾归一化，见 `_crlf_safe_command`。
+LLM_SCRIPT_PROGRAMS = (
+    "sh", "bash", "dash", "zsh", "sudo", "env", "exec", "command",
+    "python", "python3",
+)
+# 沙盒自己的路径不碰：`/bin/cat`、`/usr/bin/awk` 这些是沙盒的工具，不是任务
+# 脚本，归一化它们既没意义又可能把沙盒改坏
+LLM_SCRIPT_SYSTEM = (
+    "/bin/", "/sbin/", "/usr/", "/etc/", "/lib/", "/proc/", "/sys/", "/dev/",
+    "/var/",
+)
+# 认得出是脚本的后缀：`./check` 这类校验脚本通常没有后缀，所以空后缀也算
+LLM_SCRIPT_EXTS = ("", ".sh", ".bash", ".py", ".pl", ".rb")
+# 带这些字符的写法一律不碰：拼进前置片段会破坏命令本身
+LLM_SCRIPT_BAD = frozenset("'\"`\\*?[]$&|;<>(){}\n\r\t")
+
+
+def _script_wrapper(token: str) -> bool:
+    """这个词是不是"跑脚本的方式"而不是脚本本身（解释器 / 前缀命令 / 选项）
+
+    `/bin/sh ./check`、`python3 /tmp/x.py`、`sudo ./check` 里的第一个词都是
+    解释器或前缀命令，真正要跑的东西在后一个词上；`-x` 这类选项同理，跳过它们
+    才找得到脚本本身。
+    """
+    if token in LLM_SCRIPT_PROGRAMS:
+        return True
+    if token.startswith("-"):
+        return True
+    return (
+        token.startswith(LLM_SCRIPT_SYSTEM)
+        and os.path.basename(token) in LLM_SCRIPT_PROGRAMS
+    )
+
+
+def _script_in_command(command: str) -> str:
+    """命令里第一个被执行到的沙盒脚本（没有则返回空串）
+
+    跳过解释器/前缀命令与选项之后看第一个词：`./check`、`../check.sh`、
+    `/tmp/selfEvolutionTask/1-x/check.py` 是"跑沙盒里的一个脚本"，而归一化只对
+    脚本有意义——`cat ./task.md` 里的路径是数据文件（给取数结果做 sed 只会改坏
+    答案），`curl` 后面的地址同理，这些一概不碰。
+
+    参数:
+        command: LLM 给的沙盒命令（单行）
+
+    返回:
+        可以安全做行尾归一化的脚本路径；找不到时返回空串
+    """
+    tokens = command.strip().split()
+    index = 0
+    while index < len(tokens) and _script_wrapper(tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return ""
+    token = tokens[index]
+    if not token.startswith(("./", "../", "/")):
+        return ""
+    if token.startswith(LLM_SCRIPT_SYSTEM):
+        return ""
+    if any(char in LLM_SCRIPT_BAD for char in token):
+        return ""
+    if os.path.splitext(token)[1].lower() not in LLM_SCRIPT_EXTS:
+        return ""
+    return token
+
+
+def _crlf_safe_command(command: str) -> str:
+    """把命令里调用的沙盒脚本转成 LF 行尾再执行（S1）
+
+    CRLF 的脚本会以 `/bin/sh^M: bad interpreter` 收场（复盘 PK591009 的 R14：
+    这一条把任务窗里的一个回合整段烧掉）。前置片段先 `[ -f ]` 判存在：LLM 猜
+    的路径未必真有那个文件，这种情况原命令照跑，行为与改造前一致；`sed -i`
+    本身失败（只读挂载、没有 sed）也只是归一化没生效，不影响后面的命令。
+
+    参数:
+        command: LLM 给的沙盒命令（单行）
+
+    返回:
+        带行尾归一化前置片段的命令；没有脚本可归一化时原样返回
+    """
+    script = _script_in_command(command)
+    if not script:
+        return command
+    # 正则里的 `\r` 不能直接写在 sed 表达式里（POSIX 没定义，个别 sed 当成
+    # 字母 r，那样会把每行末尾的 r 都删掉、把脚本改坏），改用 printf 生成一个
+    # 真正的回车字符拼进表达式。变量名带 `CRLF_` 前缀，避开命令自己可能用到的
+    # 短名字（`P`、`CR` 这种在 LLM 给的命令里并不罕见）
+    return (
+        f"CRLF_P='{script}'; CRLF_CR=$(printf '\\r'); "
+        f"[ -f \"$CRLF_P\" ] && "
+        f"sed -i \"s/$CRLF_CR\\$//\" \"$CRLF_P\" 2>/dev/null; "
+        f"{command}"
+    )
+
+
 def _llm_task_command(turn: Turn) -> str:
     """把 LLM 给的取数命令包成一条沙盒命令（带任务标识，供下一回合取答案）
 
     包装方式和执行器一致：`[TASK]<标识>` 与 `[TASK_END]` 之间是答案区，
     末尾的 `:` 保证退出码为 0。
+
+    命令调的是沙盒里的脚本时先做一遍行尾归一化（S1，见 `_crlf_safe_command`）：
+    CRLF 的脚本只会换来一行 `/bin/sh^M: bad interpreter`，一个任务回合白搭。
     """
     state = _task_llm_state(turn)
     command = str(state.get("pending_cmd") or "")
@@ -3525,7 +3638,7 @@ def _llm_task_command(turn: Turn) -> str:
     state["cmd_round"] = turn.round_no
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
     return (
-        f'echo "{marker}"; {command}\n'
+        f'echo "{marker}"; {_crlf_safe_command(command)}\n'
         f'echo "{TASK_END_MARKER}"; :'
     )
 
