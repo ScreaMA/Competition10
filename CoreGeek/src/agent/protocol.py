@@ -234,6 +234,7 @@ class Turn:
     player_tasks: tuple[PlayerTask, ...]  # 任务点
     phase_task: str  # 当前任务描述
     last_cmd_result: str  # 上回合沙盒命令（executeCmd）的执行结果
+    last_action_results: dict[int, bool]  # 上回合各角色动作是否执行成功
     vendor_shop: list[dict[str, Any]]  # 小贩价格表
     weapon_shop: list[dict[str, Any]]  # 武器商店价格表
 
@@ -266,6 +267,13 @@ class Turn:
             ),
             phase_task=str(payload.get("phaseTask") or ""),
             last_cmd_result=str(payload.get("lastCmdResult") or ""),
+            last_action_results={
+                int(role_id): bool(success)
+                for role_id, success in (
+                    payload.get("lastRoundRoleActionResults") or {}
+                ).items()
+                if str(role_id).isdigit()
+            },
             vendor_shop=payload.get("vendorShopList") or [],
             weapon_shop=payload.get("weaponShopList") or [],
         )
@@ -376,6 +384,15 @@ class Turn:
             r for r in self.robots
             if r.is_alive and r.target_team == self.team_type
         )
+
+    def action_failed(self, unit_id: int) -> bool:
+        """该角色上一回合的动作是否执行失败
+
+        任务书4.5.4节的碰撞规则会让移动/建造失败（目标格被抢占、
+        与其他角色争夺同一格等）。报文里没有给出该角色的结果时视为成功，
+        免得决策层误以为失败而反复换位置。
+        """
+        return self.last_action_results.get(unit_id, True) is False
 
 
 # === 指令构建函数 ===
