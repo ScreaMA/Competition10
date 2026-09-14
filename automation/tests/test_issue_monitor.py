@@ -38,18 +38,27 @@ def test_fetch_candidates_keeps_only_newest(tmp_path):
 
 
 def test_fetch_candidates_skips_processed_and_ignored(tmp_path):
-    """截断之前先走原有过滤：处理过的、命中忽略标签的都不在候选里"""
+    """截断之后再过滤：最新 3 个里被处理过 / 命中忽略标签的都不在候选里"""
     monitor = _monitor(tmp_path, [
         _issue(9),
         _issue(8, labels=("wontfix",)),
         _issue(7),
-        _issue(6),
+        _issue(6),  # 排在最新 3 个之外，根本不会被看到
     ])
     monitor.mark_processed(7, "published", "")
 
     picked = monitor.fetch_candidates()
 
-    assert [issue.number for issue in picked] == [9, 6]
+    assert [issue.number for issue in picked] == [9]
+
+
+def test_fetch_candidates_never_looks_back(tmp_path):
+    """最新 3 个都处理过时本轮没有候选，不往历史回溯（只看最新 3 个）"""
+    monitor = _monitor(tmp_path, [_issue(n) for n in range(1, 8)])
+    for number in (7, 6, 5):
+        monitor.mark_processed(number, "published", "")
+
+    assert monitor.fetch_candidates() == []
 
 
 def test_fetch_candidates_limit_can_be_disabled(tmp_path):
