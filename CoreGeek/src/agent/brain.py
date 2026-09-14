@@ -8,7 +8,7 @@
           围墙建完后用富余资源换取金币和武器升级（金币阶梯：
           武器升级券 > 围墙升级券，不让金币在手里睡着）。
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
-          描述里没给文件名时先全盘探测沙盒，顺带把任务文件读回来
+          描述里没给文件名时先全盘探测沙盒，顺带把任务文件都读回来
           缓存备用，下一个任务点就能即时交卷），
           有任务在身时不退回基地，任务点冷却期间白天也守在下一个会开放的
           任务点旁等它开放（省掉"回基地再折返"的来回），天黑前再回防；
@@ -18,10 +18,11 @@
 
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
 不依赖任何跨回合的战场状态，可自动适应矿区刷新、单位移动与视野变化。
-任务答案同理，直接从上一回合的沙盒输出（`lastCmdResult`）中解析，
-解析不到时再退到纯缓存 `_TASK_ANSWER_CACHE`（内容全部来自沙盒输出，
-未命中就走原来的读取流程）；LLM 建议也从请求里的 `llmResp` 现解析成
-有界计划（`_llm_plan`），建议与指令出自同一套决策函数。
+任务答案同理，只认执行器按任务描述在沙盒里取到的数据（`[SOLUTION]` 段，
+见 `_task_answer`），取不到数据就不提交；解析不到时再退到纯缓存
+`_TASK_ANSWER_CACHE`（内容全部来自执行器的产出），未命中就走原来的
+执行流程；LLM 建议也从请求里的 `llmResp` 现解析成有界计划（`_llm_plan`），
+建议与指令出自同一套决策函数。
 """
 
 import os
@@ -98,6 +99,17 @@ TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)  # 武器建造顺序（按射程由�
 STONE_BATCH = 3  # 工人采集石头的批次大小（越小围墙越早开工）
 WALL_BUILD_PRIORITY = 1000  # 围墙建造优先级
 SELL_BATCH = 10  # 卖给小贩的矿石批次大小
+# 一段围墙只要石头*1（任务书4.5.1），所以手里有石头就该立刻变成墙，
+# 不必攒够 STONE_BATCH 那么多段再一起铺。
+WALL_STONE_COST = 1
+
+# 金币见底线（经济回路）：低于这个值时不再等凑够一批矿石，手里有什么就卖什么。
+# 复盘里 R6 建完第三座塔后 gold=0 冻结 13 个回合，背包里 stone:6 既不卖也不
+# 建墙，全盘停摆——建造、升级、买券全部停摆，只能靠卖矿把金币重新转起来。
+LOW_GOLD_THRESHOLD = WEAPON_BUILD_COST
+# 建造分支的预算下限：余额不足一座塔的钱时不下发建造指令（`_gold_left` 算的是
+# 扣掉本回合已发指令后的余额），免得同一回合里两条 build 只有一条能结算成功。
+MIN_GOLD_FOR_BUILD = WEAPON_BUILD_COST
 
 # 建筑满血表在 protocol.py（日志与决策共用，任务书 4.5.1 节）：
 # 基地 1500/3000/4500，围墙 1000/1500/2000。判断"残血"靠这张表反查。
@@ -208,11 +220,10 @@ TASK_FIND_PRUNE = ("/proc", "/sys", "/dev")
 TASK_FILE_NAMES = ("task*", "spec*")
 # 探测沙盒时放宽一档：描述里连文件名都没有时，任何文档都可能是任务说明
 TASK_PROBE_NAMES = ("task*", "spec*", "*.md")
-# find 命中后执行的动作：直接打印内容（读任务文件）/ 只列出路径（探测与回读）
-TASK_FIND_CAT = "-exec cat -- {} +"
+# find 命中后执行的动作：只列出路径（探测与回读任务文件都用它）
 TASK_FIND_PRINT = "-print"
 # 任务文件分段标记：读任务文件时顺带把沙盒里的任务文件都读回来，
-# 每份用这两个标记包起来，`_remember_task_files` 据此按文件名缓存内容
+# 每份用这两个标记包起来，`_task_file` 据此认出沙盒里的真实文件名
 TASK_FILE_MARKER = "[TASK_FILE]"
 TASK_FILE_END = "[TASK_EOF]"
 # 单份任务文件最多读回的行数、一次最多回读的份数，
@@ -220,12 +231,35 @@ TASK_FILE_END = "[TASK_EOF]"
 TASK_FILE_LIMIT = 60
 TASK_FILE_MAX = 12
 
-# 任务答案缓存：文件名 -> 沙盒里读回来的内容
+# 任务答案的产出方式（自进化闭环）：沙盒里的任务文件是"任务描述"，不是答案。
+# 复盘里 R12/R14/R16/R18 四次 submitAnswer 交的全是任务原文
+# （"# 自进化任务 A-1：查询北京文化遗产 ## 任务背景…"），Judge 一次都没放行，
+# 任务分与任务金币全丢。答案必须由"按任务描述执行沙盒命令"产出：
+# 执行器（`_task_executor`）读任务文件与沙盒里的接口文档，照文档给出的地址
+# 真实调用本地接口取数，把取到的数据打成 `[SOLUTION]` 段。
+TASK_SOLUTION_MARKER = "[SOLUTION]"  # 答案段落开头，后跟任务文件名
+TASK_SOLUTION_END = "[/SOLUTION]"
+TASK_DATA_MARKER = "[API]"  # 真实取数的证据：只有请求成功才会打印
+TASK_ANSWER_MIN_LEN = 4  # 答案最短长度（任务原文动辄几千字，这条挡住空答）
+TASK_ECHO_RUN = r"[一-鿿]{6,}"  # 任务描述里的中文长句（复读判定用）
+TASK_API_DEFAULT = "http://localhost:8899"  # 沙盒内的本地接口
+TASK_API_TIMEOUT = 1  # 单次取数超时（秒），整条沙盒命令限时 15 秒
+TASK_API_MAX_CALLS = 8  # 一条命令里最多请求几次（本地接口，失败也是立刻返回）
+TASK_API_TIME_BUDGET = 8  # 取数阶段的时间上限（秒），留出找文件与回读的余量
+TASK_EXEC_DIR_BUDGET = 4000  # 全盘找文件时最多进几个目录（防止 walk 慢过 15 秒）
+TASK_API_QUERY_MAX = 2  # 每个接口地址最多试几个查询词
+TASK_API_BODY_LIMIT = 400  # 单个响应体最多带回的字符数
+TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一）
+TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
+TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
+TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
+
+# 任务答案缓存：任务文件名 -> 沙盒执行产出的答案（`[SOLUTION]` 段的内容）
 # 任务书5.3节要求"根据任务1探索的内容形成固定SOP或者SKILL，实现Agent自进化"，
 # 积分又是"任务奖励 + 5 × 标准回合数 / (完成回合 - 接取回合)"（任务书第六章），
-# 交得越早分越高。沙盒里一次把任务文件都读回来存进这里，后续任务点领到同一个
-# 任务时，开拓者不必再等一个来回的沙盒输出，接取后下一回合就能直接作答
-# （复盘里敌方就是靠答案缓存秒交，两次提交各拿 155 分）。
+# 交得越早分越高。执行器一次会把沙盒里的任务文件都试着解一遍，解出来的答案
+# 存进这里，后续任务点领到同一份任务时，开拓者不必再等一个来回的沙盒输出，
+# 接取后下一回合就能直接作答（复盘里敌方就是靠答案缓存秒交，两次提交各拿 155 分）。
 # 这是纯缓存：没有命中的任务仍然走"下发沙盒命令 -> 下一回合读输出"的原路径。
 _TASK_ANSWER_CACHE: dict[str, str] = {}
 
@@ -291,8 +325,8 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     输出: (角色ID字符串: 指令字典, 提交给LLM的prompt)
     """
     turn = Turn.load(payload)
-    # 上回合沙盒读回来的任务文件按文件名缓存，后续任务一到手就能直接作答
-    _remember_task_files(turn.last_cmd_result)
+    # 上回合执行器解出来的任务答案按文件名缓存，后续任务一到手就能直接作答
+    _remember_task_answers(turn.last_cmd_result)
     # 上一回合的LLM建议解析成有界计划，和指令生成器共用（解析不出来时是默认计划）
     plan = _llm_plan(payload)
     commands: dict[int, dict[str, Any]] = {}
@@ -525,9 +559,8 @@ def _worker_day_logic(
 ) -> None:
     """工人白天逻辑
 
-    优先级: 建造武器工事 > 换金币/升级武器/升级围墙(经济分工) > 采集石头
-            > 建造围墙 > 围墙建完后: 武器升级 > 围墙升级 > 卖矿换金币
-            > 采集任意矿石
+    优先级: 建造武器工事 > 用背包里的石头建围墙 > 换金币/升级武器/升级围墙
+            (经济分工) > 采集石头 > 施工用不上的石头卖给小贩 > 采集任意矿石
 
     任何分支最后都会落到"采集/交易"上，保证工人每回合都有产出，
     不会出现整回合没有任何指令的空转。
@@ -563,7 +596,7 @@ def _worker_day_logic(
     if (
         towers_missing
         and len(turn.weapons()) < _tower_target(turn, plan)
-        and _gold_left(turn, commands) >= WEAPON_BUILD_COST
+        and _gold_left(turn, commands) >= MIN_GOLD_FOR_BUILD
     ):
         # 就近认领: 每个工人挑离自己最近的那座塔，两个工人自然分头开工，
         # 而不是都盯着建造顺序表里的第一座（都挤过去的结果是另一座塔整局没人管）
@@ -627,19 +660,38 @@ def _worker_day_logic(
             claimed.add(mine)
             return
 
-    # 如果有石头,去建造围墙（位置都被其他角色占住时继续往下走,别空转）
-    if stones > 0:
+    # 如果有石头,去建造围墙（认领成功就记进 claimed：几名工人自然分头铺不同
+    # 段，而不是都奔向优先级最高的那一段，白走一趟还互相挡路；位置都被其他
+    # 角色占住时继续往下走,别空转）
+    if stones >= WALL_STONE_COST:
         sites = _retry_sites(
             turn, worker, [site for site in walls_missing if site not in claimed],
         )
-        if sites:
-            _build_or_walk(turn, worker, sites[0], WALL, claimed, commands)
+        if sites and _build_or_walk(turn, worker, sites[0], WALL, claimed, commands):
+            claimed.add(sites[0])
             return
 
-    # 没石头(或暂时没位置建): 就近采矿; 采不到就把背包里的矿石卖掉腾地方
+    # 没石头(或暂时没位置建): 金币见底时先把背包里的矿石变现，再谈采集
+    # （采集排在卖矿前面的旧顺序让矿石一直躺在背包里：复盘里 gold=0 冻结 13 个
+    #   回合、stone:6 从头到尾没卖出去，建造/升级/买券跟着一起停摆）
+    if _gold_critical(turn) and _trade_logic(turn, worker, claimed, commands):
+        return
+
+    # 还是没着落: 就近采矿; 采不到就把背包里的矿石卖掉腾地方
     if _gather_logic(turn, worker, claimed, commands, prefer_stone=wall_quota):
         return
     _trade_logic(turn, worker, claimed, commands)
+
+
+def _gold_critical(turn: Turn) -> bool:
+    """金币是否已经见底（不足一座塔的造价）
+
+    见底时经济回路成为第一优先级：建造、升级、买券都要求手里有金币，而金币
+    只能靠卖矿换（任务书4.6.1）。复盘里 R6 建完第三座塔后 gold=0 连续冻结
+    13 个回合、背包里的矿石一直没卖出去，全盘停摆——这时矿石留在背包里
+    没有任何价值，先变现才有翻盘的可能。
+    """
+    return turn.gold < LOW_GOLD_THRESHOLD
 
 
 def _tower_picks(
@@ -972,6 +1024,10 @@ def _trade_logic(
     既换到金币又避免工人因为塞满背包而无法采集。小贩离得太远、跑一趟回不来
     时不出门，先就近采集，等靠近了再卖（见 `_can_return_before_dusk`）。
 
+    金币见底（低于一座塔的造价）时不再等凑够一批：手里有多少卖多少。复盘里
+    R6 建完第三座塔后 gold=0 冻结 13 个回合，而背包里 stone:6 一直躺在背包里
+    ——等凑够 `SELL_BATCH` 的话，这点矿石永远变不成钱，经济也就永远转不起来。
+
     参数:
         turn: 当前回合信息
         worker: 当前决策的工人
@@ -990,8 +1046,9 @@ def _trade_logic(
         quantities,
         key=lambda item: (item[1], -SELLABLE_MINES.index(item[0])),
     )
-    # 背包满了就卖一批腾地方,否则等攒够一批再卖
-    if amount < (1 if worker.backpack_full else SELL_BATCH):
+    # 背包满了就卖一批腾地方,否则等攒够一批再卖；金币见底时有几块卖几块
+    batch = 1 if (worker.backpack_full or _gold_critical(turn)) else SELL_BATCH
+    if amount < batch:
         return False
 
     vendor = _nearest_zone(turn, VENDOR, worker.pos)
@@ -1695,24 +1752,24 @@ def _nearest_task_position(turn: Turn, origin: Pos) -> Pos | None:
 def _sandbox_command(turn: Turn) -> str:
     """任务期间需要提交给沙盒执行的命令
 
-    自进化类任务的原文描述通常形如“请阅读task_1_beijing.md”，需要在沙盒
-    中读取对应文件后才能作答。命令带上任务标识，便于下一回合确认输出
-    属于当前任务；已经拿到本任务的输出后就不再重复执行。
+    自进化类任务的任务文件是"任务描述"（"请阅读task_1_beijing.md，获取任务
+    信息"），答案要按描述在沙盒里取数才能得到。命令带上任务标识，便于下一
+    回合确认输出属于当前任务；已经拿到本任务的答案后就不再重复执行。
 
-    一条命令里尽量多拿信息（复盘里敌方逐次试错 401→400，白丢好几个回合）：
-    描述里的路径读不到时，按文件名在沙盒里全盘再找一次；再把沙盒的
-    工作目录与根目录列表一并带回来作诊断线索。答案由 `TASK_END_MARKER`
-    界定，诊断信息不会被当成答案提交。
+    答案区里跑的是执行器（`_task_executor`）：它读任务文件与沙盒里的接口
+    文档，照文档给出的地址真实调用本地接口取数，把取到的数据打成
+    `[SOLUTION]` 段。取不到数据就什么都不打——`_task_answer` 只认带取数
+    证据的答案，宁可这一回合不提交，也不把任务原文当成答案交上去
+    （复盘里 R12/R14/R16/R18 四次 submitAnswer 交的全是任务原文，任务分
+    恒为 0，两个任务点合计 160 分 + 160 金币全部丢掉）。
 
     描述里连文件名都没有时（"请按沙盒里的任务说明作答"这类），先按
-    `_sandbox_probe` 探一次沙盒，下一回合从探测结果里认出文件名
-    再走上面的读文件流程——复盘里"任务卡在任务点反复答非所问、整个任务
-    周期空转"就是从"不知道该读哪个文件"开始的。
+    `_sandbox_probe` 探一次沙盒，下一回合从探测结果里认出文件名再走上面的
+    读文件流程。
 
-    答案取完之后再把沙盒里的任务文件都读回来（`[TASK_FILE]` 分段），
-    交给 `_remember_task_files` 按文件名缓存：下一个任务点领到同一个任务时
-    开拓者不必再等一个来回的沙盒输出，接取后下一回合就能直接作答。
-    这一段排在 `TASK_END_MARKER` 之后，永远不会被当成当前任务的答案。
+    答案区之后依次是工作目录诊断与任务文件回读（`[TASK_FILE]` 分段，供
+    `_task_file` 认出沙盒里的真实文件名、给执行器圈定候选任务文件）。
+    这两段都排在 `TASK_END_MARKER` 之后，永远不会被当成答案。
     """
     if (
         not turn.phase_task
@@ -1727,19 +1784,224 @@ def _sandbox_command(turn: Turn) -> str:
         return _sandbox_probe(turn)
 
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
-    # 描述里给的可能是带目录的路径，兜底搜索只按文件名找
-    base = target.replace("\\", "/").rsplit("/", 1)[-1]
-    read = (
-        f'cat -- "{target}" 2>/dev/null'
-        f' || {_sandbox_find((base,), TASK_FIND_CAT)}'
-    )
     scan = "pwd; ls -a -- . 2>&1 | head -40"
+    # 执行器片段以 heredoc 结束符收尾，换行后再接诊断与回读；
     # 末尾的 `:` 保证整条命令的退出码为 0：输出带 `[exitCode:0]` 才会被
-    # `_task_answer` 采纳，而链路里的 find/cat 读不到文件时退出码是非 0 的
+    # `_task_answer` 采纳，而执行器里的取数失败时退出码可能是非 0 的
     return (
-        f'echo "{marker}"; {read}; echo "{TASK_END_MARKER}"; {scan};'
+        f'echo "{marker}"; {_task_executor(target)}'
+        f'\necho "{TASK_END_MARKER}"; {scan};'
         f' {_task_dump(turn)}; :'
     )
+
+
+def _task_executor(task_path: str) -> str:
+    """在沙盒里执行自进化任务的命令片段（读任务文件 -> 调接口取数 -> 打答案）
+
+    沙盒里只有基础 shell 与 python，命令一回合只能下一发、限时 15 秒，
+    所以取数脚本一次跑完：找任务文件与接口文档、按文档里的样例地址调用
+    本地接口、把响应体打成 `[SOLUTION]` 段。
+
+    参数:
+        task_path: 任务描述里点名的任务文件（沙盒路径或文件名）
+
+    返回:
+        可直接拼进沙盒命令的 shell 片段
+    """
+    script = (
+        TASK_EXECUTOR
+        .replace("__TASK_PATH__", repr(task_path))
+        .replace("__BASE__", repr(TASK_API_DEFAULT))
+        .replace("__TIMEOUT__", str(TASK_API_TIMEOUT))
+        .replace("__MAX_CALLS__", str(TASK_API_MAX_CALLS))
+        .replace("__TIME_BUDGET__", str(TASK_API_TIME_BUDGET))
+        .replace("__DIR_BUDGET__", str(TASK_EXEC_DIR_BUDGET))
+        .replace("__QUERY_MAX__", str(TASK_API_QUERY_MAX))
+        .replace("__BODY_LIMIT__", str(TASK_API_BODY_LIMIT))
+        .replace("__SOLVE_MAX__", str(TASK_SOLVE_MAX))
+        .replace("__DOC_NAMES__", repr(TASK_API_DOC_NAMES))
+        .replace("__SUFFIXES__", repr(TASK_API_PATH_SUFFIXES))
+        .replace("__PRUNE__", repr(TASK_EXEC_PRUNE))
+        .replace("__SOLUTION__", repr(TASK_SOLUTION_MARKER))
+        .replace("__SOLUTION_END__", repr(TASK_SOLUTION_END))
+        .replace("__DATA__", repr(TASK_DATA_MARKER))
+    )
+    # 沙盒的解释器叫 python3 或 python，挑一个能用的（挑不到时脚本不会执行，
+    # 答案区为空 -> 这一回合不提交，下一回合重来）。
+    # 片段以 heredoc 结束符收尾且不带换行：调用方必须换行后再接别的命令
+    # （结束符要独占一行，直接接 `;` 会让后一条命令变成脚本的一部分）
+    return (
+        'for P in python3 python; do command -v "$P" >/dev/null 2>&1 && break;'
+        f" done; $P - <<'PYEOF' 2>/dev/null\n{script}\nPYEOF"
+    )
+
+
+# 沙盒执行器：占位符由 `_task_executor` 按当前任务填好。
+# 之所以要"执行"而不是"读文件"，是因为任务文件里写的是任务要求（"查询北京
+# 文化遗产"），答案在文档给出的本地接口里；直接把任务文件的内容交上去
+# 等于答非所问（复盘里就是这么丢掉全部任务分的）。
+TASK_EXECUTOR = '''\
+import os
+import re
+import time
+import urllib.request
+
+TASK_PATH = __TASK_PATH__
+BASE = __BASE__
+TIMEOUT = __TIMEOUT__
+MAX_CALLS = __MAX_CALLS__
+TIME_BUDGET = __TIME_BUDGET__
+DIR_BUDGET = __DIR_BUDGET__
+QUERY_MAX = __QUERY_MAX__
+BODY_LIMIT = __BODY_LIMIT__
+SOLVE_MAX = __SOLVE_MAX__
+DOC_NAMES = __DOC_NAMES__
+SUFFIXES = __SUFFIXES__
+PRUNE = __PRUNE__
+SOLUTION = __SOLUTION__
+SOLUTION_END = __SOLUTION_END__
+DATA = __DATA__
+SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
+
+
+def read(path):
+    """读文件，读不到就返回空串（沙盒里权限与路径都不可控）"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def fetch(url):
+    """调用接口并把响应体截断返回（失败返回空串，绝不抛异常打断整条命令）"""
+    try:
+        request = urllib.request.Request(url, headers={"Accept": "*/*"})
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            return response.read().decode("utf-8", "replace").strip()[:BODY_LIMIT]
+    except Exception:
+        return ""
+
+
+def find_files(patterns, limit):
+    """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
+
+    全盘 walk 是这里最慢的一步，所以两个上限都要兜住：找到够数就停，
+    进的目录太多也停（沙盒命令整体限时 15 秒，宁可少找几个也不能超时）。
+    """
+    found = []
+    seen = set()
+    visited = 0
+    for root, dirs, files in os.walk("/"):
+        visited += 1
+        if visited > DIR_BUDGET:
+            break
+        dirs[:] = [d for d in dirs if os.path.join(root, d) not in PRUNE]
+        for name in files:
+            path = os.path.join(root, name)
+            if path in seen:
+                continue
+            if not any(re.search(pattern, name, re.I) for pattern in patterns):
+                continue
+            seen.add(path)
+            found.append(path)
+            if len(found) >= limit:
+                return found
+    return found
+
+
+def task_files():
+    """待解的任务文件：描述里点名的那份排第一（答案只认它）"""
+    wanted = os.path.basename(TASK_PATH) if TASK_PATH else ""
+    named = []
+    others = []
+    for path in find_files((r"^(task|spec).*\\.(md|txt|json)$",), 24):
+        if wanted and os.path.basename(path) == wanted:
+            named.append(path)
+        else:
+            others.append(path)
+    if TASK_PATH and os.path.isfile(TASK_PATH) and TASK_PATH not in named:
+        named.insert(0, TASK_PATH)
+    return named + others
+
+
+def endpoints(doc_text):
+    """接口文档里的调用样例：完整 URL 优先，其次退回文档给出的本地地址"""
+    urls = []
+    for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
+        raw = raw.strip().strip("\\"'").rstrip(".,;:!?、。）])")
+        if raw and raw not in urls:
+            urls.append(raw)
+    local = [url for url in urls if "localhost" in url or "127.0.0.1" in url]
+    picked = local or urls or [BASE]
+    return picked
+
+
+def queries(text, name):
+    """查询关键词：文件名里的英文词最可靠（task_1_beijing.md -> beijing）"""
+    values = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", name or ""):
+        if token.lower() not in SKIP_WORDS:
+            values.append(token)
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", text):
+        if token.lower() not in SKIP_WORDS:
+            values.append(token)
+    picked = []
+    for value in values:
+        if value not in picked:
+            picked.append(value)
+    return picked[:QUERY_MAX]
+
+
+def candidates(text, name, urls):
+    """这一份任务要试的调用地址：文档样例 + 把样例里的查询词换成任务自己的"""
+    urls = urls or [BASE]
+    out = []
+    for url in urls[:2]:
+        if url not in out:
+            out.append(url)
+        for value in queries(text, name):
+            variant = (
+                re.sub(r"=([^&/]+)", "=" + value, url, count=1)
+                if "=" in url
+                else url.rstrip("/") + "/" + value
+            )
+            if variant not in out:
+                out.append(variant)
+    for suffix in SUFFIXES:
+        variant = BASE.rstrip("/") + suffix
+        if variant not in out:
+            out.append(variant)
+    return out
+
+
+doc_text = "\\n".join(read(path) for path in find_files(DOC_NAMES, 6))
+urls = endpoints(doc_text)
+
+deadline = time.time() + TIME_BUDGET
+calls = 0
+solutions = []
+for path in task_files()[:SOLVE_MAX]:
+    name = os.path.basename(path)
+    text = read(path)
+    bodies = []
+    for url in candidates(text, name, urls):
+        if calls >= MAX_CALLS or time.time() > deadline:
+            break
+        calls += 1
+        body = fetch(url)
+        if body:
+            print(DATA, url, "=>", len(body))
+            bodies.append(body)
+    if bodies:
+        solutions.append((name, bodies))
+
+for name, bodies in solutions:
+    print(SOLUTION + name)
+    for body in bodies:
+        print(body)
+    print(SOLUTION_END)
+'''
 
 
 def _sandbox_find(names: tuple[str, ...], action: str) -> str:
@@ -1754,7 +2016,7 @@ def _sandbox_find(names: tuple[str, ...], action: str) -> str:
 
     参数:
         names: 文件名通配（如 `task*`），多个通配之间是"或"关系
-        action: 命中后执行的动作（`TASK_FIND_CAT` 打印内容 / `TASK_FIND_PRINT` 列路径）
+        action: 命中后执行的动作（`TASK_FIND_PRINT` 只列路径，内容由调用方按需读取）
 
     返回:
         可直接拼进沙盒命令的 find 片段
@@ -1837,8 +2099,13 @@ def _task_answer(turn: Turn) -> str | None:
 
     输出格式约定为 "[exitCode:N]\\n<输出>"（见接口文档），因此只有执行成功
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
-    答案取任务标识到 `TASK_END_MARKER` 之间的内容，命令末尾的诊断信息（目录
-    列表等）因此不会被误当成答案提交。
+    答案取任务标识到 `TASK_END_MARKER` 之间、`[SOLUTION]` 段里的内容。
+
+    两道闸门保证交上去的不是任务原文（复盘里 4 次 submitAnswer 交的全是
+    任务描述，Judge 一次都没放行）：
+        1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
+           执行器取不到数据时答案区是空的，这一回合就不提交；
+        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
@@ -1850,43 +2117,89 @@ def _task_answer(turn: Turn) -> str | None:
     if marker not in result or "[exitCode:0]" not in result:
         return None
 
-    answer = result.split(marker, 1)[1].split(TASK_END_MARKER, 1)[0].strip()
-    if not answer or any(bad in answer for bad in TASK_ERROR_MARKERS):
+    region = result.split(marker, 1)[1].split(TASK_END_MARKER, 1)[0]
+    if TASK_DATA_MARKER not in region:
+        return None  # 没取到数据：沙盒里只有任务原文，不能当答案交上去
+    if any(bad in region for bad in TASK_ERROR_MARKERS):
+        return None
+
+    answer = _solution_answer(region, turn)
+    if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
+        return None
+    if _task_echo(answer, turn.phase_task):
         return None
     return answer
 
 
-def _remember_task_files(result: str) -> None:
-    """把沙盒里读回来的任务文件按文件名记进答案缓存
+def _solution_answer(region: str, turn: Turn) -> str | None:
+    """从执行器的输出里取出当前任务那一段 `[SOLUTION]` 的内容
 
-    `_sandbox_command` 会把任务目录下的文件都读回来，每份用 `[TASK_FILE]`
-    （后跟完整路径）与 `[TASK_EOF]` 分段；这里把"文件名 -> 内容"存下来，
-    下一个任务点领到同一个任务时就能省掉一个来回的沙盒执行（见 `_cached_answer`）。
+    执行器会把沙盒里的任务文件都试着解一遍（解出来的存进答案缓存，见
+    `_remember_task_answers`），每一份打成 `[SOLUTION]<文件名>` 到
+    `[/SOLUTION]` 的一段。这里只取与当前任务同名的那个：任务描述里没点名
+    文件时取第一段（那正是探测结果里认出来的那一份）。
 
-    缓存只增不改（`setdefault`）：已经记下的内容不会被后来的输出覆盖，
-    读文件失败的输出（文件不存在等）同样不入缓存。
+    参数:
+        region: 沙盒输出里任务标识与 `TASK_END_MARKER` 之间的内容
+        turn: 当前回合信息
+
+    返回:
+        当前任务的答案内容；没有可用的答案段时返回 None
+    """
+    blocks: dict[str, str] = {}
+    for chunk in region.split(TASK_SOLUTION_MARKER)[1:]:
+        path, _, body = chunk.partition("\n")
+        name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
+        if name:
+            blocks[name] = body.split(TASK_SOLUTION_END, 1)[0].strip()
+
+    target = _task_file(turn.phase_task)
+    if target is not None:
+        return blocks.get(target.replace("\\", "/").rsplit("/", 1)[-1]) or None
+    return next(iter(blocks.values()), None)
+
+
+def _task_echo(answer: str, phase_task: str) -> bool:
+    """答案是不是在复读任务原文
+
+    任务描述里的中文长句出现在答案里，说明交上去的是任务文件的内容而不是
+    执行结果（复盘里的 4 次 0 分提交都是这个形态）。答案来自接口取数，
+    正常不会整句重复任务描述。
+    """
+    return any(run in answer for run in re.findall(TASK_ECHO_RUN, phase_task))
+
+
+def _remember_task_answers(result: str) -> None:
+    """把执行器解出来的答案按任务文件名记进答案缓存
+
+    `_sandbox_command` 的执行器会把沙盒里的任务文件都试着解一遍，每份的答案
+    用 `[SOLUTION]`（后跟文件名）与 `[/SOLUTION]` 分段；这里把"文件名 -> 答案"
+    存下来，下一个任务点领到同一份任务时就能省掉一个来回的沙盒执行
+    （见 `_cached_answer`）。
+
+    缓存只增不改（`setdefault`）：已经记下的答案不会被后来的输出覆盖。
 
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
     """
-    for chunk in result.split(TASK_FILE_MARKER)[1:]:
+    for chunk in result.split(TASK_SOLUTION_MARKER)[1:]:
         path, _, body = chunk.partition("\n")
-        answer = body.split(TASK_FILE_END, 1)[0].strip()
+        answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and not any(bad in answer for bad in TASK_ERROR_MARKERS):
+        if name and answer:
             _TASK_ANSWER_CACHE.setdefault(name, answer)
 
 
 def _cached_answer(turn: Turn) -> str | None:
-    """当前任务在答案缓存里的答案（沙盒里之前读回来过的同名任务文件）
+    """当前任务在答案缓存里的答案（沙盒里之前解出来的同名任务）
 
     积分 = 任务奖励 + 5 × 标准回合数 / (完成回合 - 接取回合)（任务书第六章），
     完成回合差越小分越高。缓存命中时开拓者在任务进行中的第一个回合就能交卷，
     把回合差压到 1（复盘里敌方两次 cached submit 各得 155 分，我们则要重新
-    读一遍沙盒、回合差至少 2）。
+    执行一遍沙盒、回合差至少 2）。
 
     任务描述里没点名文件时返回 None：探测出来的文件名与任务描述的对应关系
-    不确定，宁可多花一个来回读一次，也不拿别的任务的内容去作答。
+    不确定，宁可多花一个来回执行一次，也不拿别的任务的答案去作答。
     """
     target = _task_file(turn.phase_task)
     if target is None:

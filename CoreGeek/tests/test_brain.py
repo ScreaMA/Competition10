@@ -15,17 +15,22 @@ from agent.brain import (
     LLM_PLAN_DEFAULT,
     LLM_PLAN_TEMPLATE,
     LLM_PROMPT_PER_DAY,
+    LOW_GOLD_THRESHOLD,
     SELL_BATCH,
     STATION_UPGRADE_VOUCHER,
     STONE_BATCH,
+    TASK_DATA_MARKER,
     TASK_END_MARKER,
     TASK_FILE_END,
     TASK_FILE_MARKER,
     TASK_MARKER,
     TASK_PROBE_MARKER,
+    TASK_SOLUTION_END,
+    TASK_SOLUTION_MARKER,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
     WALL_FIXER,
+    WALL_STONE_COST,
     WALL_UPGRADE_GOLD,
     WALL_UPGRADE_VOUCHER,
     WEAPON_UPGRADE_VOUCHER,
@@ -85,6 +90,26 @@ def _footprint_distance(pos: Pos, footprint) -> int:
 def _sandbox_result(phase_task: str, output: str, exit_code: int = 0) -> str:
     """按接口文档格式构造一条沙盒命令执行结果（lastCmdResult）"""
     return f"[exitCode:{exit_code}]\n{TASK_MARKER}{_task_token(phase_task)}\n{output}"
+
+
+def _solution_result(
+    phase_task: str,
+    task_file: str,
+    body: str,
+    url: str = "http://localhost:8899/heritage?city=beijing",
+) -> str:
+    """构造一条"执行器取数成功"的沙盒输出（答案区只有取到的数据）
+
+    答案区里必须先有取数证据（`TASK_DATA_MARKER`），`[SOLUTION]` 段里才是
+    要提交的答案；诊断信息排在 `TASK_END_MARKER` 之后。
+    """
+    return _sandbox_result(
+        phase_task,
+        f"{TASK_DATA_MARKER} {url} => {len(body)}\n"
+        f"{TASK_SOLUTION_MARKER}{task_file}\n{body}\n{TASK_SOLUTION_END}\n"
+        f"{TASK_END_MARKER}\n"
+        "pwd\n/\ntask_1_beijing.md\n",
+    )
 
 
 # === 建造位置规划 ===
@@ -320,14 +345,14 @@ def test_decide_day_collects_stone(payload_factory, role_factory):
 
 
 def test_decide_day_builds_wall_when_has_stone(payload_factory, role_factory):
-    """背包里有石头且站在建造点旁时建造围墙"""
+    """背包里有石头且站在建造点旁时建造围墙（一段墙只要石头*1）"""
     payload = payload_factory(
         round_no=1,
         gold=0,
         roles=[
             role_factory(
                 10012, WORKER, 12, 26, backPackCapability=100,
-                backpack=[WALL_MATERIAL],
+                backpack=[WALL_MATERIAL] * WALL_STONE_COST,
             ),
         ],
     )
@@ -519,8 +544,9 @@ def test_worker_falls_back_to_weapon_before_night(payload_factory, role_factory)
 
 
 def _payload_with_full_walls(payload_factory, role_factory, worker_pos: Pos,
-                             zones=(), backpack=(), capacity: int = 100) -> dict:
-    """构造“围墙已建完”的局面"""
+                             zones=(), backpack=(), capacity: int = 100,
+                             gold: int = 0) -> dict:
+    """构造“围墙已建完”的局面（默认金币见底，用来观察经济回路）"""
     order = _calc_wall_order(Turn.load(payload_factory()))
     walls = [
         role_factory(40000 + index, WALL, pos.x, pos.y)
@@ -532,7 +558,7 @@ def _payload_with_full_walls(payload_factory, role_factory, worker_pos: Pos,
             backPackCapability=capacity, backpack=list(backpack),
         ),
     )
-    return payload_factory(gold=0, roles=walls, zones=list(zones))
+    return payload_factory(gold=gold, roles=walls, zones=list(zones))
 
 
 def test_trade_sells_stone_when_adjacent_to_vendor(payload_factory, role_factory):
@@ -570,16 +596,41 @@ def test_trade_moves_toward_vendor_when_far(payload_factory, role_factory):
 
 
 def test_trade_keeps_stone_when_backpack_not_full(payload_factory, role_factory):
-    """石头不足一批时不卖（留给后续围墙/升级）"""
-    payload = _payload_with_full_walls(
+    """金币还够一座塔时，石头不足一批就先留着（攒批卖价更省回合）"""
+    payload = _payload_with_full_defense(
         payload_factory, role_factory,
+        gold=LOW_GOLD_THRESHOLD,  # 还没见底：不为了几块矿石专门跑一趟小贩
         worker_pos=Pos(20, 17),
-        zones=[(VENDOR, 20, 16)],
         backpack=[WALL_MATERIAL] * (SELL_BATCH - 1),
+        zones=[(VENDOR, 20, 16)],
     )
     commands, _ = decide(payload)
 
     assert "10010" not in commands
+
+
+def test_trade_sells_ore_as_soon_as_gold_runs_out(
+    payload_factory, role_factory,
+):
+    """金币见底时手里有几块卖几块，不再等凑够一批
+
+    回归：复盘里 R6 建完第三座塔后 gold=0 冻结 13 个回合，背包里的 stone:6
+    因为凑不满 SELL_BATCH 一直没卖出去，建造/升级/买券跟着一起停摆。
+    """
+    payload = _payload_with_full_defense(
+        payload_factory, role_factory,
+        gold=LOW_GOLD_THRESHOLD - 1,
+        worker_pos=Pos(20, 17),
+        backpack=[WALL_MATERIAL] * (SELL_BATCH - 1),
+        zones=[(VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "sell",
+        "name": WALL_MATERIAL,
+        "num": SELL_BATCH - 1,
+    }
 
 
 def test_trade_sells_ore_when_backpack_full(payload_factory, role_factory):
@@ -597,6 +648,37 @@ def test_trade_sells_ore_when_backpack_full(payload_factory, role_factory):
         "action": "sell",
         "name": COPPER_MINE,
         "num": 3,
+    }
+
+
+def test_worker_sells_ore_before_gathering_when_gold_runs_out(
+    payload_factory, role_factory,
+):
+    """金币见底时先把手头的矿石变现，而不是继续往背包里堆
+
+    回归：复盘里 R6 建完第三座塔后 gold=0 冻结 13 个回合，工人每回合都在
+    采矿，背包里的矿石却一块都没卖出去过（卖矿被"攒够一批"和采集分支堵住），
+    建造/升级/买券跟着一起停摆。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=LOW_GOLD_THRESHOLD - 1,
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(
+                10012, WORKER, 20, 17, backPackCapability=100,
+                backpack=[IRON_MINE] * 2,
+            ),
+        ],
+        # 身边就有铁矿可采，也仍然该先把背包里那两块卖掉
+        zones=[(STONE_MINE, 35, 5), (IRON_MINE, 21, 18), (VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": IRON_MINE,
+        "num": 2,
     }
 
 
@@ -1223,8 +1305,13 @@ def test_pioneer_holds_task_from_second_cell(payload_factory, role_factory):
 # === 自进化任务（沙盒作答） ===
 
 
-def test_sandbox_command_reads_task_file(payload_factory, role_factory):
-    """任务进行中：提交读取任务文件的沙盒命令"""
+def test_sandbox_command_executes_task_in_sandbox(payload_factory, role_factory):
+    """任务进行中：提交执行器命令，而不是把任务文件打印出来当答案
+
+    任务文件里写的是任务要求（"查询北京文化遗产"），沙盒里能打印出来的只有
+    它自己；答案要按描述去调本地接口取。旧实现把 `cat 任务文件` 的输出直接
+    当答案提交，复盘里 4 次 submitAnswer 交的全是任务原文、任务分恒为 0。
+    """
     payload = payload_factory(
         round_no=1,
         gold=0,
@@ -1234,7 +1321,13 @@ def test_sandbox_command_reads_task_file(payload_factory, role_factory):
     )
     command = sandbox_command(payload)
 
-    assert 'cat -- "task_1_beijing.md"' in command
+    # 答案区里跑的是执行器：任务文件的路径交给它，由它在沙盒里读文件并取数
+    assert "task_1_beijing.md" in command
+    assert "python3 python" in command
+    assert TASK_SOLUTION_MARKER in command
+    assert TASK_DATA_MARKER in command
+    # 答案区不再直接打印任务文件：那正是"提交任务原文"的来源
+    assert 'cat -- "task_1_beijing.md"' not in command
     # 命令必须带上任务标识，才能确认下一回合的输出属于本任务
     assert TASK_MARKER in command
 
@@ -1247,13 +1340,12 @@ def test_sandbox_command_idle_without_task(payload_factory):
 def test_sandbox_command_gathers_clues_in_one_shot(
     payload_factory, role_factory,
 ):
-    """一条沙盒命令同时带上兜底搜索与目录诊断，减少逐次试错回合
+    """一条沙盒命令同时带上接口取数、兜底搜索与目录诊断，减少逐次试错回合
 
     复盘里敌方"用错鉴权头→401、补参数又缺字段→400"逐次试错，白丢好几个
-    回合；这里把"读任务文件 + 路径不对时按文件名全盘再找 + 列出沙盒工作
-    目录"合成一条命令，一次就能拿到更多线索。搜索必须覆盖整个沙盒：
-    实测沙盒的工作目录就是 `/`，而任务文件不在 `/` 的前三层里，
-    旧实现的 `find . -maxdepth 3` 一次都没命中过。
+    回合；这里把"读文件取数 + 全盘找任务文件 + 列出沙盒工作目录"合成一条
+    命令，一次就能拿到更多线索。搜索必须覆盖整个沙盒：实测沙盒的工作目录
+    就是 `/`，而任务文件不在 `/` 的前三层里。
     """
     payload = payload_factory(
         round_no=1,
@@ -1264,10 +1356,9 @@ def test_sandbox_command_gathers_clues_in_one_shot(
     )
     command = sandbox_command(payload)
 
-    assert 'cat -- "tasks/task_1_beijing.md"' in command
-    # 描述里的路径读不到时按文件名在沙盒里再找一次（只按文件名，不带目录）
+    # 描述里给的路径原样交给执行器（它自己会做"读不到就按文件名全盘找"的兜底）
+    assert "tasks/task_1_beijing.md" in command
     assert "find / " in command
-    assert '-name "task_1_beijing.md"' in command
     assert "-maxdepth" not in command
     # 诊断信息排在答案结束标记之后，不会被当成答案提交
     assert command.index(TASK_MARKER) < command.index(TASK_END_MARKER)
@@ -1309,7 +1400,7 @@ def test_sandbox_probes_task_dir_when_description_has_no_file(
         "/tmp/selfEvolutionTask/task_1_alpha.md\n"
     )
     command = sandbox_command(payload)
-    assert 'cat -- "/tmp/selfEvolutionTask/task_1_alpha.md"' in command
+    assert "/tmp/selfEvolutionTask/task_1_alpha.md" in command
     assert TASK_MARKER in command
 
     # 目录清单本身不是答案，不能被提交上去
@@ -1329,15 +1420,15 @@ def test_sandbox_answer_ignores_diagnostics_after_end_marker(
         tasks=[(14, 14)],
         phase_task=phase_task,
     )
-    payload["lastCmdResult"] = (
-        _sandbox_result(phase_task, "北京 晴 25摄氏度")
-        + f"\n{TASK_END_MARKER}\ntask_1_beijing.md\ntask_2_shanghai.md\n"
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
     )
     commands, _ = decide(payload)
 
+    # 提交的是执行器取到的数据，不是任务文本，也不含标记之后的诊断信息
     assert commands["10011"] == {
         "action": "submitAnswer",
-        "taskAnswer": "北京 晴 25摄氏度",
+        "taskAnswer": '{"city": "北京", "count": 7}',
     }
 
 
@@ -1355,12 +1446,14 @@ def test_pioneer_submits_answer_from_sandbox(payload_factory, role_factory):
     assert sandbox_command(payload) != ""
 
     # 下一回合带回沙盒输出，开拓者直接作答
-    payload["lastCmdResult"] = _sandbox_result(phase_task, "北京 晴 25摄氏度")
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
+    )
     commands, _ = decide(payload)
 
     assert commands["10011"] == {
         "action": "submitAnswer",
-        "taskAnswer": "北京 晴 25摄氏度",
+        "taskAnswer": '{"city": "北京", "count": 7}',
     }
     # 已有答案后不再重复执行沙盒命令
     assert sandbox_command(payload) == ""
@@ -1420,28 +1513,27 @@ def test_task_dump_widens_search_after_empty_result(
     assert '-name "*.md"' in command
 
 
-def test_task_cache_skips_failed_reads_and_keeps_first_answer():
-    """缓存不记"文件读不到"的输出，也不会被后来的输出覆盖"""
-    brain._remember_task_files(
-        "[exitCode:1]\n[TASK_FILE]/tmp/x/task_1_alpha.md\n"
-        "cat: /tmp/x/task_1_alpha.md: No such file or directory\n[TASK_EOF]\n"
+def test_task_cache_keeps_first_answer_per_task_file():
+    """缓存按任务文件名记执行器解出来的答案，且不会被后来的输出覆盖"""
+    brain._remember_task_answers(
+        "[exitCode:0]\n[TASK]上一个任务\n"
+        "[SOLUTION]task_1_alpha.md\nalpha-answer\n[/SOLUTION]\n"
     )
-    assert brain._TASK_ANSWER_CACHE == {}
-
-    brain._remember_task_files(
-        "[TASK_FILE]/tmp/x/task_1_alpha.md\nalpha-answer\n[TASK_EOF]\n"
-    )
-    brain._remember_task_files(
-        "[TASK_FILE]/tmp/x/task_1_alpha.md\n乱码\n[TASK_EOF]\n"
+    brain._remember_task_answers(
+        "[SOLUTION]task_1_alpha.md\n乱码\n[/SOLUTION]\n"
     )
     assert brain._TASK_ANSWER_CACHE == {"task_1_alpha.md": "alpha-answer"}
 
+    # 没有答案段的输出（执行器什么都没取到）不入缓存
+    brain._remember_task_answers("[exitCode:0]\n[TASK]上一个任务\n[TASK_END]\n")
+    assert brain._TASK_ANSWER_CACHE == {"task_1_alpha.md": "alpha-answer"}
 
-def test_pioneer_answers_from_cached_task_file(payload_factory, role_factory):
-    """沙盒里提前读回来的任务文件命中时，接取后立刻交卷
+
+def test_pioneer_answers_from_cached_solution(payload_factory, role_factory):
+    """沙盒里提前解出来的答案命中时，接取后立刻交卷
 
     回归：复盘里敌方靠答案缓存两次提交各拿 155 分（任务奖励 80 +
-    5×标准回合数15/(完成回合-接取回合)1），我们每次都重新读一遍沙盒，
+    5×标准回合数15/(完成回合-接取回合)1），我们每次都重新跑一遍沙盒，
     完成回合差至少 2 回合，分数被白白扣掉。
     """
     phase_task = "请阅读task_2_beijing.md"
@@ -1452,25 +1544,71 @@ def test_pioneer_answers_from_cached_task_file(payload_factory, role_factory):
         tasks=[(14, 14)],
         phase_task=phase_task,
     )
-    # 上一个任务期间沙盒把任务目录里的文件都读回来过（含本次要用的这份）
+    # 上一个任务期间执行器把沙盒里的任务文件都试着解了一遍（含本次要用的这份）
     payload["lastCmdResult"] = (
         "[exitCode:0]\n"
         "[TASK]上一个任务\n"
-        "[TASK_FILE]/tmp/selfEvolutionTask/task_1_alpha.md\n"
-        "alpha-answer\n"
-        "[TASK_EOF]\n"
-        "[TASK_FILE]/tmp/selfEvolutionTask/task_2_beijing.md\n"
-        "北京 晴 25摄氏度\n"
-        "[TASK_EOF]\n"
+        "[API] http://localhost:8899/heritage?city=alpha => 12\n"
+        f"{TASK_SOLUTION_MARKER}/tmp/selfEvolutionTask/task_1_alpha.md\n"
+        '{"city": "Alpha", "count": 3}\n'
+        f"{TASK_SOLUTION_END}\n"
+        f"{TASK_SOLUTION_MARKER}/tmp/selfEvolutionTask/task_2_beijing.md\n"
+        '{"city": "北京", "count": 7}\n'
+        f"{TASK_SOLUTION_END}\n"
     )
     commands, _ = decide(payload)
 
     assert commands["10011"] == {
         "action": "submitAnswer",
-        "taskAnswer": "北京 晴 25摄氏度",
+        "taskAnswer": '{"city": "北京", "count": 7}',
     }
     # 已经有缓存答案，不必再花一个来回执行沙盒命令
     assert sandbox_command(payload) == ""
+
+
+def test_sandbox_answer_rejects_task_text_echo(payload_factory, role_factory):
+    """答案区里只有任务原文时绝不提交（复盘里 4 次 0 分提交就是这个形态）"""
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    # 旧实现把 `cat 任务文件` 的输出当答案：取数证据一个也没有
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task,
+        "# 自进化任务 A-1：查询北京文化遗产\n## 任务背景\n"
+        "请阅读task_1_beijing.md，获取任务信息\n",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands
+    # 答案区里没有取数证据，沙盒命令继续下发（下一回合再执行一次）
+    assert sandbox_command(payload) != ""
+
+
+def test_sandbox_answer_rejects_solution_without_api_data(
+    payload_factory, role_factory,
+):
+    """没有取数证据的 `[SOLUTION]` 段同样不能提交（宁可这一回合不交卷）"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task,
+        f"{TASK_SOLUTION_MARKER}task_1_beijing.md\n任务原文\n{TASK_SOLUTION_END}\n"
+        f"{TASK_END_MARKER}\n",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands
 
 
 def test_pioneer_ignores_stale_or_failed_sandbox_output(
