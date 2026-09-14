@@ -4181,6 +4181,12 @@ def test_early_wall_keeps_single_worker_on_towers(payload_factory, role_factory)
 # === 任务求助 LLM（任务期不占每日额度） ===
 
 
+# LLM 给的取数命令样例：真去调本地接口的那种。任务期用得多，抽出来是因为
+# "裸任务文件名读文件"那类命令会被路径闸门挡下（见 `_task_command_path_ok`），
+# 不适合当"命令照旧下发"的例子。
+_LLM_FETCH_COMMAND = "http://localhost:8899/weather?city=beijing"
+
+
 def _llm_task_payload(payload_factory, role_factory, phase_task, round_no,
                       evidence: str = "接口文档：GET http://localhost:8899/weather?city="):
     """任务进行中、沙盒已吐回文档、但还没取到数的局面"""
@@ -4277,19 +4283,21 @@ def test_last_round_before_the_fail_limit_goes_to_the_executor(
         decide(payload)
         return payload
 
-    # 连败第 1 回合：LLM 回了一条取数命令
-    fail_round(11, "CMD: cat task_1_beijing.md")
+    # 连败第 1 回合：LLM 回了一条取数命令（例子必须是真去调接口的那种：
+    # 拿裸任务文件名读文件的命令在"没有回读段"的回合会被路径闸门丢掉，见
+    # `test_llm_command_with_a_names_only_task_file_falls_back_to_executor`）
+    fail_round(11, f"CMD: curl -s {_LLM_FETCH_COMMAND}")
 
     # 连败还没到线：这条命令照旧下发（执行器的片段里才有 heredoc 结束符）
     on_time = fail_round(12)
     assert brain._TASK_WATCH.fails < TASK_API_FAIL_LIMIT - 1
     on_time_command = sandbox_command(on_time)  # 只取一次：取用后命令就出队了
-    assert "cat task_1_beijing.md" in on_time_command
+    assert _LLM_FETCH_COMMAND in on_time_command
     assert "PYEOF" not in on_time_command
 
     fail_round(13)
     fail_round(14)
-    last = fail_round(15, "CMD: cat task_1_beijing.md")
+    last = fail_round(15, f"CMD: curl -s {_LLM_FETCH_COMMAND}")
     assert brain._TASK_WATCH.fails == TASK_API_FAIL_LIMIT - 1
 
     # 到线前最后一个回合：不再跑 LLM 的命令，改让执行器去取数
@@ -4412,6 +4420,79 @@ def test_llm_command_without_auth_falls_back_to_the_executor(
     command = sandbox_command(payload)
     assert "curl -s http://localhost:8899/weather?city=beijing" not in command
     assert brain.TASK_SCAN_MARKER in command  # 走的是执行器
+
+
+def test_llm_command_with_a_names_only_task_file_falls_back_to_executor(
+    payload_factory, role_factory,
+):
+    """裸任务文件名 + 手上没有真实路径时，命令丢掉、改走执行器（S3）
+
+    复盘 PK592086 的 R17：上一回合跑的是交卷指令，`lastCmdResult` 里没有回读段
+    （`[TASK_FILE]<绝对路径>`），LLM 给的 `cat task_1_alpha.md` 于是原样下发，
+    只换来一行 `cat: task_1_alpha.md: No such file or directory`——整条命令一个字
+    都没读到，一个任务回合白搭。丢掉它改走执行器（`_sandbox_command`）比赌一条
+    注定报 `No such file` 的命令更接近答案：执行器的命令自带回读段，下一回合
+    真实路径就在手里（`_absolute_paths` 那时就能把裸文件名补全）。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_alpha.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: cat task_1_alpha.md"
+    decide(payload)
+
+    assert not any(
+        state.get("pending_cmd") for state in brain._TASK_LLM_STATE.values()
+    )
+    command = sandbox_command(payload)
+    assert "cat task_1_alpha.md" not in command  # 错路径的命令没有下发
+    assert brain.TASK_SCAN_MARKER in command  # 改走执行器：读任务文件 + 取数
+
+
+def test_task_command_path_gate_only_stops_bare_task_file_names():
+    """只有"拿裸任务文件名读文件、又没有真实路径"的命令过不了路径闸门（S3）
+
+    与路径无关的三种命令照旧放行：描述里没点名文件、描述里给的就是路径、命令
+    根本没碰这份文件（自己生成的 `out.json` 之类不归这条闸门管）。
+    """
+    # 描述里没点名文件：无从判起，放行
+    assert brain._task_command_path_ok(
+        "cat task_1_alpha.md", "请按沙盒里的任务说明作答", "",
+    )
+    # 描述里给的就是路径：LLM 多半是从回读段里抄来的，交给 `_absolute_paths`
+    assert brain._task_command_path_ok(
+        "cat /tmp/selfEvolutionTask/1-x/task_1_alpha.md",
+        "请阅读/tmp/selfEvolutionTask/1-x/task_1_alpha.md",
+        "",
+    )
+    # 命令没碰这份任务文件：不碰接口、也不碰任务文件的自造文件照旧放行
+    assert brain._task_command_path_ok(
+        f"curl -s {_LLM_FETCH_COMMAND}", "请阅读task_1_alpha.md", "",
+    )
+    assert brain._task_command_path_ok(
+        "python3 build.py --out out.json", "请阅读task_1_alpha.md", "",
+    )
+    # 命令自己 cd 进了任务目录：裸文件名在那边解析得到，这条命令跑得通
+    assert brain._task_command_path_ok(
+        "cd /tmp/selfEvolutionTask/1-alpha && cat task_1_alpha.md",
+        "请阅读task_1_alpha.md", "",
+    )
+
+    # 回读段里有它的真实路径：放行，命令里的裸文件名由 `_absolute_paths` 补全
+    path = f"{TASK_ROOTS[0]}/1-alpha/task_1_alpha.md"
+    result = f"{TASK_FILE_MARKER}{path}\n请查询 alpha\n{TASK_FILE_END}\n"
+    assert brain._task_command_path_ok(
+        "cat task_1_alpha.md", "请阅读task_1_alpha.md", result,
+    )
+    # 回读段不在（上一回合跑的是交卷指令或 LLM 的命令）：丢掉这条命令
+    assert not brain._task_command_path_ok(
+        "cat task_1_alpha.md", "请阅读task_1_alpha.md", "",
+    )
+    assert not brain._task_command_path_ok(
+        "head -3 task_1_alpha.md", "请阅读task_1_alpha.md",
+        f"{TASK_API_FAIL_MARKER} http://localhost:8899/guess HTTPError 404\n",
+    )
 
 
 def test_script_in_command_finds_the_script_not_its_arguments():
