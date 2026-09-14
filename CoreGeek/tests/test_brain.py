@@ -2199,6 +2199,91 @@ def test_decide_night_moves_controller_to_weapon(payload_factory, role_factory):
     assert distance(current, weapon_pos) <= 1
 
 
+def test_night_controller_plugs_gap_next_to_its_weapon(payload_factory, role_factory):
+    """夜晚射程内没有目标时，操控者挪到武器旁那格围墙缺口上堵住（T6 人肉城墙）
+
+    复盘里"无围墙 + 全员空转、没有任何堵缺口行为"（PK590991/591016）：墙砌
+    不起来时缺口就是机器人直通基地的门，站在缺口上照样操控得到武器，所以
+    与其空着，不如把人挪上去。
+    """
+    payload = payload_factory(
+        round_no=DAY_ROUNDS + 1,
+        roles=[
+            role_factory(10010, WORKER, 9, 23, backPackCapability=100),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+    )
+    holes = _wall_holes(Turn.load(payload))
+    commands, _ = decide(payload)
+
+    # 站的是缺口那一格本身（不是它的邻格），且仍在武器的操控范围内
+    assert commands["10010"] == {
+        "action": "move",
+        "targetPos": [{"x": 8, "y": 23}],
+    }
+    assert Pos(8, 23) in holes
+    assert distance(Pos(8, 23), Pos(9, 24)) <= 1
+
+
+def test_night_plugs_priority_gap_without_weapon(payload_factory, role_factory):
+    """没摊上武器的角色去堵优先级最高的缺口，堵上之后不再挪窝（T6）"""
+    def _commands(x: int, y: int) -> dict:
+        return decide(payload_factory(
+            round_no=DAY_ROUNDS + 1,
+            roles=[role_factory(10010, WORKER, x, y, backPackCapability=100)],
+        ))[0]
+
+    # 没有敌方单位时正面是 up（`_wall_side_order` 的默认顺序），
+    # 上边外圈的第一个缺格就是 (13,26)
+    assert _commands(14, 27)["10010"] == {
+        "action": "move",
+        "targetPos": [{"x": 13, "y": 26}],
+    }
+    # 已经堵在缺口上：这一回合不下指令（站着不动就是堵着，别把自己支使走）
+    assert "10010" not in _commands(13, 26)
+
+
+def test_night_attacks_instead_of_plugging_gap(
+    payload_factory, role_factory, robot_factory,
+):
+    """射程内有机器人时照旧开火，操控者不会为了堵缺口让出武器（T6）"""
+    payload = payload_factory(
+        round_no=DAY_ROUNDS + 1,
+        roles=[
+            role_factory(10010, WORKER, 9, 23, backPackCapability=100),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+        robots=[robot_factory(30001, 12, 24, targetTeam="challenger")],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10020"] == {
+        "action": "attack",
+        "targetPos": [{"x": 12, "y": 24}],
+        "controllerId": "10010",
+    }
+    assert "10010" not in commands
+
+
+def test_night_keeps_position_when_ring_is_complete(payload_factory, role_factory):
+    """外墙一圈都在时没有缺口可堵，操控者照旧守在武器旁（T6 不改动原有行为）"""
+    ring = _calc_wall_order(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=DAY_ROUNDS + 1,
+        roles=[
+            role_factory(10010, WORKER, 9, 23, backPackCapability=100),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+            *[
+                role_factory(40000 + index, WALL, pos.x, pos.y)
+                for index, pos in enumerate(ring)
+            ],
+        ],
+    )
+    commands, _ = decide(payload)
+
+    assert "10010" not in commands
+
+
 def test_pair_controllers_and_weapons(payload_factory, role_factory):
     """角色与武器按距离就近配对，数量不匹配时取较少的那个"""
     payload = payload_factory(
