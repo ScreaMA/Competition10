@@ -6559,3 +6559,136 @@ def test_llm_command_reads_the_task_file_by_its_sandbox_path(
     assert f"cat {path}" in command
     assert "cat task_1_alpha.md" not in command
 
+
+# === issue #183：取数失败的短回显不能当答案交（PK592029 的 R16）===
+
+
+def test_junk_answer_matches_a_bare_fetch_failure_echo():
+    """整个答案就是一句取数失败的回显时才判定命中（S1，PK592029 的 R16）
+
+    地址没命中时接口回的就是一句 `not found`，执行器把它当成"有响应的正文"
+    打进 `[SOLUTION]` 段，`submitAnswer not found` 交上去 Judge 判 0，还白占
+    一次提交额度（同一个任务窗口里 R14 已经交过一次自检横幅）。
+    """
+    for text in (
+        "not found",
+        "Not Found",
+        "NOT  FOUND",
+        "not_found",
+        "not-found",
+        "notfound",
+        "no data",
+        "No Results",
+        "未找到",
+        "没有找到",
+        "无数据",
+        "查无此数据",
+        "not found.",
+        "  not found  ",
+    ):
+        assert brain._task_junk_answer(text), text
+
+
+def test_junk_answer_leaves_real_answers_and_long_sentences_alone():
+    """真正的答案、以及含这几个词的长句都不受影响（S1）
+
+    判据是"整条答案就是这几个词"（全匹配）：答案是一段取数结果（JSON、
+    短字符串），不会整条就等于一句取数诊断；带状态码的 `404 Not Found`
+    另有 `_task_error_body` 那道闸门管，这里不重复认。
+    """
+    for text in (
+        "北京故宫",
+        '{"city": "北京", "count": 7}',
+        "not found 是英文里的否定说法",
+        "第 3 页写着 not found 的来历",
+        "找不到北的旅行者",
+        "404 Not Found",
+        "not found\n北京故宫",
+        "",
+    ):
+        assert not brain._task_junk_answer(text), text
+
+
+def test_task_answer_is_not_submitted_when_it_is_a_fetch_failure_echo(
+    payload_factory, role_factory,
+):
+    """答案区里只有一句取数失败的回显时不提交（S1，PK592029 的 R16）
+
+    回归：`submitAnswer not found` 交上去 Judge 判 0，还烧掉一次提交额度。
+    同一个局面换成真正的取数结果照样交卷——闸门不误伤正常答案。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    payload = _stuck_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", "not found",
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 没取到数：沙盒命令照旧下发，下一回合重新取数
+    assert sandbox_command(payload) != ""
+    # 日志里能一眼看到原因（`task_brief` 的状态字段）
+    assert "state=junk_answer" in brain.task_brief(Turn.load(payload))
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": '{"city": "北京", "count": 7}',
+    }
+
+
+def test_llm_command_output_that_is_a_fetch_failure_echo_is_not_submitted(
+    payload_factory, role_factory,
+):
+    """LLM 的命令只打回一句取数失败回显时不能交卷（S1，PK592029 的 R16）
+
+    `CMD:` 的输出与沙盒执行器那条路各装一道闸门（见 `_llm_command_answer`）：
+    少装一道，404 的正文就照旧会被当成答案交上去。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: curl -s http://localhost:8899/weather?city=beijing"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13, evidence="not found",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_cached_junk_answer_is_not_submitted(payload_factory, role_factory):
+    """缓存里那条"答案"是取数失败的回显时同样不能交（S1）
+
+    缓存是跨任务点的：一条 `not found` 被记下来之后，下一个任务点一到手就会
+    被当成答案秒交，闸门必须也装在 `_cached_answer` 这条路上。
+    """
+    phase_task = "请阅读task_1_alpha.md"
+    # 执行器把 404 的正文当成"取到的数"记进了缓存
+    brain._remember_task_answers(
+        "[exitCode:0]\n[TASK]上一个任务\n"
+        "[API] http://localhost:8899/heritage?city=alpha => 9\n"
+        f"{TASK_SOLUTION_MARKER}task_1_alpha.md\nnot found\n"
+        f"{TASK_SOLUTION_END}\n"
+    )
+    assert "task_1_alpha.md" in brain._TASK_ANSWER_CACHE  # 缓存确实收下了它
+
+    payload = payload_factory(
+        round_no=16,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    assert brain._cached_answer(Turn.load(payload)) is None
+
