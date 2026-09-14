@@ -349,6 +349,12 @@ TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一�
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
+# 沙盒执行器抓接口地址用的字符集（白名单）：只放行 URL 里合法且纯 ASCII 的字符。
+# 任务文档是中文写的，地址后面紧跟的标点会被一起抓进 URL——PK590389/590405 的
+# 沙盒输出就是 `[APIFAIL] http://localhost:8899`），API InvalidURL`：旧正则
+# 只排除空白与 `<>)]}`，反引号与全角"），"全在放行名单里，抓出来的地址连
+# 请求都构造不出来，一轮任务 5+ 个回合纯空转、MAX_CALLS 也被这些坏地址吃光。
+TASK_URL_PATTERN = r"https?://[A-Za-z0-9._~:/?#@!$&*+,;=%-]+"
 
 # 任务止损（S1）：自进化任务的闭环是"下发沙盒命令 -> 取数 -> submitAnswer"，
 # 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
@@ -3255,6 +3261,7 @@ def _task_executor(task_path: str) -> str:
         .replace("__DATA__", repr(TASK_DATA_MARKER))
         .replace("__FAIL__", repr(TASK_API_FAIL_MARKER))
         .replace("__SCAN__", repr(TASK_SCAN_MARKER))
+        .replace("__URL_RE__", repr(TASK_URL_PATTERN))
     )
     # 沙盒的解释器叫 python3 或 python，挑一个能用的（挑不到时脚本不会执行，
     # 答案区为空 -> 这一回合不提交，下一回合重来）。
@@ -3293,6 +3300,7 @@ SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
 FAIL = __FAIL__
 SCAN = __SCAN__
+URL_PATTERN = __URL_RE__
 SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
 
 
@@ -3362,22 +3370,43 @@ def task_files():
     return named + others
 
 
+def valid_url(url):
+    """地址闸门：只放行纯 ASCII 的 URL（发起请求前先过这一道）
+
+    任务文档是中文写的，地址后面紧跟的标点会被一起抓进 URL——PK590389/590405
+    的沙盒输出就是 `[APIFAIL] http://localhost:8899`），API InvalidURL`。
+    这类地址连 Request 都构造不出来，请求必然在构造阶段抛 InvalidURL：
+    空转一个回合，还把 MAX_CALLS 的额度白白吃掉一次。
+    """
+    return bool(re.fullmatch(URL_PATTERN, url))
+
+
 def endpoints(doc_text):
-    """接口文档里的调用样例：本地接口优先，其次才是文档里抓到的其他地址
+    """接口文档里的调用样例：本地接口优先，且 BASE 永远留在候选里
 
     沙盒内的接口就在 BASE 上（TASK_API_DEFAULT），而 find_files(DOC_NAMES)
     从全盘捞回来的文档里什么外链都有。旧实现把抓到的外链排在本地接口前面，
     MAX_CALLS 被这些在无网沙盒里调不通的地址耗光，真正能取数的本地接口
     一次都没被请求到，答案区永远是空的——三场复盘里"沙盒执行了（exitCode:0）
     却拿不到答案"就是这么来的。
+
+    抓串走 URL_PATTERN 这道 ASCII 闸门（见 `TASK_URL_PATTERN`）：中文文档里
+    跟在地址后面的"），API"、反引号都不会再被吃进 URL。还有一处坑是"文档里的
+    本地地址把 BASE 挤掉"——旧写法只要抓到一个带 localhost 的地址就不再单独
+    用 BASE，而那个地址可能只是文档里的半截样例，本机接口一次都没被请求到。
+    现在 BASE 固定排第一（`candidates` 只取前两个地址，它必须在前两位），
+    文档样例与文档里的其他地址依次跟在后面。
     """
     urls = []
-    for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
-        raw = raw.strip().strip("\\"'").rstrip(".,;:!?、。）])")
+    for raw in re.findall(URL_PATTERN, doc_text):
+        raw = raw.strip().strip("\\"'").rstrip(".,;:!?")
         if raw and raw not in urls:
             urls.append(raw)
     local = [url for url in urls if "localhost" in url or "127.0.0.1" in url]
-    picked = local or [BASE] + [url for url in urls if url != BASE]
+    picked = []
+    for url in [BASE] + local + urls:
+        if url not in picked and valid_url(url):
+            picked.append(url)
     return picked
 
 
@@ -3398,8 +3427,12 @@ def queries(text, name):
 
 
 def candidates(text, name, urls):
-    """这一份任务要试的调用地址：文档样例 + 把样例里的查询词换成任务自己的"""
-    urls = urls or [BASE]
+    """这一份任务要试的调用地址：文档样例 + 把样例里的查询词换成任务自己的
+
+    这里是唯一的"发起请求前"收口，所以坏地址（含反引号/中文等非 ASCII 字符，
+    见 `valid_url`）在这一步就被剔除，不会白占一次 `MAX_CALLS` 额度。
+    """
+    urls = [url for url in (urls or [BASE]) if valid_url(url)] or [BASE]
     out = []
     for url in urls[:2]:
         if url not in out:

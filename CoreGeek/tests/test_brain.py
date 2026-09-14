@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -2838,7 +2839,75 @@ def test_task_executor_prefers_local_api_over_doc_links():
     旧实现把抓到的外链排在本地接口前面，`MAX_CALLS` 被这些在无网沙盒里
     调不通的地址耗光，本地接口一次都没被请求到，答案区永远是空的。
     """
-    assert "picked = local or [BASE] + " in brain.TASK_EXECUTOR
+    endpoints, _ = _executor_endpoints()
+
+    urls = endpoints("外链：http://a.example/x 与 http://localhost:8899/docs")
+
+    assert urls.index(brain.TASK_API_DEFAULT) < urls.index("http://a.example/x")
+
+
+# === issue #61：沙盒取数地址抓串（PK590389/590405） ===
+
+
+def _executor_endpoints():
+    """在测试进程里跑一遍沙盒执行器的地址抓取逻辑
+
+    执行器整体要在沙盒里跑（它会全盘 walk、还要真发请求），但"抓地址"那两段
+    是纯函数，按生成后的脚本文本截出来直接跑，比断言源码字符串靠谱——上一版
+    只断言 `"picked = local or [BASE] + " in TASK_EXECUTOR`，坏地址被吃进 URL
+    这件事就没被发现（PK590389/590405）。
+
+    截出来的是脚本里"URL_PATTERN 常量赋值 -> `def queries`"之间的一段：
+    里面只有常量赋值与函数定义（没有模块级可执行语句），所以 exec 不会碰到
+    文件系统；地址常量也用的是脚本里真正注入的那一份，不另抄一遍。
+
+    返回:
+        (endpoints, valid_url) 两个函数，签名与沙盒里的一致
+    """
+    script = brain._task_executor("task_1_beijing.md")
+    chunk = script[script.index("URL_PATTERN ="):script.index("def queries(")]
+    namespace: dict = {"re": re, "BASE": brain.TASK_API_DEFAULT}
+    exec(chunk, namespace)
+    return namespace["endpoints"], namespace["valid_url"]
+
+
+def test_task_executor_url_pattern_drops_non_ascii_junk():
+    """沙盒抓地址时不会把中文标点、反引号一起吃进 URL
+
+    回归：PK590389/590405 的沙盒输出是
+    `[APIFAIL] http://localhost:8899`），API InvalidURL`——任务文档是中文写的，
+    地址后面紧跟的"），API"被旧正则（只排除空白与 `<>)]}`）一起抓走，请求每次
+    都在构造阶段抛 InvalidURL：一轮任务 5+ 个回合空转，MAX_CALLS 也被这些
+    坏地址吃光，真正的本机接口一次都没被请求到。
+    """
+    endpoints, valid_url = _executor_endpoints()
+    doc = (
+        "调用示例：http://localhost:8899/heritage?city=beijing，返回 JSON。\n"
+        "另一种写法：`http://localhost:8899/weather?city=`），API 说明\n"
+    )
+
+    urls = endpoints(doc)
+
+    assert urls[0] == brain.TASK_API_DEFAULT  # 本机接口永远排第一
+    assert "http://localhost:8899/heritage?city=beijing" in urls
+    assert all(valid_url(url) for url in urls)
+    for url in urls:
+        assert "，" not in url and "`" not in url and "）" not in url
+
+
+def test_task_executor_keeps_base_when_doc_links_shadow_it():
+    """文档里的本地地址不会再把沙盒内的本机接口挤出候选
+
+    回归：旧写法 `picked = local or [BASE] + ...` 只要抓到一个带 localhost 的
+    地址就不再单独用 BASE，而 `candidates` 只取前两个地址——文档里的半截样例
+    把 BASE 挤到候选之外，本机接口一次都没被请求到，答案区永远是空的。
+    """
+    endpoints, _ = _executor_endpoints()
+
+    urls = endpoints("参考 http://localhost:9999/unknown 与 http://a.example/x")
+
+    assert urls[0] == brain.TASK_API_DEFAULT
+    assert "http://localhost:9999/unknown" in urls
 
 
 def test_defender_cashes_out_income_ore_while_wall_quota_open(
