@@ -361,6 +361,13 @@ TASK_SOLUTION_END = "[/SOLUTION]"
 TASK_DATA_MARKER = "[API]"  # 真实取数的证据：只有请求成功才会打印
 TASK_API_FAIL_MARKER = "[APIFAIL]"  # 取数失败也留一行诊断（URL + 异常类型）
 TASK_SCAN_MARKER = "[SCAN]"  # 找到多少任务文件/接口文档/可用地址 + 有没有抠到鉴权 Key
+# 空结果标记（S1，PK592107 的 R15）：地址对了、鉴权也过了，可接口回的是一段
+# "零条记录"的 JSON（`{"total_count": 0, "data": []}`）。`[API]` 只证明"这一次
+# 请求有响应"，不证明"响应里有答案"；这种响应执行器改打一行 `[EMPTY]`（见
+# `empty_body`），不打 `[API]`——决策侧据此把它归进"这一趟没取到数"
+# （见 `_task_fetch_failed`），任务照旧换候选地址重试，而不是把这段空壳当成
+# 答案交上去（Judge 判 0，还白占一次提交额度，见 `TASK_SUBMIT_LIMIT`）。
+TASK_EMPTY_MARKER = "[EMPTY]"
 TASK_ANSWER_MIN_LEN = 4  # 答案最短长度（任务原文动辄几千字，这条挡住空答）
 TASK_ECHO_RUN = r"[一-鿿]{6,}"  # 任务描述里的中文长句（复读判定用）
 TASK_API_DEFAULT = "http://localhost:8899"  # 沙盒内的本地接口
@@ -731,6 +738,29 @@ TASK_JUNK_ANSWER = re.compile(
     re.IGNORECASE,
 )
 
+# 空结果集（S1，PK592107 的 R15）：接口对"没查到的查询词"回的是 200 + 一段
+# 零条记录的 JSON（`{"total_count": 0, "data": []}`），取数器照旧把它打进
+# `[SOLUTION]` 段。它既不是错误体（没有错误键、也没有状态码，`TASK_ERROR_BODY`
+# 拦不住），不是沙盒里那份文档的原文（没有指纹可比），也不是一句取数诊断
+# （`TASK_JUNK_ANSWER` 只认 `not found` 那几个词）——前面几道闸门一条都拦不住，
+# 开拓者于是把这段"什么都没查到"的 JSON 当成答案交了卷：Judge 判 0，还占掉
+# 一次提交额度（`TASK_SUBMIT_LIMIT`），下一回合复位重来，整个任务窗口就这么
+# 空转掉了。空结果说明的是"这个查询词/这条地址没对上"，正确的动作是换候选
+# 地址接着取数（见 `rotate`）或走 LLM 兜底，不是交卷。
+#
+# 判据是"整条答案就是一段 JSON，且把它里面那些空值键值对摘掉之后什么都不剩"
+# （见 `_task_empty_answer`）：`{"total_count": 0, "data": []}`、`{"items": []}`、
+# `{}`、`[]` 都命中；带内容的答案（`{"city": "北京"}`、`{"count": 0, "city":
+# "北京"}`）摘完总会有值留下来。多行答案与非 JSON 答案一律不认——真正的答案
+# 不会长成"一段空壳 JSON"的样子，误伤面因此很小。
+TASK_JSON_BODY = re.compile(r"^[\[{][\s\S]*[\]}]\s*$")
+# 键值对里"等于没有值"的那几种写法（键 + 值成对出现，整对摘掉）
+TASK_EMPTY_JSON_PAIR_TEXT = (
+    r'"[^"]*"\s*:\s*(?:0(?:\.0+)?\b|\[\s*\]|\{\s*\}|""|\'\'|null|false)'
+)
+TASK_EMPTY_JSON_PAIR = re.compile(TASK_EMPTY_JSON_PAIR_TEXT, re.IGNORECASE)
+TASK_JSON_RESIDUE = re.compile(r"[\s\[\]{},]*")
+
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
     "challenger": (CHALLENGER_TASK_1, CHALLENGER_TASK_2),
@@ -779,7 +809,8 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
         watch=r2/t3    看门狗：同一份沙盒输出重复 r 次 / 任务已占用 t 回合
         abandoned=yes  是否已止损（开拓者被放回战斗调度）
         sandbox=发送   本回合是否下发了沙盒命令
-        api=1 fail=3   上一份沙盒输出里取数成功 / 取数失败（`[APIFAIL]`）次数
+        api=1 fail=3   上一份沙盒输出里取数成功 / 取数失败（`[APIFAIL]` 与
+                       只取回空结果集的 `[EMPTY]`）次数
         solution=yes   输出里有没有 `[SOLUTION]` 段
         cache=hit      答案缓存里有没有当前任务文件的答案
         llm=ask2/cmd   LLM 求助了几次 / 是否已拿到待执行命令或直接答案
@@ -813,7 +844,9 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
         f"abandoned={'yes' if _task_abandoned(turn) else 'no'} "
         f"sandbox={'发送' if sandbox_sent else '空闲'} "
         f"api={result.count(TASK_DATA_MARKER)} "
-        f"fail={result.count(TASK_API_FAIL_MARKER)} "
+        # 空结果集（`[EMPTY]`）也是"这一趟没取到数"：不计进来的话，日志上会是
+        # `api=0 fail=0`，看上去像"执行器根本没发请求"，下一轮又只能靠猜
+        f"fail={result.count(TASK_API_FAIL_MARKER) + result.count(TASK_EMPTY_MARKER)} "
         f"solution={'yes' if TASK_SOLUTION_MARKER in result else 'no'} "
         f"cache={'hit' if _cached_answer(turn) is not None else 'miss'} "
         f"llm=ask{int(llm_state.get('prompts') or 0)}{flags}"
@@ -3478,7 +3511,13 @@ def _task_fetch_failed(output: str) -> bool:
     读文件循环（沙盒没有在反复读同一份文件），也不是"猜错了地址"（一个地址
     都还没试）——是这条命令做得太多、时间花在了找文件上（见 `_task_retry_budget`）。
 
-    第 1/3/4 条的止损线都一样（见 `_task_abandoned`）：读文件死循环按同一份输出
+    另有一条与上面几条并列的第五种：整份输出只有 `[EMPTY]`
+    （`TASK_EMPTY_MARKER`，PK592107 的 R15）——地址通了、正文回来了，可里面
+    一条记录都没有（`{"total_count": 0, "data": []}`）。它按第 1 条那一档走：
+    地址这一趟是"试过了、没拿到数"，该换候选地址接着试（执行器每回合按
+    `rotate` 换一批），不是把空壳交上去（见 `_task_empty_answer`）。
+
+    第 1/3/4/5 条的止损线都一样（见 `_task_abandoned`）：读文件死循环按同一份输出
     重复几次熔断（`TASK_LOOP_LIMIT`），它们按连续几回合取不到数熔断
     （`TASK_API_FAIL_LIMIT`，比前者宽，正是为了把几个回合留给重试与 LLM 兜底）。
     判据在 `_watch_task` 里用来把这几类的 `repeats` 按住不动——否则它们
@@ -3489,12 +3528,13 @@ def _task_fetch_failed(output: str) -> bool:
 
     返回:
         True 表示这一份输出里没有任何取数证据、也不是"在读同一份文件"的死循环
-        （取数全失败 / 执行器没发出请求 / 整条命令被掐掉）
+        （取数全失败 / 执行器没发出请求 / 整条命令被掐掉 / 只取回空结果集）
     """
     if TASK_DATA_MARKER in output:
         return False  # 取到数了（哪怕后来又失败），这一回合算有进展
     return (
         TASK_API_FAIL_MARKER in output          # 试过地址，全失败
+        or TASK_EMPTY_MARKER in output          # 地址通了，正文里零条记录
         or TASK_SCAN_MARKER in output           # 执行器跑过，却一次请求都没发
         or TASK_TIMEOUT_MARKER in output        # 整条命令被掐了，取数还没轮到
     )
@@ -4281,6 +4321,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None
     if _task_junk_answer(answer):
         return None  # LLM 把一句取数失败的回显当成了答案（S1）
+    if _task_empty_answer(answer):
+        return None  # LLM 把一段零条记录的 JSON 当成了答案（S1）
     return answer
 
 
@@ -4320,6 +4362,8 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None
     if _task_junk_answer(answer):
         return None  # 命令只把取数失败的短回显打了出来（S1）
+    if _task_empty_answer(answer):
+        return None  # 命令只把一段零条记录的 JSON 打了出来（S1）
     return answer
 
 
@@ -4443,6 +4487,10 @@ def _task_executor(
         .replace("__SOLUTION_END__", repr(TASK_SOLUTION_END))
         .replace("__DATA__", repr(TASK_DATA_MARKER))
         .replace("__FAIL__", repr(TASK_API_FAIL_MARKER))
+        # 空结果集的判定模式串与决策侧共用一份（`repr` 注入，免得在
+        # `TASK_EXECUTOR` 那段三引号里再手写一遍转义）
+        .replace("__EMPTY_PAIR__", repr(TASK_EMPTY_JSON_PAIR_TEXT))
+        .replace("__EMPTY__", repr(TASK_EMPTY_MARKER))
         .replace("__SCAN__", repr(TASK_SCAN_MARKER))
         .replace("__DOC__", repr(TASK_DOC_MARKER))
         .replace("__TEXT_HINT__", str(TASK_TEXT_HINT))
@@ -4502,6 +4550,8 @@ SOLUTION = __SOLUTION__
 SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
 FAIL = __FAIL__
+EMPTY = __EMPTY__
+EMPTY_PAIR = __EMPTY_PAIR__
 SCAN = __SCAN__
 DOC = __DOC__
 TEXT_HINT = __TEXT_HINT__
@@ -4555,6 +4605,32 @@ def fetch(url, headers):
             line += " => " + detail[:BODY_LIMIT]
         print(FAIL, line)
         return ""
+
+
+def empty_body(body):
+    """响应体是不是一段"零条记录"的 JSON（S1，PK592107 的 R15）
+
+    接口对没对上的查询词回的是 200 + `{"total_count": 0, "data": []}`：请求
+    本身是成功的（`[API]` 那一行照旧会打），可正文里一条记录都没有。旧实现
+    把它当"取到的数"打进 `[SOLUTION]` 段，决策侧前面几道闸门一条都拦不住
+    （不是错误体、不是文档原文、也不是一句 `not found`），开拓者于是把这段
+    空壳交了上去——Judge 判 0，还白占一次提交额度（`TASK_SUBMIT_LIMIT`）。
+
+    这里把它认出来，调用方改打一行 `[EMPTY]`（不打 `[API]`、也不收进
+    `bodies`）：这一趟等于没取到数，该继续试后面的候选地址（`rotate` 每回合
+    换一批），决策侧也据此按"取数失败"归类（见 `_task_fetch_failed`）。
+
+    判据与决策侧的 `_task_empty_answer` 一致：整条正文就是一段 JSON，且把
+    里面所有空值键值对（`0` / `[]` / `{}` / `""` / `null` / `false`）摘掉之后
+    什么都不剩（模式串由 `EMPTY_PAIR` 注入，与决策侧那份是同一个）。
+    响应体被 `BODY_LIMIT` 截断时不再成对（收尾的括号没了），这段判定自然
+    不命中——截断的正文当正常数据走，宁可多试一次也不误丢答案。
+    """
+    text = body.strip()
+    if re.match(r"^[\\[{[\\s\\S]*[\\]}]$", text) is None:
+        return False
+    residue = re.sub(EMPTY_PAIR, "", text, flags=re.I)
+    return re.fullmatch(r"[\\s\\[\\]{},]*", residue) is not None
 
 
 def api_key(text):
@@ -5021,6 +5097,12 @@ for path in files[:SOLVE_MAX]:
         calls += 1
         body = fetch(url, headers)
         if body:
+            # 有响应但一条记录都没有（`{"total_count": 0, "data": []}`）：这一趟
+            # 不算取到数，继续试后面的候选地址（S1，PK592107 的 R15）。空壳不能
+            # 打进 `[SOLUTION]` 段——决策侧会把它当成答案交上去，Judge 判 0。
+            if empty_body(body):
+                print(EMPTY, url)
+                continue
             print(DATA, url, "=>", len(body))
             bodies.append(body)
     if bodies:
@@ -5056,6 +5138,10 @@ if not calls:
         calls += 1
         body = fetch(url, headers)
         if body:
+            # 同上：零条记录的空壳不算取到数（S1，PK592107 的 R15）。
+            if empty_body(body):
+                print(EMPTY, url)
+                continue
             print(DATA, url, "=>", len(body))
             bodies.append(body)
     if bodies:
@@ -5294,6 +5380,9 @@ def _task_answer(turn: Turn) -> str | None:
     R14 交的是"逐项 [FAIL] + `4/6 通过，2 失败`"，Judge 都判 0）；
     收窄之后还要过 `_task_junk_answer`（S1）：整条答案就是一句取数失败的
     短回显（`not found`）时同样不能交——PK592029 的 R16 交的正是这一行。
+    最后再收一道 `_task_empty_answer`（S1）：整条答案就是一段零条记录的 JSON
+    （`{"total_count": 0, "data": []}`）时不交——PK592107 的 R15 交的正是它，
+    那说明这个查询词/这条地址没对上，该换候选地址接着取数而不是交卷。
     走 LLM 那条路时输出里没有文档指纹可比，另有一道按"文档长什么样"判定的
     闸门（`_task_doc_body`，PK590836 的 R15 交的是 API 文档正文）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
@@ -5314,7 +5403,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     原文）/ `path_answer`（答案是一条文件路径）/ `doc_body`（答案是 Markdown
     文档的正文，见 `_task_doc_body`）/ `harness_only`（答案区里只有脚本自检
     回显——逐项状态行加收尾小结行，没有答案可交，见 `_answer_value`）/
-    `junk_answer`（整个答案就是一句取数失败的短回显，见 `_task_junk_answer`）。
+    `junk_answer`（整个答案就是一句取数失败的短回显，见 `_task_junk_answer`）/
+    `empty_result`（整个答案就是一段零条记录的 JSON，见 `_task_empty_answer`）。
     """
     if not turn.phase_task:
         return None, "no_task"
@@ -5363,6 +5453,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
         return None, "harness_only"  # 答案区里只有脚本状态行，没有答案可交
     if _task_junk_answer(answer):
         return None, "junk_answer"  # 交上去的是一句取数失败的短回显（S1）
+    if _task_empty_answer(answer):
+        return None, "empty_result"  # 交上去的是一段零条记录的 JSON（S1）
     if len(answer) < TASK_ANSWER_MIN_LEN:
         return None, "short_or_missing"
     return answer, "ok"
@@ -5433,6 +5525,36 @@ def _task_junk_answer(answer: str) -> bool:
     """
     text = answer.strip()
     return "\n" not in text and TASK_JUNK_ANSWER.match(text) is not None
+
+
+def _task_empty_answer(answer: str) -> bool:
+    """答案是不是一段"零条记录"的 JSON（S1）
+
+    接口对没对上的查询词回的是 200 + `{"total_count": 0, "data": []}` 这种空壳，
+    取数器把它当"有响应的正文"打进 `[SOLUTION]` 段（复盘 PK592107 的 R15），
+    前面几道闸门一条都拦不住——`_task_error_body` 认的是错误键/状态码，
+    `_task_junk_answer` 认的是 `not found` 那几个词，而这段 JSON 两样都不占。
+    交上去 Judge 判 0，还白占一次提交额度（`TASK_SUBMIT_LIMIT`），不如这一
+    回合不交、换个候选地址接着取数（执行器每回合按 `rotate` 换一批，LLM 兜底
+    也还在后面）。
+
+    判定分两步（见 `TASK_JSON_BODY` 那段常量注释）：整条答案就是一段 JSON，
+    且把里面所有空值键值对（`0` / `[]` / `{}` / `""` / `null` / `false`）摘掉
+    之后什么都不剩。带内容的答案摘完总会有值留下来，`{"count": 0, "city":
+    "北京"}` 这类"有计数也有正文"的同样不会被误伤；`{"count": 0}` 这种"只有
+    一个零计数"的会命中——它回答的正是"什么都没查到"。
+
+    参数:
+        answer: 待提交的答案内容
+
+    返回:
+        True 表示这条答案是一段空结果集，不能提交
+    """
+    text = answer.strip()
+    if TASK_JSON_BODY.match(text) is None:
+        return False
+    residue = TASK_EMPTY_JSON_PAIR.sub("", text)
+    return TASK_JSON_RESIDUE.fullmatch(residue) is not None
 
 
 def _task_doc_body(answer: str) -> bool:
@@ -5582,7 +5704,8 @@ def _remember_task_answers(result: str) -> None:
     沙盒里那份文档的原文同样不进缓存（`_task_text_answer`）：`/docs` 这类
     地址把文档页当正文返回时，`[API]` 证据是有的，但缓存下来的仍然是文档
     ——下一个任务点一到手就会把它当答案秒交（PK590851 的 R13 正是这么交的）。
-    文档正文（`_task_doc_body`）同理。
+    文档正文（`_task_doc_body`）同理；一段零条记录的 JSON（`_task_empty_answer`，
+    PK592107 的 R15）更不该进缓存：它是"这个查询词没对上"，不是答案。
 
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
@@ -5599,6 +5722,7 @@ def _remember_task_answers(result: str) -> None:
             and TASK_DATA_MARKER in evidence
             and not _task_text_answer(answer, result)
             and not _task_doc_body(answer)
+            and not _task_empty_answer(answer)
         ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
@@ -5624,6 +5748,8 @@ def _cached_answer(turn: Turn) -> str | None:
     标记"的一整段在新任务到手时会被秒交，Judge 判 0 还烧掉一次提交额度。
     取数失败留下的短回显（`not found`）同样在这里挡住（`_task_junk_answer`）：
     缓存是跨任务点的，一条 `not found` 会跟着下一个任务一起被秒交。
+    一段零条记录的 JSON（`_task_empty_answer`，`{"total_count": 0, "data": []}`）
+    同理：它是"这个查询词没对上"，跟着下一个任务秒交同样是 0 分。
     """
     target = _task_file(turn.phase_task)
     if target is None:
@@ -5635,6 +5761,8 @@ def _cached_answer(turn: Turn) -> str | None:
         return None  # 缓存里那条"答案"是一份文档的正文，同样不能交（S2）
     if _task_junk_answer(answer):
         return None  # 缓存里那条"答案"是一句取数失败的短回显（S1）
+    if _task_empty_answer(answer):
+        return None  # 缓存里那条"答案"是一段零条记录的 JSON（S1）
     return _answer_value(answer) or None  # 只有脚本状态行时算没有答案（S1）
 
 
