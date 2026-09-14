@@ -533,8 +533,27 @@ TASK_ERROR_BODY = re.compile(
     r"\b[45]\d\d\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|"
     r"Method Not Allowed|Internal Server Error|Bad Gateway|Service Unavailable)\b|"
     r"\b(?:InvalidURL|HTTPError|URLError|SocketTimeout)\b|"
-    r"Traceback \(most recent call last\)",
-    re.IGNORECASE,
+    r"Traceback \(most recent call last\)|"
+    # 沙盒命令自己的报错（PK590921 的 R16，也是 PK590882 的 R16）：`jq` 之类的
+    # 工具在沙盒里根本不存在，命令的输出于是是一行 `jq: command not found`，
+    # 它既没有错误键也没有状态码，上面几条形态一道都拦不住，会被当成"取到的
+    # 数"交上去。`cat` 读一个没找到的文件（同 R16 的
+    # `cat: task_1_beijing.md: No such file or directory`）与 curl 写响应体
+    # 失败（`Failed writing body`）同理。
+    #
+    # `command not found` 必须挂在工具名前缀上（`jq: command not found` /
+    # `bash: line 3: curl: command not found`），而且工具名只能紧贴着它：
+    # 这几个字本身是合法英文，放开了匹配会把一份写着
+    # "command not found 是我的歌名" 的正常答案拦下来。`No such file or
+    # directory` 则是整句固定搭配，本身不会出现在答案数据里；任务描述里的
+    # `No such file`（见 `TASK_ERROR_MARKERS`）因为少了 "or directory" 不会被
+    # 这条命中，两处判定互不干扰。
+    r"^(?:\S+\s*)?:\s*command not found\b|"
+    r"\s\S+:\s*command not found\b|"
+    r"\bNo such file or directory\b|"
+    r"\bEndpoint not found\b|"
+    r"\bFailed writing body\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # 答案与沙盒里读到的文档原文重合的判定（S1）：`TASK_ERROR_BODY` 挡的是"错误体"，
@@ -3368,6 +3387,13 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None  # LLM 抄的是一份文档的正文，不是一个答案（S2）
     if _task_path_answer(answer):
         return None  # "ANSWER: <任务文件的路径>" 同样不是答案（S1）
+    # LLM 把命令的报错当成了答案（PK590921 的 R14/R16）：`ANSWER:` 那一行写的
+    # 可以是它刚跑完的命令的报错原文（404 JSON 由 `_task_error_body` 拦），
+    # 也可以是 `jq: command not found` 这行工具报错——后者既没有错误键也没有
+    # 状态码，不在这里挡一道就会被当成答案交上去（`_llm_command_answer` 有
+    # 同样的闸门，两条取答案的路不能只有一条装了）。
+    if _task_error_body(answer):
+        return None
     return answer
 
 

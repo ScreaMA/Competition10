@@ -1814,6 +1814,13 @@ def test_task_error_body_matches_only_error_shapes():
         "500 Internal Server Error",
         "[APIFAIL] http://localhost:8899 HTTPError 404",
         "urllib.error.URLError: <urlopen error>",
+        # 沙盒命令自己的报错（PK590882/590921 的 R16）：没有错误键也没有状态码
+        "/bin/bash: jq: command not found",
+        "bash: line 3: curl: command not found",
+        "jq: command not found",
+        "cat: task_1_beijing.md: No such file or directory",
+        '{"status":"error","message":"Endpoint not found: /api/docs"}',
+        "curl: (23) Failed writing body",
     )
     good = (
         "Forbidden City 故宫博物院",
@@ -1824,6 +1831,14 @@ def test_task_error_body_matches_only_error_shapes():
         '{"code": 2001}',
         '{"status": "ok", "count": 7}',
         "晴，26℃",
+        # 这几个词是合法英文/正常数据，不能因为长得像就拦下来：
+        # 没有工具名前缀的 command not found、任务描述里的 `No such file`、
+        # 缺了 "or directory" 的整句都不是报错输出
+        "command not found 是我的歌名",
+        "No such file",
+        "No such file in the archive",
+        "Endpoint not found 章节在第 3 页",
+        "Failed writing body 是 curl 手册里的一节",
     )
     for text in bad:
         assert brain._task_error_body(text), text
@@ -3719,6 +3734,33 @@ def test_task_answer_ignores_task_echo_from_llm(payload_factory, role_factory):
     commands, _ = decide(payload)
 
     assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_task_answer_rejects_error_body_from_llm(payload_factory, role_factory):
+    """LLM 把命令的报错当成答案回过来时同样不能交（PK590882/590921 的 R14/R16）
+
+    那两场里 submitAnswer 交的是沙盒的报错原文：R14 是 404 的错误 JSON
+    （`{"status":"error","message":"Endpoint not found: /api/docs"}`），R16 是
+    `jq: command not found` 这行工具报错。LLM 直接给答案这条路（`ANSWER:`）与
+    命令输出那条路（`CMD:`）都要过同一道闸门——少装一道，报错原文就照旧会被
+    当成答案交上去，既拿不到分又白烧一次提交额度。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京文化遗产"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    for reply in (
+        'ANSWER: {"status":"error","message":"Endpoint not found: /api/docs"}',
+        "ANSWER: /bin/bash: jq: command not found",
+        "ANSWER: cat: task_1_beijing.md: No such file or directory",
+    ):
+        payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+        payload["llmResp"] = reply
+        commands, _ = decide(payload)
+        # 就地待命时开拓者可以没有指令，但绝不能是 submitAnswer
+        assert "10011" not in commands or commands["10011"]["action"] != (
+            "submitAnswer"
+        ), reply
 
 
 # === issue #45：V4 日计划（布局 / 目标队列 / 夜战救急） ===
