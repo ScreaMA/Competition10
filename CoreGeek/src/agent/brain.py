@@ -173,8 +173,19 @@ OPENING_MIN_TOWERS = 2
 MIN_WALLS_BEFORE_NIGHT = 2
 # 防守方每天至少要保证铺好的围墙段数：复盘里防守方整天零围墙、正面毫无阻挡，
 # 机器人直接贴脸打基地，而同一局的进攻方反倒把来路封得严严实实。
-# LLM 计划把墙压到 0 时防守方仍按下限留出石材（见 `_wall_target`）。
-DEFENDER_WALL_QUOTA = 1
+# LLM 计划把墙压到 0 段时防守方仍按下限留出石材（见 `_wall_target`）。
+#
+# 下限取 3 而不是 1（S3）：`_calc_wall_order` 排出来的墙位是按"先来敌方向、
+# 再上左下右"逐格连着的，前 N 格就是来路上连续的一段——下限 1 时立起来的是
+# 孤零零一格，机器人从旁边绕一步就进来了。两份复盘里防守方全场就那一段
+# (33,12)，R16 基地单回合掉 1350 血（PK592123/PK592176 的"单段错位墙、
+# 与基地不构成防线"）；设计文档里 S1（issue #8）立下的目标也是"第 1 天白天结束前
+# 形成闭环防线"，靠一段墙达不到。3 段能把来路那一侧压成一条通道、把机器人逼进
+# 炮塔射程，与 LLM 计划的配额上限（`LLM_MAX_WALLS`）同值，计划、底线、开局防线
+# 窗口（`WALL_PLAN_SEGMENTS`）三处口径不会互相打架。
+# 上限只管"还没铺够几段"：铺够 3 段后石材照旧变现，升级/买券的钱不会一直
+# 压在石材线上（地图上没有任何石材来源时下限自动失效，见 `_wall_target`）。
+DEFENDER_WALL_QUOTA = 3
 # 防守方开局防线计划（S3，即复盘建议里的 WALL_PLAN）：每个游戏日的前
 # WALL_PLAN_ROUNDS 个回合里，分管经济的工人照着 `_calc_wall_order` 生成的防线
 # 坐标（先来敌方向、再上左下右）铺够 WALL_PLAN_SEGMENTS 段墙，塔由另一名工人
@@ -652,7 +663,11 @@ TASK_ERROR_BODY = re.compile(
     r'"(?:status|code)"\s*:\s*"?[45]\d\d\b|'
     r"\b[45]\d\d\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|"
     r"Method Not Allowed|Internal Server Error|Bad Gateway|Service Unavailable)\b|"
-    r"\b(?:InvalidURL|HTTPError|URLError|SocketTimeout)\b|"
+    # `FileNotFoundError` 单列：沙盒里读一个不存在的设备节点时（PK592176 的
+    # R16 `FileNotFoundError: '/dev/stdin'`），异常名后面只有那个路径，
+    # 不带下面那条 `No such file or directory` 的固定搭配，前面几道形态
+    # 一条都拦不住。异常名本身不会出现在正经答案里，误伤面可以忽略。
+    r"\b(?:InvalidURL|HTTPError|URLError|SocketTimeout|FileNotFoundError)\b|"
     r"Traceback \(most recent call last\)|"
     # 沙盒命令自己的报错（PK590921 的 R16，也是 PK590882 的 R16）：`jq` 之类的
     # 工具在沙盒里根本不存在，命令的输出于是是一行 `jq: command not found`，
@@ -1334,9 +1349,20 @@ def _stone_reserve(
     而 `wall_quota` 期间经济线整段被压住（见 `_worker_day_logic` 的经济分支），
     一拖就是十几个回合——复盘里防守方首段围墙直到 R15 才出现（PK589253），
     另外两场更是全程 0 段，金币从 R6/R8 冻结到 R17。
+
+    手里已经攥着砌墙的料时不再往下攒（S3）：围墙下限是一条连续墙线
+    （`DEFENDER_WALL_QUOTA` 段，见那里的说明），照"还欠几段"去攒的话，工人
+    要先在矿点连着采满整条线的料才动身，首段围墙又被推到后面——而首段墙立起来
+    之前，那段来路整条都是敞着的。手里有料就先回去把最近那一段砌上，剩下的
+    下一趟再补；两手空空时才按还欠的段数一次性带回。
     """
     if not wall_quota:
         return STONE_BATCH
+    held = sum(
+        worker.backpack.count(WALL_MATERIAL) for worker in turn.workers()
+    )
+    if held >= WALL_STONE_COST:
+        return WALL_STONE_COST
     return max(WALL_STONE_COST, _wall_gap(turn, plan))
 
 
@@ -3943,11 +3969,12 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
     才算解出来，LLM 凭文档直接给的答案只当兜底。
 
     `CMD:` 给的命令先过一道 `_shell_command_ok` 的体检（引号成对、单行、
-    不带 heredoc）：拼不出合法命令的回复直接丢掉，本回合改走执行器自己取数
-    （`_sandbox_command` 的兜底路径），而不是拿一整个回合去换一条注定报语法错
-    的命令；状态里没落下命令时 `_task_prompt` 下一回合会再问一次，问到
-    `TASK_LLM_MAX_PROMPTS` 次为止（复盘 PK590881 的 R14 就是被一条引号不配对
-    的命令耗掉了一个回合，PK591011 的 R13/R16 则是被 heredoc 耗掉的）。
+    不带 heredoc、不从 `/dev/stdin` 取数）：拼不出合法命令的回复直接丢掉，
+    本回合改走执行器自己取数（`_sandbox_command` 的兜底路径），而不是拿一整个
+    回合去换一条注定报语法错/找不到设备的命令；状态里没落下命令时 `_task_prompt`
+    下一回合会再问一次，问到 `TASK_LLM_MAX_PROMPTS` 次为止（复盘 PK590881 的
+    R14 就是被一条引号不配对的命令耗掉了一个回合，PK591011 的 R13/R16 则是被
+    heredoc 耗掉的）。
 
     体检之后还有一道鉴权闸门（`_task_command_auth_ok`，S1）：接口已经回过
     "缺 Authorization 头"（复盘 PK591784 的 R16 401）而命令里一点鉴权材料都
@@ -3999,6 +4026,15 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
 LLM_HEREDOC_PATTERN = re.compile(r"(?<!<)<<(?![<=])")
 
 
+# 命令从标准输入那个"设备文件"读数据的样子（S1，PK592176 的 R16）：沙盒里没有
+# `/dev/stdin` 这个节点，而沙盒命令是"一回合一条、后台非交互"下发的——没有
+# 任何东西接到它的标准输入上。`cat /dev/stdin`、`python3 -c "open('/dev/stdin')"`
+# 这类写法必然只换来一行 `FileNotFoundError: '/dev/stdin'`（或 `No such file`），
+# 答案区空着、一个任务回合白搭，而正确的做法（读文件、调接口、`echo | cmd`）
+# 本来就在执行器的兜底路径里。`/dev/fd/N` 是同一个东西的另一种写法，一并挡掉。
+LLM_STDIN_PATTERN = re.compile(r"/dev/stdin|/dev/fd/")
+
+
 def _shell_command_ok(command: str) -> bool:
     """LLM 给的沙盒命令能不能直接交给 bash 跑（引号成对、单行、不带 heredoc）
 
@@ -4007,16 +4043,20 @@ def _shell_command_ok(command: str) -> bool:
     复盘 PK590881 的 R14 就是这么白丢一个回合的——沙盒输出里连任务标识都
     没有，`_task_answer` 只能判 `no_marker`，下一回合从头再来。
 
-    体检看三件事：
+    体检看四件事：
         - 单/双引号各自成对（不区分转义）
         - 不含换行（换行会把命令拆成多行，末尾的 `[TASK_END]` 会被卷进命令体）
         - 不含 heredoc 重定向（结束符独占一行，单行命令里收不了尾，末标记
           与退出码一起被吞掉，见 `LLM_HEREDOC_PATTERN`）
+        - 不从 `/dev/stdin` 取数据（沙盒里没有这个节点、也没有输入接上来，
+          见 `LLM_STDIN_PATTERN`）
 
     成对性不看转义，`echo "a\\"b"` 这类合法写法会被一并挡掉；heredoc 也一样，
     `grep -o 'a<<b' file` 这类把 `<<` 当数据的命令会被误伤。两者都按同一个
     取舍办：宁可漏放一条，交给执行器自己去取数（`_sandbox_command` 的兜底
-    路径），也不拿一个回合去赌一条可能跑不起来的命令。
+    路径），也不拿一个回合去赌一条可能跑不起来的命令。`/dev/stdin` 那条同理：
+    少了这条命令不等于少一次取数，执行器照旧会把候选地址真调一遍，而
+    `_task_prompt` 下一回合还会再问一次（次数受 `TASK_LLM_MAX_PROMPTS` 约束）。
 
     参数:
         command: LLM 给的取数命令（单行）
@@ -4027,6 +4067,8 @@ def _shell_command_ok(command: str) -> bool:
     if not command or "\n" in command or "\r" in command:
         return False
     if LLM_HEREDOC_PATTERN.search(command):
+        return False
+    if LLM_STDIN_PATTERN.search(command):
         return False
     return all(command.count(quote) % 2 == 0 for quote in ('"', "'"))
 
@@ -6928,10 +6970,17 @@ def _wall_target(turn: Turn, plan: LlmPlan) -> int:
     直接贴脸打基地（复盘里"防守方围墙 0 段、正面无任何阻挡、射程只覆盖基地
     贴脸区"）。进攻方不受影响，仍然完全按 LLM 计划走（0 段就是不铺）。
 
+    下限不是一个"有没有墙"的开关，而是一条连续的墙线（S3）：`_calc_wall_order`
+    按"先来敌方向、再上左下右"逐格排，前 N 格就是来路上连着的一段，铺够
+    `DEFENDER_WALL_QUOTA` 段之前每个回合都会把它当正事办——单段孤立墙
+    （PK592123/PK592176 里全场只有 (33,12) 那一段）机器人绕一步就进来了。
+
     配额管的是"今天要铺几段"这个目标：配额没铺满时工人优先采石、先施工，
     矿石不急着变现、金币也留到围墙立起来再花（见 `_worker_day_logic`）。
     地图上既没有石矿、背包里也没有存货时限额自动失效——没有石材就铺不出墙，
-    再扣着经济线只会让矿石卖不掉、金币闲置。
+    再扣着经济线只会让矿石卖不掉、金币闲置。围墙圈上剩下的格子比下限还少时
+    （基地贴地图边、圈被裁掉一角）同样按剩下的格子算：要求一条铺不满的整线，
+    只会把升级与买券的钱永远压在石材线上（见 `_wall_holes`）。
 
     参数:
         turn: 当前回合信息
@@ -6947,7 +6996,11 @@ def _wall_target(turn: Turn, plan: LlmPlan) -> int:
             WALL_MATERIAL in unit.backpack for unit in turn.workers()
         )
         if has_stone:
-            return max(plan.wall, DEFENDER_WALL_QUOTA)
+            # 墙线还差几段就按几段算（S3）：基地贴地图边、围墙圈被裁掉一角时，
+            # 圈上根本没那么多可铺的格子——照 `DEFENDER_WALL_QUOTA` 硬要求一条
+            # 整线的话配额永远铺不满，升级与买券的钱会被一直压在石材线上
+            holes = len(_wall_holes(turn))
+            return min(max(plan.wall, DEFENDER_WALL_QUOTA), holes)
     return plan.wall
 
 

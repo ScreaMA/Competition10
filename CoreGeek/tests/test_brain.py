@@ -1831,6 +1831,9 @@ def test_task_error_body_matches_only_error_shapes():
         "cat: task_1_beijing.md: No such file or directory",
         '{"status":"error","message":"Endpoint not found: /api/docs"}',
         "curl: (23) Failed writing body",
+        # 沙盒里不存在的设备节点（PK592176 的 R16）：异常名后面只有路径，
+        # 不带 `No such file or directory` 那句整话
+        "FileNotFoundError: '/dev/stdin'",
     )
     good = (
         "Forbidden City 故宫博物院",
@@ -2674,7 +2677,9 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
     """计划把围墙压到 0 段时，防守方仍按下限先铺墙
 
     回归：防守方整天 0 段围墙、正面毫无阻挡，机器人直接贴脸打基地，
-    而同局的进攻方反倒把来路封得严严实实。
+    而同局的进攻方反倒把来路封得严严实实。下限是一条连续墙线
+    （`DEFENDER_WALL_QUOTA` = 3 段）：单段墙机器人绕一步就进来了
+    （PK592123/PK592176 里防守方全场只有 (33,12) 那一段）。
     """
 
     def _payload(team_type: str) -> dict:
@@ -2707,7 +2712,7 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
         "name": WALL,
     }
     # LLM 看到的配额也是执行层真正要铺的段数（建议与指令同源）
-    assert "优先铺围墙 1 段" in prompt
+    assert f"优先铺围墙 {brain.DEFENDER_WALL_QUOTA} 段" in prompt
 
     # 铜矿工人不砌墙：手里的矿石照卖，经济线不被"还差一段墙"扣住
     assert commands["10012"] == {
@@ -2723,6 +2728,104 @@ def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
         "name": COPPER_MINE,
         "num": SELL_BATCH,
     }
+
+
+def test_defender_wall_quota_is_a_continuous_line(payload_factory):
+    """下限是一条连着的墙线（≥3 段），不是"有一格就算达标"
+
+    PK592123/PK592176 两场里防守方全场只有一段墙（(33,12)），机器人从旁边
+    绕一步就进了基地，R16 基地单回合掉 1350 血；`_calc_wall_order` 给出的
+    墙位是按来敌方向逐格连着的，下限 3 段就是来路上连续的一段。
+    进攻方仍完全按计划走，地图上没有石材来源时下限同样失效（否则矿石卖不掉、
+    金币一直闲置，见 `_wall_target`）。
+    """
+    with_stone = Turn.load(
+        payload_factory(team_type="defender", zones=[(STONE_MINE, 4, 24)])
+    )
+    assert brain.DEFENDER_WALL_QUOTA >= 3
+    assert brain._wall_target(with_stone, LLM_PLAN_DEFAULT) == (
+        brain.DEFENDER_WALL_QUOTA
+    )
+
+    challenger = Turn.load(
+        payload_factory(team_type="challenger", zones=[(STONE_MINE, 4, 24)])
+    )
+    assert brain._wall_target(challenger, LLM_PLAN_DEFAULT) == 0
+
+    no_stone = Turn.load(
+        payload_factory(team_type="defender", zones=[(VENDOR, 20, 16)])
+    )
+    assert brain._wall_target(no_stone, LLM_PLAN_DEFAULT) == 0
+
+
+def test_defender_keeps_building_wall_line_before_cashing_stone(
+    payload_factory, role_factory,
+):
+    """墙线还欠着时先砌墙：手里的石材不提前换金币（S3）
+
+    回归：PK592123/PK592176 里防守方全场只有一段墙——下限是 1 段的旧口径下，
+    铺满第一段 `wall_quota` 就解除，手里的石材在"金币见底"这条兜底里被卖成
+    金币（工人就站在小贩旁边），剩下的墙位再没人管，来路一直敞着。现在下限
+    是一条连着的墙线：还欠着的时候石材是砌墙的料，不是可卖的资源。
+    """
+    order = _calc_wall_order(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=WALL_FIRST_ROUND + 5,  # 开局防线窗口之外
+        gold=0,
+        team_type="defender",
+        roles=[
+            # 已经立起来的一段墙（不在施工顺位首位，工人仍该去补更靠前的一段）
+            role_factory(10020, WALL, order[-1].x, order[-1].y),
+            # 石工背着两块石材、站在墙位旁，小贩就在隔壁
+            role_factory(
+                10010, WORKER, 12, 26, backPackCapability=100,
+                backpack=[WALL_MATERIAL] * 2,
+            ),
+        ],
+        zones=[(VENDOR, 12, 27)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 13, "y": 26}],
+        "name": WALL,
+    }
+
+
+def test_stone_reserve_stops_batching_once_stone_in_hand(
+    payload_factory, role_factory,
+):
+    """手里攥着石材就先回去砌墙，两手空空时才按还欠的段数一次性带回（S3）
+
+    墙线（`DEFENDER_WALL_QUOTA` 段）没铺满时，照"还欠几段"去攒的话工人要先
+    在矿点采满整条线的料才动身，首段围墙又被拖到后面（PK589253 的首段围墙
+    拖到 R15）；手里有料就先砌最近那一段，剩下的下一趟再补。
+    """
+    stocked = Turn.load(payload_factory(
+        team_type="defender",
+        gold=0,
+        roles=[
+            role_factory(
+                10010, WORKER, 13, 27, backPackCapability=100,
+                backpack=[WALL_MATERIAL],
+            ),
+        ],
+        zones=[(STONE_MINE, 12, 27)],
+    ))
+    plan = _day_plan(stocked, stocked.workers()[0])
+    assert brain._stone_reserve(stocked, plan, True) == WALL_STONE_COST
+
+    empty = Turn.load(payload_factory(
+        team_type="defender",
+        gold=0,
+        roles=[role_factory(10010, WORKER, 13, 27, backPackCapability=100)],
+        zones=[(STONE_MINE, 12, 27)],
+    ))
+    empty_plan = _day_plan(empty, empty.workers()[0])
+    assert brain._stone_reserve(empty, empty_plan, True) == (
+        brain.DEFENDER_WALL_QUOTA
+    )
 
 
 # === 金币阶梯与资金闲置（issue #28） ===
@@ -4380,6 +4483,26 @@ def test_shell_command_check_rejects_heredoc():
     ):
         assert not brain._shell_command_ok(command), command
     assert brain._shell_command_ok('curl -s http://localhost:8899/w <<< "x"')
+
+
+def test_shell_command_check_rejects_stdin_readers():
+    """从 /dev/stdin 取数的命令一律不合格（S1：沙盒里没有这个节点）
+
+    复盘 PK592176 的 R16：沙盒执行这条命令只回了一行
+    `FileNotFoundError: '/dev/stdin'`——沙盒命令是后台非交互下发的，标准输入上
+    没有任何东西，`/dev/stdin` 这个设备节点也不在；答案区空着、一个任务回合
+    白搭。丢掉它改走执行器兜底（执行器读文件、调接口，不碰标准输入），
+    LLM 下一回合照旧会被再问一次。普通命令与 `echo | cmd` 这类管道不受影响。
+    """
+    for command in (
+        "cat /dev/stdin",
+        "python3 -c \"print(open('/dev/stdin').read())\"",
+        "jq . /dev/stdin",
+        "cat /dev/fd/0",
+    ):
+        assert not brain._shell_command_ok(command), command
+    assert brain._shell_command_ok("cat /tmp/selfEvolutionTask/task_1_beijing.md")
+    assert brain._shell_command_ok('echo "北京" | curl -s -d @- http://localhost:8899/api')
 
 
 # 接口回过"缺 Authorization 头"的沙盒证据（PK591784 的 R16 就是这句）
