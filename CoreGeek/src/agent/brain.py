@@ -3,7 +3,7 @@
 对应设计文档 3.5 节。
 
 策略概览：
-    白天：工人优先建造武器工事（加特林/电磁狙击炮/火箭发射台），
+    白天：工人优先建造武器工事（火箭发射台/电磁狙击炮/加特林，射程优先），
           再采集石头建造围墙（先封敌方来路那一侧）；
           围墙建完后用富余资源换取金币和武器升级。
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
@@ -74,12 +74,26 @@ from .protocol import (
 )
 
 # 策略常量
-TOWER_LOADOUT = (GATLING, RAILGUN, ROCKET)  # 武器建造顺序
+# 武器建造顺序：射程优先（火箭 10 > 电磁狙击炮 6 > 加特林 3）。
+# 复盘里敌方开局就建射程 10 的火箭发射台，我方却先建射程 3 的加特林，
+# 机器人一路走到基地跟前才开始挨打；塔位本来就按方位分散（`_calc_tower_sites`），
+# 让射程最远的先落地，等于把敌方来路更早罩进火力网——复盘的原话就是
+# "武器优先级表（rocket 优先）…避免低射程 gatling"。
+# 塔型与塔位在这里一一绑定（`_worker_day_logic` 按下标取），
+# "说建哪座塔"与"建的是哪种武器"因此不会再脱节。
+TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)  # 武器建造顺序
 STONE_BATCH = 3  # 工人采集石头的批次大小（越小围墙越早开工）
 WALL_BUILD_PRIORITY = 1000  # 围墙建造优先级
 SELL_BATCH = 10  # 卖给小贩的矿石批次大小
 DUSK_ROUNDS = 5  # 天黑前提前回防的回合数
 MIN_TOWERS_BEFORE_NIGHT = 2  # 入夜前的最低火力：不足时优先抢建而不是回防待命
+# 开局回合数：每个游戏日的前几个回合内塔数有硬下限，不受 LLM 计划影响
+OPENING_ROUNDS = 2
+# 开局的塔数下限：复盘里"首日 3 回合只落地 1 座塔、R2 整回合零建造"，
+# 第 2 座塔拖到 R3 才开工，火力成型远慢于敌方（敌方 R3 单回合双建）。
+# 把"开局两回合内塔数 ≥ 2"写成硬阈值，不再看当天 LLM 计划的心情；
+# 塔已经有 2 座时这条下限不起作用，金币仍可按计划留给升级券。
+OPENING_MIN_TOWERS = 2
 # 入夜前的最低围墙段数：复盘里首夜防线只有一座光塔、零段围墙，这里要求
 # 临天黑时再抢铺一段（手里有石材才抢建，没石材仍然按原策略回防）
 MIN_WALLS_BEFORE_NIGHT = 2
@@ -1765,13 +1779,27 @@ def _llm_plan(payload: dict[str, Any]) -> LlmPlan:
     )
 
 
+def _opening_round(turn: Turn) -> bool:
+    """是否还在开局回合（每个游戏日的前 `OPENING_ROUNDS` 个回合）
+
+    按"每个游戏日"而不是"整局"计算：夜里塔可能被拆掉，第二天开局同样要
+    先把火力补回下限，否则白天又要在没有塔的情况下空转好几个回合。
+    """
+    return (turn.round_no - 1) % ROUNDS_PER_DAY < OPENING_ROUNDS
+
+
 def _tower_target(turn: Turn, plan: LlmPlan) -> int:
-    """本回合要保证建成的武器塔数量（含金币闲置熔断）
+    """本回合要保证建成的武器塔数量（含金币闲置熔断与开局下限）
 
     正常情况下就是 LLM 计划里的 `tower`（默认满编 3 座）；但金币已经攒到
     `GOLD_FLUSH_TOWERS`（够再建两座塔）时一律提到满编：复盘里"金币 75 只花
     25、余下 50 连躺三个回合"的根因就是计划把塔数配额压低后金币再没有出口。
     金币留在手里不产生任何防御力，宁可多建一座塔。
+
+    开局的前 `OPENING_ROUNDS` 个回合还额外有 `OPENING_MIN_TOWERS` 的硬下限：
+    复盘里"首日 3 回合只落地 1 座塔、R2 整回合零建造"，第 2 座塔拖到 R3 才
+    开工，而敌方同一局是单回合双建——火力成型的快慢不该由当天 LLM 计划决定。
+    塔数已经达标时这条下限不起作用，金币仍然可以按计划留给升级券。
 
     熔断只在金币富余时生效（阈值高于单座造价），所以 LLM 仍然可以为
     "留钱买升级券"而少建一座塔；`upgrade` 开关与围墙配额都不受影响。
@@ -1785,7 +1813,33 @@ def _tower_target(turn: Turn, plan: LlmPlan) -> int:
     """
     if turn.gold >= GOLD_FLUSH_TOWERS:
         return LLM_MAX_TOWERS
+    if _opening_round(turn):
+        return max(plan.tower, OPENING_MIN_TOWERS)
     return plan.tower
+
+
+def _tower_site_brief(turn: Turn, plan: LlmPlan) -> str:
+    """本回合前几座塔的坐标与对应武器（写进 prompt 的"最近可建位"）
+
+    塔型由 `TOWER_LOADOUT` 与塔位下标绑定，这里把执行层真正要建的
+    "坐标 -> 武器"直接摊给 LLM 看：建议里的布防方位因此有具体坐标可对，
+    也让复盘里"LLM 说补建第 2 座高伤塔、实际建的却是另一种武器"这类
+    "说的与做的对不上"不会再发生（塔型不受 LLM 文字左右，只会被照实告知）。
+
+    参数:
+        turn: 当前回合信息
+        plan: 本回合的LLM计划
+
+    返回:
+        形如 "rocket(12,23)、railgun(10,22)" 的塔位清单；没有可用塔位时给出说明
+    """
+    sites = _calc_tower_sites(turn, plan.defend)[:_tower_target(turn, plan)]
+    if not sites:
+        return "暂无可用塔位"
+    return "、".join(
+        f"{TOWER_LOADOUT[index % len(TOWER_LOADOUT)]}({site.x},{site.y})"
+        for index, site in enumerate(sites)
+    )
 
 
 def _plan_summary(turn: Turn, plan: LlmPlan) -> str:
@@ -1793,11 +1847,14 @@ def _plan_summary(turn: Turn, plan: LlmPlan) -> str:
 
     计划出自 `_calc_tower_sites`/任务排序等同一套决策函数，LLM 因此可以对
     具体数字提意见，而不是和指令生成器各说各话。塔数与围墙段数报的是
-    `_tower_target`/`_wall_target`（含金币闲置熔断与防守方下限），
-    所以 LLM 看到的就是执行层真正要建的座数/段数。
+    `_tower_target`/`_wall_target`（含金币闲置熔断、开局下限与防守方下限），
+    塔位清单也来自同一套 `_calc_tower_sites`，所以 LLM 看到的就是执行层
+    真正要建的座数/段数/坐标——复盘建议的"prompt 注入最近可建位坐标，
+    消除'先移动、下回合再建'的一回合延迟"。
     """
     return (
         f"武器目标 {_tower_target(turn, plan)} 座（现有 {len(turn.weapons())} 座）；"
+        f"塔位 {_tower_site_brief(turn, plan)}；"
         f"优先铺围墙 {_wall_target(turn, plan)} 段（现有 {len(turn.walls())} 段）；"
         f"升级券 {'可买' if plan.upgrade else '今天不买'}；"
         f"布防方位 {plan.defend or _enemy_brief(turn)}"
