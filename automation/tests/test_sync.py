@@ -535,3 +535,32 @@ def test_commit_all_without_pre_dirty_commits_everything(repo_pair):
     committed = sorted(_git(repo_pair, "show", "--name-only", "--format=", "HEAD").split())
     assert committed == ["a.txt", "b.txt"]
     assert pusher.has_changes() is False
+
+
+# === git status 解析（回归：前导空格） ===
+
+
+def test_porcelain_paths_mixed_states(repo_pair):
+    """回归：` M path`（已跟踪文件被修改）的前导空格不能吃掉
+
+    曾经因为 _git 统一 strip，` M CoreGeek/...` 被解析成 `oreGeek/...`，
+    提交时报 "pathspec 'oreGeek/...' did not match any files"。
+    """
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "code.txt").write_text("modified\n", encoding="utf-8")   # 已跟踪 -> " M"
+    (repo_pair / "untracked.txt").write_text("new\n", encoding="utf-8")   # 未跟踪 -> "??"
+
+    assert sorted(pusher.dirty_paths()) == ["code.txt", "untracked.txt"]
+    assert pusher.has_changes() is True
+
+
+def test_commit_all_accepts_modified_tracked_file(repo_pair):
+    """被修改的已跟踪文件必须能正常提交（路径解析正确）"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "code.txt").write_text("modified by task\n", encoding="utf-8")
+
+    assert pusher.commit_all("[Auto-Fix] #1: task") is True
+
+    committed = _git(repo_pair, "show", "--name-only", "--format=", "HEAD").split()
+    assert committed == ["code.txt"]
+    assert pusher.has_changes() is False

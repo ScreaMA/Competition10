@@ -73,8 +73,13 @@ class GitPusher:
 
     # === 基础操作 ===
 
-    def _git(self, *args: str, check: bool = False) -> GitResult:
-        """执行git命令"""
+    def _git(self, *args: str, check: bool = False, strip: bool = True) -> GitResult:
+        """执行git命令
+
+        strip=False 专供解析 `git status --porcelain`：其格式为 `XY <path>`，
+        未暂存的改动前面带一个空格（如 ` M path`），统一 strip 会吃掉前导空格，
+        再按列切分就会把路径首字符切掉（曾导致 git add -- oreGeek/... 报错）。
+        """
         command = ["git"]
         # 直连 GitHub 不通时，git 也需要走代理
         if self.proxy:
@@ -94,9 +99,10 @@ class GitPusher:
             LOGGER.exception("failed to run git")
             return GitResult(-1, "", str(exc))
 
+        stdout = completed.stdout or ""
         result = GitResult(
             completed.returncode,
-            (completed.stdout or "").strip(),
+            stdout.strip() if strip else stdout,
             (completed.stderr or "").strip(),
         )
         LOGGER.debug("git %s -> rc=%d", " ".join(args), result.returncode)
@@ -111,19 +117,39 @@ class GitPusher:
         result = self._git("rev-parse", "--abbrev-ref", "HEAD")
         return result.stdout or "main"
 
+    def _porcelain_paths(self) -> list[str]:
+        """解析 `git status --porcelain`，返回改动/未跟踪的文件路径
+
+        必须用 strip=False 的原始输出：` M path`（未暂存改动）的前导空格是
+        状态列的一部分，裁掉它会把路径首字符一起切掉。
+        """
+        result = self._git("status", "--porcelain", strip=False)
+        paths: list[str] = []
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:].strip()
+            # 重命名/复制: "old -> new"，取新路径
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1].strip()
+            # 含特殊字符时git会给路径加引号
+            if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+                path = path[1:-1]
+            if path:
+                paths.append(path)
+        return paths
+
     def has_changes(self) -> bool:
         """工作区是否存在未提交的改动"""
-        return bool(self._git("status", "--porcelain").stdout)
+        return bool(self._porcelain_paths())
 
     def dirty_paths(self) -> list[str]:
         """列出工作区中已改动/未跟踪的文件路径"""
-        lines = self._git("status", "--porcelain").stdout.splitlines()
-        return [line[3:].strip() for line in lines if line.strip()]
+        return self._porcelain_paths()
 
     def changed_files(self) -> list[str]:
         """列出改动的文件"""
-        lines = self._git("status", "--porcelain").stdout.splitlines()
-        return [line[3:].strip() for line in lines if line.strip()]
+        return self._porcelain_paths()
 
     def _auth_url(self) -> str:
         """生成带token的推送地址（仅用于push，不落盘）"""
