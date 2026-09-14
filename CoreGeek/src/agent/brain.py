@@ -12,17 +12,21 @@
 
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
 不依赖任何跨回合缓存，可自动适应矿区刷新、单位移动与视野变化。
-任务答案同理，直接从上一回合的沙盒输出（`lastCmdResult`）中解析。
+任务答案同理，直接从上一回合的沙盒输出（`lastCmdResult`）中解析；
+LLM 建议也从请求里的 `llmResp` 现解析成有界计划（`_llm_plan`），
+建议与指令出自同一套决策函数。
 """
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from .grid import next_step, get_neighbors, cells_in_range
 from .protocol import (
     Turn,
     Unit,
+    PlayerTask,
     Pos,
     distance,
     # 单位类型
@@ -101,10 +105,51 @@ ROBOT_THREAT = {
 TASK_FILE_PATTERN = re.compile(r"[A-Za-z0-9_./\\-]+\.(?:md|txt|json|csv|log)")
 # 沙盒输出中的任务标识前缀，用于确认输出属于当前任务
 TASK_MARKER = "[TASK]"
+# 沙盒输出中的答案结束标记：它之后的诊断信息（目录列表等）永远不会被当成答案
+TASK_END_MARKER = "[TASK_END]"
 
 # 是否在每天第一个回合提交LLM策略咨询prompt（可用环境变量 LLM_PROMPT=0 关闭）
 # 每个游戏日的LLM调用有限额，每天只请求一次以节省额度
 LLM_PROMPT_ENABLED = os.getenv("LLM_PROMPT", "1") != "0"
+
+# LLM 建议里可以被决策层执行的部分：只开放有限几个"旋钮"，让建议和指令
+# 出自同一套决策函数，而不是各说各话（复盘里的"LLM建议与指令脱节"）。
+LLM_PLAN_LINE = re.compile(r"PLAN\s*[:：]\s*(?P<body>[^\r\n]*)", re.IGNORECASE)
+LLM_PLAN_ITEM = re.compile(r"([A-Za-z_]+)\s*=\s*([A-Za-z0-9]+)")
+# 提示词里的占位写法用尖括号：LLM 照抄模板时不会被解析成"tower=0"这类误读
+LLM_PLAN_TEMPLATE = (
+    "PLAN: tower=<1-3> wall=<0-3> upgrade=<on|off>"
+    " defend=<left|right|up|down>"
+)
+LLM_PLAN_TRUE = ("on", "true", "yes", "1")
+LLM_PLAN_FALSE = ("off", "false", "no", "0")
+# 计划里塔数的下限：误读成 0 会让白天完全不设防，宁可保守也不接受
+LLM_MIN_TOWERS = 1
+LLM_MAX_TOWERS = len(TOWER_LOADOUT)
+LLM_MAX_WALLS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class LlmPlan:
+    """LLM 建议中被采纳的部分（全部有界，且都有保守默认值）
+
+    字段:
+        tower: 白天要保证建成的武器塔数量（LLM_MIN_TOWERS..LLM_MAX_TOWERS）
+        wall: 优先铺好的围墙段数（0..LLM_MAX_WALLS），0 表示没有配额
+        upgrade: 是否允许白天花金币买武器升级券
+        defend: 优先布防的方位（up/left/down/right），None 表示按默认顺序
+
+    默认值等价于"完全按客户端原策略执行"，所以 LLM 不回复 PLAN 行、
+    回复里字段缺失或值越界时，策略与改造前完全一致。
+    """
+
+    tower: int = LLM_MAX_TOWERS
+    wall: int = 0
+    upgrade: bool = True
+    defend: str | None = None
+
+
+LLM_PLAN_DEFAULT = LlmPlan()
 
 # 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
 TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
@@ -123,14 +168,16 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     输出: (角色ID字符串: 指令字典, 提交给LLM的prompt)
     """
     turn = Turn.load(payload)
+    # 上一回合的LLM建议解析成有界计划，和指令生成器共用（解析不出来时是默认计划）
+    plan = _llm_plan(payload)
     commands: dict[int, dict[str, Any]] = {}
 
     if turn.is_day:
-        _decide_day(turn, commands)
+        _decide_day(turn, commands, plan)
     else:
         _decide_night(turn, commands)
 
-    prompt = _generate_strategy_prompt(turn, payload)
+    prompt = _generate_strategy_prompt(turn, payload, plan)
 
     # 转换key为字符串
     return {str(key): value for key, value in commands.items()}, prompt
@@ -152,10 +199,20 @@ def sandbox_command(payload: dict[str, Any]) -> str:
 # === 白天决策 ===
 
 
-def _decide_day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
-    """白天策略: 建造、采集、任务"""
-    # 计算需要建造的位置
-    tower_sites = _calc_tower_sites(turn)
+def _decide_day(
+    turn: Turn,
+    commands: dict[int, dict[str, Any]],
+    plan: LlmPlan = LLM_PLAN_DEFAULT,
+) -> None:
+    """白天策略: 建造、采集、任务
+
+    参数:
+        turn: 当前回合信息
+        commands: 指令输出字典（角色ID -> 指令）
+        plan: 本回合的LLM计划（默认计划等价于原有策略）
+    """
+    # 计算需要建造的位置（塔位排序会参考敌我相对位置与LLM指定的布防方位）
+    tower_sites = _calc_tower_sites(turn, plan.defend)
     wall_order = _calc_wall_order(turn)
 
     # 统计已建造的武器和围墙
@@ -186,7 +243,8 @@ def _decide_day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
             _fall_back_to_weapons(turn, worker, claimed, commands)
             continue
         _worker_day_logic(
-            turn, worker, tower_sites, free_towers, free_walls, claimed, commands,
+            turn, worker, tower_sites, free_towers, free_walls, claimed,
+            commands, plan,
         )
 
     # 开拓者行为（任务、宝藏）
@@ -204,6 +262,7 @@ def _worker_day_logic(
     walls_missing: list[Pos],
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    plan: LlmPlan = LLM_PLAN_DEFAULT,
 ) -> None:
     """工人白天逻辑
 
@@ -216,6 +275,9 @@ def _worker_day_logic(
     建造位一旦认领（`claimed`）就归该工人：多个工人会分头去建不同的塔/
     围墙段，而不是几个人同时奔着同一个位置去，白走一趟还互相挡路。
 
+    `plan` 是LLM建议落下来的有界计划（见 `_llm_plan`）：今天要保证几座塔、
+    先铺几段围墙、能不能买升级券。默认计划与改造前的行为完全一致。
+
     参数:
         turn: 当前回合信息
         worker: 当前决策的工人
@@ -224,11 +286,19 @@ def _worker_day_logic(
         walls_missing: 尚未建造的围墙位置
         claimed: 已被其他角色占用的目标集合，用于避免多个角色争抢同一格
         commands: 指令输出字典（角色ID -> 指令）
+        plan: 本回合的LLM计划
     """
     economy = _is_economy_worker(turn, worker)
+    # 围墙配额还没铺满时先施工、不急着变现，对应复盘建议的
+    # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"
+    wall_quota = len(turn.walls()) < plan.wall
 
-    # 优先建造武器
-    if towers_missing and turn.gold >= WEAPON_BUILD_COST:
+    # 优先建造武器（计划里塔数已经够了就不再往塔上压金币）
+    if (
+        towers_missing
+        and len(turn.weapons()) < plan.tower
+        and turn.gold >= WEAPON_BUILD_COST
+    ):
         # 就近认领: 每个工人挑离自己最近的那座塔，两个工人自然分头开工，
         # 而不是都盯着建造顺序表里的第一座（都挤过去的结果是另一座塔整局没人管）
         picks = sorted(
@@ -254,8 +324,11 @@ def _worker_day_logic(
     # 把富余资源换成战力（武器升级 > 卖矿换金币）：
     # 围墙建完时人人有责；围墙没建完时由分工里的"经济工人"负责，
     # 否则要等近二十段围墙全部铺完才会花钱，金币会闲置一整天
-    if not walls_missing or economy:
-        if _upgrade_weapon_with_gold(turn, worker, claimed, commands):
+    # （围墙配额还没铺满时先铺墙，金币留到围墙立起来再花）
+    if (not walls_missing or economy) and not wall_quota:
+        if _upgrade_weapon_with_gold(
+            turn, worker, claimed, commands, allow=plan.upgrade,
+        ):
             return
         if _trade_logic(turn, worker, claimed, commands):
             return
@@ -269,8 +342,8 @@ def _worker_day_logic(
 
     # 如果旁边有矿且石头不足,采集
     # （负责矿石变现的工人跳过这一步：否则它会一直就地采石，
-    #   永远轮不到铁/铜，矿种分工就落空了）
-    if _mine_order(turn, worker)[0] == STONE_MINE:
+    #   永远轮不到铁/铜，矿种分工就落空了；但围墙配额没铺满时全员先采石）
+    if _mine_order(turn, worker, prefer_stone=wall_quota)[0] == STONE_MINE:
         mine = _adjacent_mine(turn, worker, STONE_MINE)
         if mine is not None and stones < STONE_BATCH:
             commands[worker.unit_id] = collect_command(mine)
@@ -287,7 +360,7 @@ def _worker_day_logic(
             return
 
     # 没石头(或暂时没位置建): 就近采矿; 采不到就把背包里的矿石卖掉腾地方
-    if _gather_logic(turn, worker, claimed, commands):
+    if _gather_logic(turn, worker, claimed, commands, prefer_stone=wall_quota):
         return
     _trade_logic(turn, worker, claimed, commands)
 
@@ -337,7 +410,12 @@ def _is_economy_worker(turn: Turn, worker: Unit) -> bool:
     return worker.unit_id != workers[0].unit_id
 
 
-def _mine_order(turn: Turn, worker: Unit) -> tuple[str, ...]:
+def _mine_order(
+    turn: Turn,
+    worker: Unit,
+    *,
+    prefer_stone: bool = False,
+) -> tuple[str, ...]:
     """该工人本回合的采集矿种顺序
 
     "矿种互补"只在还有另一名工人兜底采石材时成立：同一时刻最多一名工人去
@@ -347,11 +425,16 @@ def _mine_order(turn: Turn, worker: Unit) -> tuple[str, ...]:
     参数:
         turn: 当前回合信息
         worker: 待判断的工人
+        prefer_stone: 为 True 时全员石材优先（围墙配额还没铺满时用）
 
     返回:
         按优先级排序的矿种元组
     """
-    if len(turn.workers()) < 2 or not _is_economy_worker(turn, worker):
+    if (
+        prefer_stone
+        or len(turn.workers()) < 2
+        or not _is_economy_worker(turn, worker)
+    ):
         return SELLABLE_MINES
     return ECONOMY_MINE_ORDER
 
@@ -538,6 +621,8 @@ def _upgrade_weapon_with_gold(
     worker: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    *,
+    allow: bool = True,
 ) -> bool:
     """把富余金币换成武器升级券并用于武器（level1 -> level2）
 
@@ -552,6 +637,8 @@ def _upgrade_weapon_with_gold(
         worker: 当前决策的工人
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
+        allow: 是否允许花金币买券（LLM计划里"今天不买"时为 False，
+               已经买好的券仍然照用不误）
 
     返回:
         True 表示本回合已下达指令（购买/使用/移动），调用方应直接返回
@@ -582,8 +669,8 @@ def _upgrade_weapon_with_gold(
             return True
         return False
 
-    # 2. 金币足够: 去武器商店购买
-    if turn.gold < UPGRADE_GOLD or worker.backpack_full:
+    # 2. 金币足够且计划允许: 去武器商店购买
+    if not allow or turn.gold < UPGRADE_GOLD or worker.backpack_full:
         return False
 
     shop = _nearest_zone(turn, WEAPON_SHOP, worker.pos)
@@ -857,6 +944,10 @@ def _sandbox_command(turn: Turn) -> str:
     自进化类任务的原文描述通常形如“请阅读task_1_beijing.md”，需要在沙盒
     中读取对应文件后才能作答。命令带上任务标识，便于下一回合确认输出
     属于当前任务；已经拿到本任务的输出后就不再重复执行。
+
+    一条命令里尽量多拿信息（复盘里敌方逐次试错 401→400，白丢好几个回合）：
+    描述里的路径读不到时，按文件名在沙盒里再找一次；末尾附上目录列表作为
+    诊断线索。答案由 `TASK_END_MARKER` 界定，诊断信息不会被当成答案提交。
     """
     if not turn.phase_task or _task_answer(turn) is not None:
         return ""
@@ -866,7 +957,14 @@ def _sandbox_command(turn: Turn) -> str:
         return ""
 
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
-    return f'echo "{marker}"; cat -- "{target}" 2>&1'
+    # 描述里给的可能是带目录的路径，兜底搜索只按文件名找
+    base = target.replace("\\", "/").rsplit("/", 1)[-1]
+    read = (
+        f'cat -- "{target}" 2>/dev/null'
+        f' || find . -maxdepth 3 -type f -name "{base}" -exec cat -- {{}} + 2>&1'
+    )
+    scan = "ls -a -- . 2>&1 | head -40"
+    return f'echo "{marker}"; {read}; echo "{TASK_END_MARKER}"; {scan}'
 
 
 def _task_file(phase_task: str) -> str | None:
@@ -885,6 +983,8 @@ def _task_answer(turn: Turn) -> str | None:
 
     输出格式约定为 "[exitCode:N]\\n<输出>"（见接口文档），因此只有执行成功
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
+    答案取任务标识到 `TASK_END_MARKER` 之间的内容，命令末尾的诊断信息（目录
+    列表等）因此不会被误当成答案提交。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
@@ -896,7 +996,7 @@ def _task_answer(turn: Turn) -> str | None:
     if marker not in result or "[exitCode:0]" not in result:
         return None
 
-    answer = result.split(marker, 1)[1].strip()
+    answer = result.split(marker, 1)[1].split(TASK_END_MARKER, 1)[0].strip()
     if not answer or any(bad in answer for bad in TASK_ERROR_MARKERS):
         return None
     return answer
@@ -944,6 +1044,8 @@ def _gather_logic(
     worker: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    *,
+    prefer_stone: bool = False,
 ) -> bool:
     """保证工人每回合都有产出：按矿种分工就近采集
 
@@ -951,10 +1053,17 @@ def _gather_logic(
     一名采石、一名采铁/铜换金币，不会一起挤在同一个矿点上；分工里负责的矿种
     附近没有（或已被其他角色占住）时退回其他矿种，保证不会整回合没有指令。
 
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        prefer_stone: 为 True 时全员石材优先（围墙配额还没铺满时用）
+
     返回:
         True 表示本回合已下达采集或移动指令
     """
-    for mine_type in _mine_order(turn, worker):
+    for mine_type in _mine_order(turn, worker, prefer_stone=prefer_stone):
         if _go_mine(turn, worker, mine_type, claimed, commands):
             return True
     return False
@@ -1092,13 +1201,24 @@ def _footprint_distance(pos: Pos, footprint: tuple[Pos, ...]) -> int:
     return min(distance(pos, cell) for cell in footprint)
 
 
-def _calc_tower_sites(turn: Turn) -> tuple[Pos, ...]:
+def _calc_tower_sites(
+    turn: Turn,
+    preferred: str | None = None,
+) -> tuple[Pos, ...]:
     """计算武器塔建造位置（基地周围一圈）
 
     取基地 2x2 占地周围距离为1且可通行的格子，按上/左/下/右四个方位各取
-    一个代表点，再优先选择朝向地图内侧的三个方位（朝向内侧意味着有更大
-    的来敌空间），使三座武器覆盖不同方向而不挤在基地同一侧。
+    一个代表点，再按"先朝敌方来路、后朝地图内侧"的顺序取前三个，使三座
+    武器覆盖不同方向而不挤在基地同一侧，并优先罩住敌人来的那一侧
+    （复盘指出塔位只按地图空间选，没参考敌方来路）。
     分别对应加特林、电磁狙击炮、火箭发射台。
+
+    参数:
+        turn: 当前回合信息
+        preferred: LLM 计划指定的布防方位（up/left/down/right），None 表示自动
+
+    返回:
+        按建造顺序排列的武器塔位置（最多3个）
     """
     station = turn.station()
     if station is None:
@@ -1118,19 +1238,75 @@ def _calc_tower_sites(turn: Turn) -> tuple[Pos, ...]:
                 continue
             groups[_side_of(neighbor, xmin, xmax, ymax)].append(neighbor)
 
-    # 每个方位取最居中的一个格子作为代表，再按“朝向地图内侧”的程度排序
+    # 每个方位取最居中的一个格子作为代表，再按"敌人在哪边"排序
+    enemy_sides = _enemy_sides(turn)
     sites = [
         (side, _side_representative(side, cells))
         for side, cells in groups.items()
         if cells
     ]
     sites.sort(key=lambda item: (
+        _side_priority(item[0], enemy_sides, preferred),
         -_side_room(item[0], turn, xmin, xmax, ymin, ymax),
         TOWER_SIDES.index(item[0]),
     ))
 
     # 取前3个位置
     return tuple(pos for _, pos in sites[:3])
+
+
+def _enemy_sides(turn: Turn) -> frozenset[str]:
+    """敌方主力大致来自基地的哪几个方位
+
+    优先用可见的敌方基地定位来路（敌方单位都是从它出发的），看不到敌方基地
+    时退回最近的敌方单位。两个都看不到时返回空集合，塔位排序退回原来的
+    "朝地图内侧空间"，策略与改造前完全一致。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        方位集合（up/left/down/right 的子集）
+    """
+    station = turn.station()
+    if station is None:
+        return frozenset()
+
+    visible = [enemy for enemy in turn.enemies if enemy.is_alive]
+    candidates = [unit for unit in visible if unit.kind == STATION] or visible
+    if not candidates:
+        return frozenset()
+
+    enemy = min(
+        candidates,
+        key=lambda unit: (distance(unit.pos, station.pos), unit.pos.x, unit.pos.y),
+    )
+    dx = enemy.pos.x - station.pos.x
+    dy = enemy.pos.y - station.pos.y
+
+    sides = set()
+    if dx < 0:
+        sides.add("left")
+    elif dx > 0:
+        sides.add("right")
+    if dy < 0:
+        sides.add("down")
+    elif dy > 0:
+        sides.add("up")
+    return frozenset(sides)
+
+
+def _side_priority(
+    side: str,
+    enemy_sides: frozenset[str],
+    preferred: str | None,
+) -> int:
+    """塔位排序的第一权重：LLM 指定 > 朝敌方来路 > 其他"""
+    if preferred is not None and side == preferred:
+        return 0
+    if side in enemy_sides:
+        return 1
+    return 2
 
 
 def _side_of(pos: Pos, xmin: int, xmax: int, ymax: int) -> str:
@@ -1215,11 +1391,123 @@ def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
 # === LLM 策略咨询 ===
 
 
-def _generate_strategy_prompt(turn: Turn, payload: dict[str, Any]) -> str:
+def _llm_plan(payload: dict[str, Any]) -> LlmPlan:
+    """把上一回合的 LLM 建议（llmResp）解析成有界的作战计划
+
+    复盘里反复出现的"LLM建议与指令脱节"：建议内容从来没进过指令生成器。
+    这里只认 prompt 约定的 `PLAN:` 行，逐键做白名单 + 范围钳制——LLM 只能在
+    既有策略的旋钮里做选择，不能凭空发明动作：
+
+        tower   今天要保证建成的塔数（钳到 LLM_MIN_TOWERS..LLM_MAX_TOWERS）
+        wall    今天优先铺好的围墙段数（钳到 0..LLM_MAX_WALLS）
+        upgrade 今天是否允许买武器升级券
+        defend  优先布防的方位（up/left/down/right）
+
+    解析不出来时（没写 PLAN 行、字段缺失、值越界）逐项退回默认值，默认值
+    等价于改造前的策略，所以 LLM 不配合也不会让决策变差。建议里先复述了
+    prompt 的占位模板、再给出真正的计划时，按"先解析出来的值优先"合并，
+    模板本身（`tower=<1-3>` 这类尖括号写法）解析不出任何字段。
+
+    计划每回合都从 `llmResp` 现解析（不落任何跨回合缓存），因此它的生效
+    窗口与"报文里带着 LLM 回复"的回合一致，回复消失后自动回到默认计划；
+    塔位/塔数/围墙配额这些旋钮的作用期正好是开局那几天，与回复到达的时机
+    吻合。
+
+    参数:
+        payload: 判题系统原始请求（取 llmResp 字段）
+
+    返回:
+        解析后的计划；无法解析时返回 LLM_PLAN_DEFAULT
+    """
+    text = str(payload.get("llmResp") or "")
+    # 建议里可能先复述了 prompt 的占位模板、再给出真正的计划，
+    # 因此逐行扫所有 PLAN 行，按"先解析出来的值优先"合并，别被模板带偏
+    items: dict[str, str] = {}
+    for match in LLM_PLAN_LINE.finditer(text):
+        for key, value in LLM_PLAN_ITEM.findall(match.group("body")):
+            items.setdefault(key.lower(), value.lower())
+    if not items:
+        return LLM_PLAN_DEFAULT
+
+    def _bounded(key: str, default: int, low: int, high: int) -> int:
+        raw = items.get(key)
+        if raw is None or not raw.isdigit():
+            return default
+        return min(max(int(raw), low), high)
+
+    upgrade = LLM_PLAN_DEFAULT.upgrade
+    if items.get("upgrade") in LLM_PLAN_TRUE:
+        upgrade = True
+    elif items.get("upgrade") in LLM_PLAN_FALSE:
+        upgrade = False
+
+    defend = items.get("defend")
+    if defend not in TOWER_SIDES:
+        defend = None
+
+    return LlmPlan(
+        tower=_bounded(
+            "tower", LLM_PLAN_DEFAULT.tower, LLM_MIN_TOWERS, LLM_MAX_TOWERS,
+        ),
+        wall=_bounded("wall", LLM_PLAN_DEFAULT.wall, 0, LLM_MAX_WALLS),
+        upgrade=upgrade,
+        defend=defend,
+    )
+
+
+def _plan_summary(turn: Turn, plan: LlmPlan) -> str:
+    """把本回合的既定计划写成一句人话
+
+    计划出自 `_calc_tower_sites`/任务排序等同一套决策函数，LLM 因此可以对
+    具体数字提意见，而不是和指令生成器各说各话。
+    """
+    return (
+        f"武器目标 {plan.tower} 座（现有 {len(turn.weapons())} 座）；"
+        f"优先铺围墙 {plan.wall} 段（现有 {len(turn.walls())} 段）；"
+        f"升级券 {'可买' if plan.upgrade else '今天不买'}；"
+        f"布防方位 {plan.defend or _enemy_brief(turn)}"
+    )
+
+
+def _enemy_brief(turn: Turn) -> str:
+    """敌我相对方位，看不到敌方单位时说明塔位是按地图空间选的"""
+    sides = _enemy_sides(turn)
+    if not sides:
+        return "按地图内侧空间选择（当前看不到敌方单位）"
+    return "敌方来路 " + "/".join(side for side in TOWER_SIDES if side in sides)
+
+
+def _task_brief(turn: Turn) -> str:
+    """可接任务点的坐标/奖励/剩余回合，供LLM判断值不值得去做任务"""
+    valid = [task for task in turn.player_tasks if task.is_valid]
+    if not valid:
+        return ""
+    items = [
+        f"({task.task_position.x},{task.task_position.y}){task.score_reward}分"
+        + (f"/剩{task.timeout_rounds}回合" if task.timeout_rounds > 0 else "")
+        for task in valid[:2]
+    ]
+    return "：" + "；".join(items)
+
+
+def _generate_strategy_prompt(
+    turn: Turn,
+    payload: dict[str, Any],
+    plan: LlmPlan = LLM_PLAN_DEFAULT,
+) -> str:
     """生成提交给LLM的策略咨询prompt（每个游戏日只请求一次）
 
     接口文档规定每个游戏日有LLM调用次数限制（errorCode=5），
     因此只在每天的第一个回合请求一次，并带上上一回合的LLM回复作为上下文。
+
+    prompt 里一并给出"本回合既定计划"并要求最后回一行 `PLAN:`：建议因此
+    能落到具体数字上，回复里的 PLAN 行由 `_llm_plan` 解析回指令生成器
+    （复盘里的"策略与执行脱节"）。
+
+    参数:
+        turn: 当前回合信息
+        payload: 判题系统原始请求（取 llmResp 作为上下文）
+        plan: 上一回合LLM建议解析出的计划，用于说明当前策略
 
     返回:
         需要提交给LLM的prompt；本回合不需要咨询时返回空字符串
@@ -1242,8 +1530,12 @@ def _generate_strategy_prompt(turn: Turn, payload: dict[str, Any]) -> str:
         f"可控制角色: {len(turn.controllable())} 个",
         f"来袭机器人: {len(robots)} 个"
         f"（小型/中型/大型/BOSS尽量优先处理大型与BOSS）",
-        f"可领取任务点: {sum(1 for t in turn.player_tasks if t.is_valid)} 个",
+        f"可领取任务点: {sum(1 for t in turn.player_tasks if t.is_valid)} 个"
+        f"{_task_brief(turn)}",
+        f"本回合既定计划: {_plan_summary(turn, plan)}",
         "请用不超过5行中文说明：优先建造或升级什么、角色如何站位、是否值得去做任务。",
+        "最后一行必须输出作战计划，客户端会照它调整指令（值越界会被忽略）："
+        f"{LLM_PLAN_TEMPLATE}",
     ]
     if previous:
         lines.insert(1, f"上一回合LLM建议: {previous[:500]}")
