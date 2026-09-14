@@ -537,6 +537,18 @@ TASK_ERROR_BODY = re.compile(
     re.IGNORECASE,
 )
 
+# 答案与沙盒里读到的文档原文重合的判定（S1）：`TASK_ERROR_BODY` 挡的是"错误体"，
+# `_task_echo` 挡的是"复读任务描述"，但复盘 PK590851 的 R13 交上去的是沙盒里
+# 那份**接口文档**的原文（"# 国家文化遗产数字档案查询系统 — API 参考文档…"）
+# ——执行器把 `/docs` 这类地址取回来的文档正文当成了取数结果打进 `[SOLUTION]`
+# 段，四道闸门一道都没拦住，Judge 判 0 分；PK590847 的 R13–R16 沙盒里回读的
+# 也一直是同一份文档。这份文档既不在任务描述里，也不是错误体，只能靠"它长什么
+# 样"来认：执行器读到的接口文档、`_task_dump` 回读的任务文件，开头都留一行指纹，
+# 答案里出现这份指纹就说明交的是文档原文（判定见 `_task_text_answer`）。
+TASK_DOC_MARKER = "[DOC]"  # 执行器读到的接口文档开头（诊断行，供答案闸门比对）
+TASK_TEXT_HINT = 120  # 文档指纹取开头这些字符（空白归一化后）
+TASK_TEXT_HINT_MIN = 30  # 指纹短于这个长度不作数：太短的串容易误伤正常答案
+
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
     "challenger": (CHALLENGER_TASK_1, CHALLENGER_TASK_2),
@@ -3339,6 +3351,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
+    if _task_text_answer(answer, turn.last_cmd_result):
+        return None  # 把喂给 LLM 的那份文档原文抄回来，同样不是答案（S1）
     if _task_path_answer(answer):
         return None  # "ANSWER: <任务文件的路径>" 同样不是答案（S1）
     return answer
@@ -3361,6 +3375,8 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None
     if _task_error_body(answer):
         return None  # 命令把接口的错误提示打了出来，这一趟同样没取到数
+    if _task_text_answer(answer, turn.last_cmd_result):
+        return None  # 命令把沙盒里的文档原文打了出来（`cat 文档`），不是答案
     if _task_path_answer(answer):
         return None  # 命令只把任务文件的路径打了出来，不算取到数
     return answer
@@ -3462,6 +3478,8 @@ def _task_executor(task_path: str) -> str:
         .replace("__DATA__", repr(TASK_DATA_MARKER))
         .replace("__FAIL__", repr(TASK_API_FAIL_MARKER))
         .replace("__SCAN__", repr(TASK_SCAN_MARKER))
+        .replace("__DOC__", repr(TASK_DOC_MARKER))
+        .replace("__TEXT_HINT__", str(TASK_TEXT_HINT))
     )
     # 沙盒的解释器叫 python3 或 python，挑一个能用的（挑不到时脚本不会执行，
     # 答案区为空 -> 这一回合不提交，下一回合重来）。
@@ -3503,6 +3521,8 @@ SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
 FAIL = __FAIL__
 SCAN = __SCAN__
+DOC = __DOC__
+TEXT_HINT = __TEXT_HINT__
 SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
 
 
@@ -3705,6 +3725,14 @@ if not doc_files:
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
 print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
+# 接口文档的开头各打一行（DOC）：文档页被当成"取数结果"取回来时（`/docs`
+# 这类地址返回的就是文档本身），决策侧靠这些指纹认出"答案就是文档原文"
+# （见 `_task_text_answer`）。指纹必须排在 `[SOLUTION]` 段之前，取数失败时
+# 答案区为空、闸门也不会跟着失效。
+for path in doc_files:
+    hint = " ".join(read(path).split())[:TEXT_HINT]
+    if hint:
+        print(DOC, hint)
 
 deadline = time.time() + TIME_BUDGET
 calls = 0
@@ -3890,7 +3918,9 @@ def _task_answer(turn: Turn) -> str | None:
         2. 答案里不能出现任务描述里的中文长句（`_task_echo`）；
         3. 答案不能是接口的错误响应体（`_task_error_body`）：那说明这次取数
            其实失败了，只是失败信息被当成了正文；
-        4. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
+        4. 答案不能是沙盒里那份文档的原文（`_task_text_answer`）：PK590851 的
+           R13 交的就是接口文档原文，它是"取数取到了文档页"而不是答案；
+        5. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
            "该读哪个文件"当成了答案。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
@@ -3906,7 +3936,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     可解析的字段：`ok` / `llm_answer` / `no_marker`（本任务的沙盒输出还没到）/
     `exit_nonzero`（命令失败）/ `no_api_data`（取不到数）/ `error_in_output` /
     `short_or_missing` / `echo_task_text`（答案就是任务原文）/
-    `error_body`（答案是接口的错误响应体）/ `path_answer`（答案是一条文件路径）。
+    `error_body`（答案是接口的错误响应体）/ `doc_text`（答案是沙盒里那份文档的
+    原文）/ `path_answer`（答案是一条文件路径）。
     """
     if not turn.phase_task:
         return None, "no_task"
@@ -3942,6 +3973,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
         return None, "echo_task_text"
     if _task_error_body(answer):
         return None, "error_body"  # 交上去的是接口的错误提示，不是答案
+    if _task_text_answer(answer, result):
+        return None, "doc_text"  # 交上去的是沙盒里那份文档的原文，不是答案
     if _task_path_answer(answer):
         return None, "path_answer"  # 交上去的是一条路径：文件里问的答案还没拿到
     return answer, "ok"
@@ -3988,6 +4021,68 @@ def _task_error_body(answer: str) -> bool:
         True 表示这条答案是错误体的正文，不能提交
     """
     return TASK_ERROR_BODY.search(answer) is not None
+
+
+def _task_text_hints(result: str) -> list[str]:
+    """沙盒输出里那些文档的开头（供 `_task_text_answer` 比对）
+
+    两处来源：
+        - `[DOC]` 行：执行器读到的接口文档开头（见 `TASK_EXECUTOR`）；
+        - `[TASK_FILE]<路径>` 与 `[TASK_EOF]` 之间：`_task_dump` 回读的任务文件
+          正文（第一行是路径，后面才是内容）。
+
+    只取"开头"是有意的：原样复读的答案一定以文档开头起头，而正常取到的数据
+    不会整段等于某份文档的开头，误伤的窗口因此小到可以忽略。
+
+    参数:
+        result: 报文的 `lastCmdResult`（沙盒输出）
+
+    返回:
+        文档开头的字符串列表（顺序按输出里出现的先后）
+    """
+    hints = []
+    for line in result.splitlines():
+        if line.startswith(TASK_DOC_MARKER):
+            hints.append(line[len(TASK_DOC_MARKER):])
+    for chunk in result.split(TASK_FILE_MARKER)[1:]:
+        body = chunk.split(TASK_FILE_END, 1)[0]
+        _, _, text = body.partition("\n")  # 第一行是文件路径，后面才是正文
+        if text.strip():
+            hints.append(text)
+    return hints
+
+
+def _task_text_answer(answer: str, result: str) -> bool:
+    """答案是不是沙盒里某份文档（任务文件/接口文档）的原文（S1）
+
+    复盘 PK590851 的 R13 把接口文档原文交了上去（0 分），PK590847 的 R13–R16
+    沙盒里回读的也一直是同一份文档：`_task_echo` 只认任务描述里的中文长句，
+    文档不在任务描述里；`TASK_ERROR_BODY` 只认错误体，文档也不是错误——两道
+    闸门都拦不住，答案就这么交上去了。这里拿"沙盒里那些文档的开头"当指纹，
+    命中就不提交（下一回合照常重跑取数命令，等真正的数据）。
+
+    指纹与答案都先做空白归一化再比对：文档从沙盒里 `cat` 回来时行首缩进、
+    换行位置未必与取回的那一份逐字相同，而"是不是同一段文字"才是要判的东西。
+
+    判据只有输出里带得出的那几份文档：执行器把接口文档的开头打成了 `[DOC]` 行、
+    `_task_dump` 把任务文件读了回来（`[TASK_FILE]` 段），两者都没有的输出
+    （比如 LLM 自己给的一条 `cat 文档` 命令）这里比不了，交给上面几道闸门。
+
+    参数:
+        answer: 待提交的答案内容
+        result: 报文的 `lastCmdResult`（文档与文档指纹都在里面）
+
+    返回:
+        True 表示这条答案是沙盒里文档的原文，不能提交
+    """
+    head = " ".join(answer.split())
+    if not head:
+        return False
+    for text in _task_text_hints(result):
+        hint = " ".join(text.split())[:TASK_TEXT_HINT]
+        if len(hint) >= TASK_TEXT_HINT_MIN and hint in head:
+            return True
+    return False
 
 
 def _solution_answer(region: str, turn: Turn) -> str | None:
@@ -4043,6 +4138,10 @@ def _remember_task_answers(result: str) -> None:
     把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
     ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
 
+    沙盒里那份文档的原文同样不进缓存（`_task_text_answer`）：`/docs` 这类
+    地址把文档页当正文返回时，`[API]` 证据是有的，但缓存下来的仍然是文档
+    ——下一个任务点一到手就会把它当答案秒交（PK590851 的 R13 正是这么交的）。
+
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
     """
@@ -4052,7 +4151,12 @@ def _remember_task_answers(result: str) -> None:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and TASK_DATA_MARKER in evidence:
+        if (
+            name
+            and answer
+            and TASK_DATA_MARKER in evidence
+            and not _task_text_answer(answer, result)
+        ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
 

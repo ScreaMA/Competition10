@@ -33,6 +33,7 @@ from agent.brain import (
     STONE_PLAN_MAX,
     STONE_RESERVE_MIN,
     TASK_DATA_MARKER,
+    TASK_DOC_MARKER,
     TASK_END_MARKER,
     TASK_FILE_END,
     TASK_FILE_EXTS,
@@ -1879,6 +1880,174 @@ def test_task_brief_reports_error_body_reason(payload_factory, role_factory):
     )
     brief = brain.task_brief(Turn.load(payload))
     assert "state=error_body" in brief
+
+
+# === issue #92：答案不能是沙盒里读到的文档原文（PK590847/590851） ===
+
+# 沙盒里那份接口文档（复盘 PK590851 的 R13 交上去的就是它的原文）
+_DOC_TEXT = (
+    "# 国家文化遗产数字档案查询系统 — API 参考文档\n"
+    "## 接口列表\n"
+    "GET http://localhost:8899/heritage?city=<城市名>  查询该城市的文化遗产\n"
+    '响应体为 JSON：{"city": "北京", "items": [...]}\n'
+)
+
+
+def _doc_hint(text: str = _DOC_TEXT) -> str:
+    """执行器读到接口文档时打出的那行指纹（`[DOC]` + 文档开头）"""
+    return f"{TASK_DOC_MARKER}{' '.join(text.split())[:brain.TASK_TEXT_HINT]}"
+
+
+def _doc_echo_result(phase_task: str, task_file: str = "task_1_beijing.md") -> str:
+    """构造一条"取回来的是文档页本身"的沙盒输出（执行器视角）"""
+    return _sandbox_result(
+        phase_task,
+        f"{_doc_hint()}\n"
+        f"{TASK_DATA_MARKER} http://localhost:8899/docs => {len(_DOC_TEXT)}\n"
+        f"{TASK_SOLUTION_MARKER}{task_file}\n{_DOC_TEXT}\n{TASK_SOLUTION_END}\n"
+        f"{TASK_END_MARKER}\n",
+    )
+
+
+def test_sandbox_answer_rejects_api_doc_echo(payload_factory, role_factory):
+    """取回来的是接口文档页本身时不提交（复盘 PK590851 的 R13 交了文档原文）
+
+    执行器把 `/docs` 这类地址的正文当成"取到的数"打进 `[SOLUTION]` 段：
+    `_task_echo` 只认任务描述里的中文长句、`_task_error_body` 只认错误体，
+    文档两者都不是，原样交上去就是 Judge 的 0 分。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _doc_echo_result(phase_task)
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands
+    # 文档不是答案：沙盒命令继续下发，下一回合照常取数
+    assert sandbox_command(payload) != ""
+
+
+def test_sandbox_answer_rejects_task_file_read_back(payload_factory, role_factory):
+    """答案是沙盒里回读的任务文件正文时同样不提交
+
+    `_task_dump` 每回合把沙盒里的任务文件读回来（供答案缓存与文件名识别用），
+    这段正文出现在答案里说明交的是文件而不是取到的数。任务描述很短时
+    （"请阅读task_1_beijing.md" 里没有 6 个字的中文长句）`_task_echo` 抓不住，
+    只有这道闸门挡得住。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    task_text = (
+        "# 自进化任务 A-1：查询北京文化遗产\n"
+        "## 任务背景\n"
+        "请按接口文档取数后作答，答案要能通过 Judge 的校验。\n"
+    )
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task,
+        f"{TASK_DATA_MARKER} http://localhost:8899/heritage?city=beijing => 33\n"
+        f"{TASK_SOLUTION_MARKER}task_1_beijing.md\n{task_text}\n{TASK_SOLUTION_END}\n"
+        f"{TASK_END_MARKER}\n"
+        f"{TASK_FILE_MARKER}/tmp/selfEvolutionTask/task_1_beijing.md\n"
+        f"{task_text}\n{TASK_FILE_END}\n",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands
+
+
+def test_task_text_answer_matches_only_document_prefixes():
+    """`_task_text_answer` 的判定边界：只拦"复读文档开头"的答案
+
+    正常取到的数据（哪怕提到文档里的地址、字段名）一律放行——任务千变万化，
+    闸门只排掉"整段等于某份文档开头"这一种形态，误伤的窗口必须小到可以忽略。
+    """
+    result = f"{_doc_hint()}\n{TASK_DATA_MARKER} http://localhost:8899/docs => 4\n"
+
+    # 文档原文（或它的开头）出现在答案里 -> 拦下
+    assert brain._task_text_answer(_DOC_TEXT, result)
+    assert brain._task_text_answer(f"{_DOC_TEXT}\n以上是接口说明", result)
+    # 取数取到的数据 -> 放行
+    assert not brain._task_text_answer('{"city": "北京", "items": [7]}', result)
+    # 只重合一小段（地址、文档里的字段名）-> 放行
+    assert not brain._task_text_answer(
+        "GET http://localhost:8899/heritage?city=beijing 返回 3 条", result,
+    )
+    # 指纹本身太短时不作数（短文档的指纹撑不起"复读"的判定）
+    assert not brain._task_text_answer("北京 7", f"{TASK_DOC_MARKER}# API\n")
+    assert not brain._task_text_answer("", result)
+
+
+def test_cached_doc_text_is_not_submitted(payload_factory, role_factory):
+    """缓存里那条"答案"是文档原文时不能进缓存（提交闸门不能只拦一条路）
+
+    缓存是在执行器输出上直接建的（`_remember_task_answers`），只按取数证据
+    `[API]` 过滤；`/docs` 这类地址的正文照样带着 `[API]` 证据，缓存下来等于
+    把接口文档背了下来，下一个任务点一到手就会把它当答案秒交。
+    """
+    phase_task = "请阅读task_1_alpha.md"
+    brain._remember_task_answers(_doc_echo_result(phase_task, "task_1_alpha.md"))
+
+    assert "task_1_alpha.md" not in brain._TASK_ANSWER_CACHE
+
+    payload = payload_factory(
+        round_no=16,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    commands, _ = decide(payload)
+    assert "10011" not in commands
+
+
+def test_task_brief_reports_doc_text_reason(payload_factory, role_factory):
+    """`task_brief` 把"交上去的是沙盒里那份文档"写成 state=doc_text"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _doc_echo_result(phase_task)
+    brief = brain.task_brief(Turn.load(payload))
+    assert "state=doc_text" in brief
+
+
+def test_llm_answer_rejects_doc_echo(payload_factory, role_factory):
+    """LLM 把喂给它的接口文档原文当答案返回时不能交（照抄文档 ≠ 答案）
+
+    `_task_prompt` 会把沙盒里捞回来的任务文件与接口文档一起喂给 LLM，
+    LLM 完全可能把文档正文抄回来当作 `ANSWER:`——它和沙盒自己取回来的那份
+    一样，都不是答案。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    evidence = f"{_doc_hint()}\n{TASK_DATA_MARKER} http://localhost:8899/docs => 4\n"
+    decide(_llm_task_payload(
+        payload_factory, role_factory, phase_task, 11, evidence=evidence,
+    ))
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 12, evidence=evidence,
+    )
+    # LLM 把文档抄成一行贴回来（`ANSWER:` 只认一行，空白归一化后仍是文档原文）
+    payload["llmResp"] = f"ANSWER: {' '.join(_DOC_TEXT.split())}"
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
 
 
 # === 夜晚决策 ===
