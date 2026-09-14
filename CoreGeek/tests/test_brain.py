@@ -528,6 +528,160 @@ def test_worker_uses_upgrade_voucher_on_weapon(payload_factory, role_factory):
     }
 
 
+# === 工人分工与经济循环（issue #15） ===
+
+
+def test_worker_falls_through_to_gather_when_tower_unreachable(
+    payload_factory, role_factory,
+):
+    """塔位走不通时工人转去采集，而不是空手过一回合
+
+    回归：对战复盘里工人连续多回合只下 move、金币零增长——塔位走不通时
+    决策在建造分支直接返回，采集/建墙/交易一条都排不上。
+    """
+    worker_pos = Pos(5, 23)
+    stone_pos = Pos(4, 24)
+    # 把工人围住（只留石矿那一格），三座塔位它一座也够不着
+    enclosure = [pos for pos in get_neighbors(worker_pos) if pos != stone_pos]
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST,
+        roles=[
+            role_factory(
+                10010, WORKER, worker_pos.x, worker_pos.y, backPackCapability=100,
+            ),
+            *[
+                role_factory(40000 + index, WALL, pos.x, pos.y)
+                for index, pos in enumerate(enclosure)
+            ],
+        ],
+        zones=[(STONE_MINE, stone_pos.x, stone_pos.y)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "collect",
+        "targetPos": [{"x": stone_pos.x, "y": stone_pos.y}],
+    }
+
+
+def test_workers_split_mine_types(payload_factory, role_factory):
+    """两名工人按矿种分工：一名采石材（围墙），一名采铁/铜（换金币）
+
+    回归：以前两名工人只按"石矿 -> 铁矿 -> 铜矿"的顺序就近采，只要地图上
+    还剩别的石矿，负责变现的那名工人就会被石矿带着跑，铁/铜永远排不上，
+    金币整局没有产出（对战复盘里的"金币零增长"）。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(10012, WORKER, 20, 23, backPackCapability=100),
+        ],
+        # (35,5) 是远处那座没被第1名工人认领的石矿
+        zones=[(STONE_MINE, 4, 24), (STONE_MINE, 35, 5), (IRON_MINE, 20, 22)],
+    )
+    commands, _ = decide(payload)
+
+    # 第1名工人就地采石材
+    assert commands["10010"] == {
+        "action": "collect",
+        "targetPos": [{"x": 4, "y": 24}],
+    }
+    # 第2名工人不去抢石矿，就地采铁（矿石换金币这条收入线）
+    assert commands["10012"] == {
+        "action": "collect",
+        "targetPos": [{"x": 20, "y": 22}],
+    }
+
+
+def test_economy_worker_sells_ore_before_walls_done(
+    payload_factory, role_factory,
+):
+    """围墙还没建完，负责经济的工人也会把矿石卖给小贩换金币
+
+    回归：以前只有"围墙圈建完"或"没矿可采"时才会走到卖矿分支——这里地图上
+    还有石矿，占着经济分工的工人却被派去采石，手头那批矿石一直变不成金币
+    （对战复盘里的"金币连续多回合零增长"）。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(
+                10012, WORKER, 20, 17, backPackCapability=100,
+                backpack=[IRON_MINE] * SELL_BATCH,
+            ),
+        ],
+        # 石矿在远处，负责采石的工人有活干；卖矿的工人不该被它带着走
+        zones=[(STONE_MINE, 35, 5), (VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": IRON_MINE,
+        "num": SELL_BATCH,
+    }
+
+
+def test_economy_worker_buys_upgrade_before_walls_done(
+    payload_factory, role_factory,
+):
+    """三座武器都已建成、围墙还在施工时，富余金币就用来买武器升级券
+
+    回归：以前买券也卡在"围墙建完"这个条件上，围墙施工期间金币只进不出。
+    """
+    sites = _calc_tower_sites(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=1,
+        gold=UPGRADE_GOLD,
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(10012, WORKER, 20, 17, backPackCapability=100),
+            *[
+                role_factory(10020 + index, kind, pos.x, pos.y, attackRange=4)
+                for index, (kind, pos) in enumerate(zip(TOWER_LOADOUT, sites))
+            ],
+        ],
+        zones=[(WEAPON_SHOP, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10012"] == {
+        "action": "buy",
+        "name": WEAPON_UPGRADE_VOUCHER,
+        "num": 1,
+    }
+
+
+def test_economy_worker_skips_vendor_trip_close_to_night(
+    payload_factory, role_factory,
+):
+    """天黑前跑不到小贩就别出门：经济动作不能把角色拖在地图另一头
+
+    夜晚的武器要有角色操控才会开火（任务书4.4节），所以只在天黑前还剩
+    "往返路费"时才出发去卖矿。
+    """
+    payload = payload_factory(
+        round_no=DAY_ROUNDS - 10,  # 距天黑还有11回合，来不及跑一趟(20,16)
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(
+                10012, WORKER, 30, 20, backPackCapability=100,
+                backpack=[IRON_MINE] * SELL_BATCH,
+            ),
+        ],
+        zones=[(VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert "10012" not in commands
+
+
 # === 任务系统 ===
 
 

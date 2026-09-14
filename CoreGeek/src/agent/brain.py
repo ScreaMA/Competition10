@@ -77,6 +77,8 @@ UPGRADE_GOLD = 100  # 购买一张武器升级券所需金币
 
 # 可卖给小贩的矿石（按优先级排序，石矿既是围墙材料也是主要收入来源）
 SELLABLE_MINES = (STONE_MINE, IRON_MINE, COPPER_MINE)
+# 负责"矿石换金币"的工人的采集顺序：铁/铜是纯收入来源，石材只作兜底
+ECONOMY_MINE_ORDER = (IRON_MINE, COPPER_MINE, STONE_MINE)
 
 # 任务点排序权重：报文缺少 timeoutRounds 时用最大值，不抢占"临期优先"
 TASK_TIMEOUT_UNKNOWN = 10 ** 9
@@ -205,7 +207,7 @@ def _worker_day_logic(
 ) -> None:
     """工人白天逻辑
 
-    优先级: 建造武器工事 > 采集石头 > 建造围墙
+    优先级: 建造武器工事 > 换金币/升级武器(经济分工) > 采集石头 > 建造围墙
             > 围墙建完后: 武器升级 > 卖矿换金币 > 采集任意矿石
 
     任何分支最后都会落到"采集/交易"上，保证工人每回合都有产出，
@@ -223,6 +225,8 @@ def _worker_day_logic(
         claimed: 已被其他角色占用的目标集合，用于避免多个角色争抢同一格
         commands: 指令输出字典（角色ID -> 指令）
     """
+    economy = _is_economy_worker(turn, worker)
+
     # 优先建造武器
     if towers_missing and turn.gold >= WEAPON_BUILD_COST:
         # 就近认领: 每个工人挑离自己最近的那座塔，两个工人自然分头开工，
@@ -243,27 +247,35 @@ def _worker_day_logic(
                     # 认领建造位: 其他工人改去下一座塔,不会几个人挤在同一个位置上
                     claimed.add(site)
                     return
-            return
+            # 所有塔位这一回合都走不通（无路可走或被抢占）时不再空手过回合，
+            # 而是继续往下走：有石头就建围墙，否则去采集。复盘里工人连续多回合
+            # 只下 move、金币零增长，就是这里直接返回造成的。
 
-    # 围墙已建完: 把富余资源换成战力（武器升级 > 卖矿换金币）
-    if not walls_missing:
+    # 把富余资源换成战力（武器升级 > 卖矿换金币）：
+    # 围墙建完时人人有责；围墙没建完时由分工里的"经济工人"负责，
+    # 否则要等近二十段围墙全部铺完才会花钱，金币会闲置一整天
+    if not walls_missing or economy:
         if _upgrade_weapon_with_gold(turn, worker, claimed, commands):
             return
         if _trade_logic(turn, worker, claimed, commands):
             return
-        # 手里还没有可卖的矿石: 继续采集,攒够一批再换金币
-        _gather_logic(turn, worker, claimed, commands)
-        return
+        if not walls_missing:
+            # 手里还没有可卖的矿石: 继续采集,攒够一批再换金币
+            _gather_logic(turn, worker, claimed, commands)
+            return
 
     # 检查背包里的石头数量
     stones = worker.backpack.count(WALL_MATERIAL)
 
     # 如果旁边有矿且石头不足,采集
-    mine = _adjacent_mine(turn, worker, STONE_MINE)
-    if mine is not None and stones < STONE_BATCH:
-        commands[worker.unit_id] = collect_command(mine)
-        claimed.add(mine)
-        return
+    # （负责矿石变现的工人跳过这一步：否则它会一直就地采石，
+    #   永远轮不到铁/铜，矿种分工就落空了）
+    if _mine_order(turn, worker)[0] == STONE_MINE:
+        mine = _adjacent_mine(turn, worker, STONE_MINE)
+        if mine is not None and stones < STONE_BATCH:
+            commands[worker.unit_id] = collect_command(mine)
+            claimed.add(mine)
+            return
 
     # 如果有石头,去建造围墙（位置都被其他角色占住时继续往下走,别空转）
     if stones > 0:
@@ -302,6 +314,46 @@ def _retry_sites(
     if len(candidates) > 1 and turn.action_failed(unit.unit_id):
         return candidates[1:]
     return candidates
+
+
+def _is_economy_worker(turn: Turn, worker: Unit) -> bool:
+    """该工人是否负责"矿石换金币"这条经济线
+
+    分工按角色ID顺序静态划定，不依赖任何跨回合缓存：两名工人时第1名管石材
+    与围墙、第2名管矿石变现，于是两名工人不会一起挤在同一个矿点上，经济也
+    总有人推进；只剩一名工人（夜里阵亡后常见）时它兼顾两件事，否则金币会
+    一直闲置到围墙圈建完。
+
+    参数:
+        turn: 当前回合信息
+        worker: 待判断的工人
+
+    返回:
+        True 表示该工人负责卖矿换金币与武器升级
+    """
+    workers = turn.workers()
+    if len(workers) <= 1:
+        return True
+    return worker.unit_id != workers[0].unit_id
+
+
+def _mine_order(turn: Turn, worker: Unit) -> tuple[str, ...]:
+    """该工人本回合的采集矿种顺序
+
+    "矿种互补"只在还有另一名工人兜底采石材时成立：同一时刻最多一名工人去
+    采铁/铜换金币，其余人继续采石材保证围墙不停工；只剩一名工人时它必须
+    石材优先（围墙是防守的根本），所以退回默认顺序。
+
+    参数:
+        turn: 当前回合信息
+        worker: 待判断的工人
+
+    返回:
+        按优先级排序的矿种元组
+    """
+    if len(turn.workers()) < 2 or not _is_economy_worker(turn, worker):
+        return SELLABLE_MINES
+    return ECONOMY_MINE_ORDER
 
 
 def _pioneer_day_logic(
@@ -436,7 +488,8 @@ def _trade_logic(
 
     小贩收购价随世界新闻波动（任务书4.6.1节），卖出所得可用于购买升级券。
     背包还有空间时攒够一批再卖；背包已经满了就先卖掉手头最多的那种矿腾地方，
-    既换到金币又避免工人因为塞满背包而无法采集。
+    既换到金币又避免工人因为塞满背包而无法采集。小贩离得太远、跑一趟回不来
+    时不出门，先就近采集，等靠近了再卖（见 `_can_return_before_dusk`）。
 
     参数:
         turn: 当前回合信息
@@ -469,7 +522,9 @@ def _trade_logic(
         commands[worker.unit_id] = sell_command(mine_type, amount)
         return True
 
-    # 否则走向小贩
+    # 否则走向小贩（路太远、天黑前回不来时不出这趟门）
+    if not _can_return_before_dusk(turn, worker, vendor):
+        return False
     step = _step_toward(turn, worker, vendor, claimed)
     if step is not None:
         commands[worker.unit_id] = move_command(step)
@@ -519,6 +574,8 @@ def _upgrade_weapon_with_gold(
             )
             claimed.add(weapon.pos)
             return True
+        if not _can_return_before_dusk(turn, worker, weapon.pos):
+            return False
         step = _step_toward(turn, worker, weapon.pos, claimed)
         if step is not None:
             commands[worker.unit_id] = move_command(step)
@@ -537,6 +594,8 @@ def _upgrade_weapon_with_gold(
         commands[worker.unit_id] = buy_command(WEAPON_UPGRADE_VOUCHER)
         return True
 
+    if not _can_return_before_dusk(turn, worker, shop):
+        return False
     step = _step_toward(turn, worker, shop, claimed)
     if step is not None:
         commands[worker.unit_id] = move_command(step)
@@ -548,6 +607,25 @@ def _rounds_to_night(turn: Turn) -> int:
     """距离天黑还剩多少回合（含当前回合）"""
     day_round = (turn.round_no - 1) % ROUNDS_PER_DAY
     return DAY_ROUNDS - day_round
+
+
+def _can_return_before_dusk(turn: Turn, unit: Unit, target: Pos) -> bool:
+    """去 target 办完事，还来得及在天黑前回到基地吗
+
+    采集和建造都在基地旁边，来回一两回合就够；卖矿、买升级券却要跑到地图
+    另一头，跑远了回不来就会让夜晚的武器没人操控（任务书4.4节：武器要有
+    角色操控才会开火）。这里按"往返路费 + 提前回防的回合数"做个粗算，
+    路太远就不出这趟门。
+
+    参数:
+        turn: 当前回合信息
+        unit: 准备出门的单位
+        target: 目的地坐标
+
+    返回:
+        True 表示这一趟来回之后还剩回防时间
+    """
+    return _rounds_to_night(turn) > 2 * distance(unit.pos, target) + DUSK_ROUNDS
 
 
 def _needs_last_build(
@@ -867,15 +945,16 @@ def _gather_logic(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """保证工人每回合都有产出：按 石矿 -> 铁矿 -> 铜矿 的顺序就近采集
+    """保证工人每回合都有产出：按矿种分工就近采集
 
-    石矿是围墙材料，优先采；附近没有石矿（或已被其他角色占住）时退而采集
-    铁/铜，卖给小贩同样能换金币。这样工人不会出现"整回合没有任何指令"的空转。
+    石材是围墙材料，优先采；两名工人时按"矿种互补"分工（见 `_mine_order`），
+    一名采石、一名采铁/铜换金币，不会一起挤在同一个矿点上；分工里负责的矿种
+    附近没有（或已被其他角色占住）时退回其他矿种，保证不会整回合没有指令。
 
     返回:
         True 表示本回合已下达采集或移动指令
     """
-    for mine_type in SELLABLE_MINES:
+    for mine_type in _mine_order(turn, worker):
         if _go_mine(turn, worker, mine_type, claimed, commands):
             return True
     return False
