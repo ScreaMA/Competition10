@@ -18,6 +18,8 @@ from agent.brain import (
     SELL_BATCH,
     STONE_BATCH,
     TASK_END_MARKER,
+    TASK_FILE_END,
+    TASK_FILE_MARKER,
     TASK_MARKER,
     TASK_PROBE_MARKER,
     TOWER_LOADOUT,
@@ -29,6 +31,7 @@ from agent.brain import (
     _generate_strategy_prompt,
     _llm_plan,
     _pair_controllers_and_weapons,
+    _reserved_build_sites,
     _task_token,
     _valid_stand_cells,
     decide,
@@ -386,9 +389,12 @@ def test_units_avoid_standing_on_build_sites(payload_factory, role_factory):
     # (12,23) 是规划中的武器塔位置，(11,22) 的相邻格里包含它
     assert Pos(12, 23) in _calc_tower_sites(turn)
     assert Pos(12, 23) not in _valid_stand_cells(turn, worker, Pos(11, 22), set())
-    # 目标本身就是建造点时（走去施工）不过滤，否则相邻格全是建造位就无处落脚
+    # 目标本身就是建造点时（走去施工）也不许站在别的建造点上：站上去会把
+    # 那一格占住，另一名工人这一回合就建不成（issue #24 的"建造指令空转"）；
+    # 建造点之外一处也站不下时才退回旧行为（见
+    # `test_walk_to_tower_skips_other_build_sites`）
     assert Pos(13, 23) in _calc_wall_order(turn)
-    assert Pos(13, 23) in _valid_stand_cells(turn, worker, Pos(12, 23), set())
+    assert Pos(13, 23) not in _valid_stand_cells(turn, worker, Pos(12, 23), set())
 
     # 夜晚不施工，建造点可以正常站人（操控武器时站位更自由）
     night = Turn.load(payload_factory(
@@ -399,6 +405,78 @@ def test_units_avoid_standing_on_build_sites(payload_factory, role_factory):
     assert Pos(12, 23) in _valid_stand_cells(
         night, night.workers()[0], Pos(11, 22), set(),
     )
+
+
+def test_walk_to_tower_skips_other_build_sites(payload_factory, role_factory):
+    """走去施工时不在别的建造点上落脚，实在无处落脚才放行
+
+    回归：复盘里"R3 下了 rocket(30,8) 的建造指令，R4 金币仍是 50、塔也没出现"
+    ——目标本身是建造点时旧实现会整体放行建造点，角色于是顺路站到别的塔位/
+    墙位上，另一名工人这一回合就建不成。
+    """
+    tower = Pos(12, 23)
+    payload = payload_factory(
+        gold=0,
+        roles=[role_factory(10010, WORKER, 14, 25, backPackCapability=100)],
+    )
+    turn = Turn.load(payload)
+    worker = turn.workers()[0]
+
+    stands = _valid_stand_cells(turn, worker, tower, set())
+    assert stands  # 建造点之外还有落脚点，不会因为过滤建造点而无处可去
+    assert all(pos not in _reserved_build_sites(turn) for pos in stands)
+    assert Pos(13, 23) in _calc_wall_order(turn)  # 右侧围墙的建造位
+    assert Pos(13, 23) not in stands
+
+    # 建造点之外一处也站不下时退回旧行为：允许站在建造点上，
+    # 否则角色会因为"相邻格全是建造位"而永远建不起来
+    crowded = payload_factory(
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, 14, 25, backPackCapability=100),
+            role_factory(40001, WALL, 11, 22),
+            role_factory(40002, WALL, 12, 22),
+            role_factory(40003, WALL, 12, 24),
+            role_factory(40004, WALL, 13, 22),  # 围墙圈的入口，也不是建造点
+        ],
+    )
+    turn = Turn.load(crowded)
+    assert _valid_stand_cells(turn, turn.workers()[0], tower, set()) == [
+        Pos(13, 23), Pos(13, 24),
+    ]
+
+
+def test_second_worker_skips_build_when_gold_runs_out(
+    payload_factory, role_factory,
+):
+    """手里只够一座塔的钱时，第二个工人不再下注定失败的建造指令
+
+    回归：同一回合的金币要等结算才扣，`turn.gold` 一直是回合开始时的余额，
+    两名工人会各下一条 build，后一条白下（复盘里的"下了建造指令、下回合
+    金币没扣、塔也没出现"）。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST,  # 只够一座塔
+        roles=[
+            role_factory(10010, WORKER, 11, 22, backPackCapability=100),
+            role_factory(10012, WORKER, 9, 22, backPackCapability=100),
+        ],
+        zones=[(STONE_MINE, 8, 21), (IRON_MINE, 10, 21)],
+    )
+    commands, _ = decide(payload)
+
+    # 第一名工人把唯一一座塔建起来，金币被这一条指令占满
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 12, "y": 23}],
+        "name": GATLING,
+    }
+    # 第二名工人改去采集（经济分工里它负责铁/铜），不再空下一条 build
+    assert commands["10012"] == {
+        "action": "collect",
+        "targetPos": [{"x": 10, "y": 21}],
+    }
 
 
 def test_worker_falls_back_to_weapon_before_night(payload_factory, role_factory):
@@ -971,6 +1049,31 @@ def test_pioneer_falls_back_to_next_task_when_one_is_unreachable(
     assert distance(step, blocked_task) >= distance(before, blocked_task)
 
 
+def test_pioneer_waits_when_task_point_is_crowded(payload_factory, role_factory):
+    """有任务可领却这一回合走不动时，开拓者原地等，不退回去跟随武器塔
+
+    回归：走向任务点走不通时旧实现会掉到"跟随武器塔"，把开拓者带回基地，
+    下一回合再往外走——来回打转，复盘里"开拓者整局在基地附近徘徊、
+    从未靠近任务点"，两处任务点合计160分+160金币一直没人领。
+    """
+    task_pos = Pos(14, 14)
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[
+            role_factory(10011, PIONEER, 10, 12, backPackCapability=40),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+        tasks=[(task_pos.x, task_pos.y)],
+        # 任务点周围一格全是矿区（不可通行），这一回合开拓者挤不进去
+        zones=[(COPPER_MINE, pos.x, pos.y) for pos in get_neighbors(task_pos)],
+    )
+    commands, _ = decide(payload)
+
+    # 原地等下一个回合，而不是朝基地方向的武器塔移动
+    assert "10011" not in commands
+
+
 def test_pioneer_waits_near_task_point_when_on_cooldown(
     payload_factory, role_factory,
 ):
@@ -1180,6 +1283,83 @@ def test_pioneer_submits_answer_from_sandbox(payload_factory, role_factory):
         "taskAnswer": "北京 晴 25摄氏度",
     }
     # 已有答案后不再重复执行沙盒命令
+    assert sandbox_command(payload) == ""
+
+
+def test_sandbox_command_dumps_task_files_for_cache(
+    payload_factory, role_factory,
+):
+    """读任务文件时顺带把任务目录里的文件都读回来，供后续任务直接作答
+
+    任务书5.3节要求把探索结果做成 SOP/SKILL（自进化），积分又按"完成回合 -
+    接取回合"倒扣：一次读回来缓存住，下一个任务点领到同一个任务就能立刻交卷。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task="请阅读task_1_beijing.md",
+    )
+    command = sandbox_command(payload)
+
+    assert TASK_FILE_MARKER in command
+    assert TASK_FILE_END in command
+    assert 'find "/tmp/selfEvolutionTask"' in command
+    # 整段 dump 排在答案结束标记之后，不会被当成当前任务的答案提交
+    assert command.index(TASK_END_MARKER) < command.index(TASK_FILE_MARKER)
+
+
+def test_task_cache_skips_failed_reads_and_keeps_first_answer():
+    """缓存不记"文件读不到"的输出，也不会被后来的输出覆盖"""
+    brain._remember_task_files(
+        "[exitCode:1]\n[TASK_FILE]/tmp/x/task_1_alpha.md\n"
+        "cat: /tmp/x/task_1_alpha.md: No such file or directory\n[TASK_EOF]\n"
+    )
+    assert brain._TASK_ANSWER_CACHE == {}
+
+    brain._remember_task_files(
+        "[TASK_FILE]/tmp/x/task_1_alpha.md\nalpha-answer\n[TASK_EOF]\n"
+    )
+    brain._remember_task_files(
+        "[TASK_FILE]/tmp/x/task_1_alpha.md\n乱码\n[TASK_EOF]\n"
+    )
+    assert brain._TASK_ANSWER_CACHE == {"task_1_alpha.md": "alpha-answer"}
+
+
+def test_pioneer_answers_from_cached_task_file(payload_factory, role_factory):
+    """沙盒里提前读回来的任务文件命中时，接取后立刻交卷
+
+    回归：复盘里敌方靠答案缓存两次提交各拿 155 分（任务奖励 80 +
+    5×标准回合数15/(完成回合-接取回合)1），我们每次都重新读一遍沙盒，
+    完成回合差至少 2 回合，分数被白白扣掉。
+    """
+    phase_task = "请阅读task_2_beijing.md"
+    payload = payload_factory(
+        round_no=2,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    # 上一个任务期间沙盒把任务目录里的文件都读回来过（含本次要用的这份）
+    payload["lastCmdResult"] = (
+        "[exitCode:0]\n"
+        "[TASK]上一个任务\n"
+        "[TASK_FILE]/tmp/selfEvolutionTask/task_1_alpha.md\n"
+        "alpha-answer\n"
+        "[TASK_EOF]\n"
+        "[TASK_FILE]/tmp/selfEvolutionTask/task_2_beijing.md\n"
+        "北京 晴 25摄氏度\n"
+        "[TASK_EOF]\n"
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": "北京 晴 25摄氏度",
+    }
+    # 已经有缓存答案，不必再花一个来回执行沙盒命令
     assert sandbox_command(payload) == ""
 
 

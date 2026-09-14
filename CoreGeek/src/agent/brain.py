@@ -7,16 +7,18 @@
           再采集石头建造围墙（先封敌方来路那一侧）；
           围墙建完后用富余资源换取金币和武器升级。
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
-          描述里没给文件名时先探测沙盒任务目录），
-          无任务时跟随武器塔；天黑前工人回防到武器旁，
+          描述里没给文件名时先探测沙盒任务目录，顺带把任务文件读回来
+          缓存备用，下一个任务点就能即时交卷），
+          有任务在身时不退回基地；天黑前工人回防到武器旁，
           但火力/围墙不达标时先抢建，角色不会整回合空转。
     夜晚：每个角色操控一座武器攻击机器人，优先攻击威胁最高的目标。
 
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
-不依赖任何跨回合缓存，可自动适应矿区刷新、单位移动与视野变化。
-任务答案同理，直接从上一回合的沙盒输出（`lastCmdResult`）中解析；
-LLM 建议也从请求里的 `llmResp` 现解析成有界计划（`_llm_plan`），
-建议与指令出自同一套决策函数。
+不依赖任何跨回合的战场状态，可自动适应矿区刷新、单位移动与视野变化。
+任务答案同理，直接从上一回合的沙盒输出（`lastCmdResult`）中解析，
+解析不到时再退到纯缓存 `_TASK_ANSWER_CACHE`（内容全部来自沙盒输出，
+未命中就走原来的读取流程）；LLM 建议也从请求里的 `llmResp` 现解析成
+有界计划（`_llm_plan`），建议与指令出自同一套决策函数。
 """
 
 import os
@@ -126,6 +128,21 @@ TASK_END_MARKER = "[TASK_END]"
 TASK_PROBE_MARKER = "[TASK_PROBE]"
 # 沙盒里自进化任务的目录约定：描述没给文件名时到这些目录里找任务文件
 TASK_PROBE_DIRS = ("/tmp/selfEvolutionTask", "/tmp/selfEvolution")
+# 任务文件分段标记：读任务文件时顺带把任务目录里的文件都读回来，
+# 每份用这两个标记包起来，`_remember_task_files` 据此按文件名缓存内容
+TASK_FILE_MARKER = "[TASK_FILE]"
+TASK_FILE_END = "[TASK_EOF]"
+# 单份任务文件最多读回的行数，避免一条命令的输出把响应体撑大
+TASK_FILE_LIMIT = 60
+
+# 任务答案缓存：文件名 -> 沙盒里读回来的内容
+# 任务书5.3节要求"根据任务1探索的内容形成固定SOP或者SKILL，实现Agent自进化"，
+# 积分又是"任务奖励 + 5 × 标准回合数 / (完成回合 - 接取回合)"（任务书第六章），
+# 交得越早分越高。沙盒里一次把任务文件都读回来存进这里，后续任务点领到同一个
+# 任务时，开拓者不必再等一个来回的沙盒输出，接取后下一回合就能直接作答
+# （复盘里敌方就是靠答案缓存秒交，两次提交各拿 155 分）。
+# 这是纯缓存：没有命中的任务仍然走"下发沙盒命令 -> 下一回合读输出"的原路径。
+_TASK_ANSWER_CACHE: dict[str, str] = {}
 
 # 是否提交LLM策略咨询prompt（可用环境变量 LLM_PROMPT=0 关闭）
 # 接口文档：每队每个游戏日的 LLM 调用额度为 3 次（自进化任务期间不计入），
@@ -189,6 +206,8 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     输出: (角色ID字符串: 指令字典, 提交给LLM的prompt)
     """
     turn = Turn.load(payload)
+    # 上回合沙盒读回来的任务文件按文件名缓存，后续任务一到手就能直接作答
+    _remember_task_files(turn.last_cmd_result)
     # 上一回合的LLM建议解析成有界计划，和指令生成器共用（解析不出来时是默认计划）
     plan = _llm_plan(payload)
     commands: dict[int, dict[str, Any]] = {}
@@ -302,6 +321,8 @@ def _idle_gather(
         - 本回合已经有指令的角色（决策层已经给了更优先的动作）
         - 任务进行中的开拓者：任务要求它留在任务点周围一格内，
           任何移动都可能让任务强制结束
+        - 有任务可领的开拓者：接任务、交任务是主要得分来源，被兜底支去采矿
+          等于把开拓者从任务点上拽走（它的任务优先级最高，见 `_pioneer_day_logic`）
         - 黄昏（调用方不调用）：回防到武器旁待命比多采一铲矿更重要，
           武器要有角色操控才会开火
 
@@ -313,11 +334,36 @@ def _idle_gather(
     """
     if unit.unit_id in commands:
         return
-    if unit.kind == PIONEER and turn.phase_task:
+    if unit.kind == PIONEER and (
+        turn.phase_task or any(task.is_valid for task in turn.player_tasks)
+    ):
         return
     for mine_type in SELLABLE_MINES:
         if _go_mine(turn, unit, mine_type, claimed, commands):
             return
+
+
+def _gold_left(turn: Turn, commands: dict[int, dict[str, Any]]) -> int:
+    """本回合还能支配的金币（扣掉已经发出去、回合结算时才扣款的建造指令）
+
+    同一回合里我们会依次给每个角色下指令，但金币要等回合结算才真正减少，
+    `turn.gold` 从头到尾都是回合开始时的余额。手里只够一座塔的钱时，
+    两名工人会各自下发一条 build，后一条注定失败——复盘里的"下了建造指令、
+    下回合金币没扣、塔也没出现"就是这么来的。
+
+    参数:
+        turn: 当前回合信息
+        commands: 本回合已经发出的指令
+
+    返回:
+        扣掉已发建造指令后的余额
+    """
+    spent = sum(
+        WEAPON_BUILD_COST
+        for command in commands.values()
+        if command.get("action") == "build" and command.get("name") in TOWER_TYPES
+    )
+    return turn.gold - spent
 
 
 def _worker_day_logic(
@@ -361,11 +407,13 @@ def _worker_day_logic(
     # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"（防守方还有下限，见 `_wall_target`）
     wall_quota = len(turn.walls()) < _wall_target(turn, plan)
 
-    # 优先建造武器（塔数由 `_tower_target` 决定：计划配额 + 金币闲置熔断）
+    # 优先建造武器（塔数由 `_tower_target` 决定：计划配额 + 金币闲置熔断）。
+    # 余额按 `_gold_left` 算：本回合已经发出去的建造指令结算时才扣款，
+    # 只够一座塔的钱时第二个工人不该再下一条注定失败的 build。
     if (
         towers_missing
         and len(turn.weapons()) < _tower_target(turn, plan)
-        and turn.gold >= WEAPON_BUILD_COST
+        and _gold_left(turn, commands) >= WEAPON_BUILD_COST
     ):
         # 就近认领: 每个工人挑离自己最近的那座塔，两个工人自然分头开工，
         # 而不是都盯着建造顺序表里的第一座（都挤过去的结果是另一座塔整局没人管）
@@ -517,7 +565,9 @@ def _pioneer_day_logic(
 ) -> None:
     """开拓者白天逻辑
 
-    优先级: 维持进行中的任务（含提交答案） > 前往任务点领取任务 > 跟随武器塔
+    优先级: 维持进行中的任务（含提交答案，命中答案缓存时接取后即交卷）
+            > 前往任务点领取任务（本回合走不动就原地等，不退回去跟随武器塔）
+            > 跟随武器塔（只在没有任何可接任务时才做）
 
     任务规则（任务书5章）:
         - 开拓者需在己方任务点周围一格内领取任务
@@ -549,8 +599,9 @@ def _pioneer_day_logic(
                 if step is not None:
                     commands[pioneer.unit_id] = move_command(step)
                 return
-            # 沙盒命令的输出上一回合才返回，这里按任务标识取出本任务的答案
-            answer = _task_answer(turn)
+            # 沙盒命令的输出上一回合才返回，这里按任务标识取出本任务的答案；
+            # 沙盒里之前已经读过同一个任务文件时直接交卷，不必再等一个来回
+            answer = _task_answer(turn) or _cached_answer(turn)
             if answer is not None:
                 commands[pioneer.unit_id] = submit_answer_command(answer)
             return
@@ -569,9 +620,14 @@ def _pioneer_day_logic(
         for task in ordered:
             if _head_to_task(turn, pioneer, task.task_position, claimed, commands):
                 return
+        # 这一步走不动时留在原地等下一个回合（同伴让开、路就通了），
+        # 而不是掉头回基地跟随武器塔——那等于往相反方向走，下一回合再往外走，
+        # 来回打转永远到不了任务点（复盘里的"开拓者整局在基地附近徘徊、
+        # 从未靠近任务点"，两处任务点合计160分+160金币一直没人领）
+        return
 
     # 3. 任务点都在冷却中: 冷却快结束时提前到任务点旁待命，任务一开放就能接
-    elif _rounds_until_task(turn) <= TASK_WAIT_ROUNDS:
+    if _rounds_until_task(turn) <= TASK_WAIT_ROUNDS:
         task_pos = _nearest_task_position(turn, pioneer.pos)
         if task_pos is not None and _head_to_task(
             turn, pioneer, task_pos, claimed, commands,
@@ -779,7 +835,7 @@ def _upgrade_weapon_with_gold(
         return False
 
     # 2. 金币足够且计划允许: 去武器商店购买
-    if not allow or turn.gold < UPGRADE_GOLD or worker.backpack_full:
+    if not allow or _gold_left(turn, commands) < UPGRADE_GOLD or worker.backpack_full:
         return False
 
     shop = _nearest_zone(turn, WEAPON_SHOP, worker.pos)
@@ -1063,8 +1119,17 @@ def _sandbox_command(turn: Turn) -> str:
     `_sandbox_probe` 探一次沙盒任务目录，下一回合从探测结果里认出文件名
     再走上面的读文件流程——复盘里"任务卡在任务点反复答非所问、整个任务
     周期空转"就是从"不知道该读哪个文件"开始的。
+
+    答案取完之后再顺带把任务目录里的文件都读回来（`[TASK_FILE]` 分段），
+    交给 `_remember_task_files` 按文件名缓存：下一个任务点领到同一个任务时
+    开拓者不必再等一个来回的沙盒输出，接取后下一回合就能直接作答。
+    这一段排在 `TASK_END_MARKER` 之后，永远不会被当成当前任务的答案。
     """
-    if not turn.phase_task or _task_answer(turn) is not None:
+    if (
+        not turn.phase_task
+        or _task_answer(turn) is not None
+        or _cached_answer(turn) is not None
+    ):
         return ""
 
     # 描述里没给文件名时，用上一回合的探测结果找；还没探过就先探一次
@@ -1080,7 +1145,27 @@ def _sandbox_command(turn: Turn) -> str:
         f' || find . -maxdepth 3 -type f -name "{base}" -exec cat -- {{}} + 2>&1'
     )
     scan = "ls -a -- . 2>&1 | head -40"
-    return f'echo "{marker}"; {read}; echo "{TASK_END_MARKER}"; {scan}'
+    return (
+        f'echo "{marker}"; {read}; echo "{TASK_END_MARKER}"; {scan}; {_task_dump()}'
+    )
+
+
+def _task_dump() -> str:
+    """读回任务目录里全部任务文件的沙盒命令（排在答案结束标记之后）
+
+    自进化类任务是一整套同构任务（任务书的例子是"查询北京/上海/广州天气"），
+    一次把任务目录里的文件都读回来，下一个任务点就不用再花一个来回等输出
+    （见 `_TASK_ANSWER_CACHE`）。只读文件名像任务文件的那几个，
+    免得把沙盒里的无关文档一起吃回来占用输出行数。
+    """
+    return "; ".join(
+        f'for f in $(find "{path}" -maxdepth 2 -type f'
+        ' \\( -name "task*" -o -name "spec*" \\) 2>/dev/null);'
+        f' do echo "{TASK_FILE_MARKER}$f";'
+        f' cat -- "$f" 2>&1 | head -{TASK_FILE_LIMIT};'
+        f' echo "{TASK_FILE_END}"; done'
+        for path in TASK_PROBE_DIRS
+    )
 
 
 def _sandbox_probe(turn: Turn) -> str:
@@ -1151,6 +1236,44 @@ def _task_answer(turn: Turn) -> str | None:
     if not answer or any(bad in answer for bad in TASK_ERROR_MARKERS):
         return None
     return answer
+
+
+def _remember_task_files(result: str) -> None:
+    """把沙盒里读回来的任务文件按文件名记进答案缓存
+
+    `_sandbox_command` 会把任务目录下的文件都读回来，每份用 `[TASK_FILE]`
+    （后跟完整路径）与 `[TASK_EOF]` 分段；这里把"文件名 -> 内容"存下来，
+    下一个任务点领到同一个任务时就能省掉一个来回的沙盒执行（见 `_cached_answer`）。
+
+    缓存只增不改（`setdefault`）：已经记下的内容不会被后来的输出覆盖，
+    读文件失败的输出（文件不存在等）同样不入缓存。
+
+    参数:
+        result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
+    """
+    for chunk in result.split(TASK_FILE_MARKER)[1:]:
+        path, _, body = chunk.partition("\n")
+        answer = body.split(TASK_FILE_END, 1)[0].strip()
+        name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
+        if name and answer and not any(bad in answer for bad in TASK_ERROR_MARKERS):
+            _TASK_ANSWER_CACHE.setdefault(name, answer)
+
+
+def _cached_answer(turn: Turn) -> str | None:
+    """当前任务在答案缓存里的答案（沙盒里之前读回来过的同名任务文件）
+
+    积分 = 任务奖励 + 5 × 标准回合数 / (完成回合 - 接取回合)（任务书第六章），
+    完成回合差越小分越高。缓存命中时开拓者在任务进行中的第一个回合就能交卷，
+    把回合差压到 1（复盘里敌方两次 cached submit 各得 155 分，我们则要重新
+    读一遍沙盒、回合差至少 2）。
+
+    任务描述里没点名文件时返回 None：探测出来的文件名与任务描述的对应关系
+    不确定，宁可多花一个来回读一次，也不拿别的任务的内容去作答。
+    """
+    target = _task_file(turn.phase_task)
+    if target is None:
+        return None
+    return _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
 
 
 def _go_mine(
@@ -1299,9 +1422,9 @@ def _valid_stand_cells(
     逻辑:
         1. 取目标位置的八方向相邻格子
         2. 过滤掉非陆地、被阻挡（建筑/单位/机器人/中立元素）以及已被占用的格子
-        3. 白天再过滤掉武器塔/围墙的建造点（角色占住建造位会让建筑永远建不起来）；
-           目标本身就是建造点时（走去施工）不过滤，否则角色会因为"相邻格全是
-           建造点"而无处落脚，反而建不起来
+        3. 白天避开武器塔/围墙的建造点（角色占住建造位会让建筑永远建不起来）；
+           真的无处落脚时才退回旧行为允许站在建造点上（目标本身是建造点时），
+           否则角色会因为"相邻格全是建造位"而无处落脚，反而建不起来
         4. inside_only 为 True 时进一步限制在基地周围
         5. 按离基地的切比雪夫距离排序
     """
@@ -1312,24 +1435,28 @@ def _valid_stand_cells(
     # 目标的八方向相邻格子
     neighbors = get_neighbors(target)
 
-    # 白天避开建造点: 角色站上去会把这一格占住,武器/围墙就再也建不起来了
-    reserved: frozenset[Pos] = frozenset()
-    if turn.is_day:
-        build_sites = _reserved_build_sites(turn)
-        if target not in build_sites:
-            reserved = build_sites
-
     cells = [
         pos for pos in neighbors
         if turn.land(pos)
         and pos not in blocked
-        and pos not in reserved
         and (pos == unit.pos or pos not in claimed)
         and (
             not inside_only
             or _footprint_distance(pos, footprint) <= 1
         )
     ]
+
+    # 白天避开建造点: 角色站上去会把这一格占住,武器/围墙就再也建不起来了。
+    # 走去施工（目标本身就是建造点）时旧实现会整体放行建造点，于是角色顺路
+    # 站到别的塔位/墙位上，另一名工人这一回合就建不成（复盘里的"下了建造指令、
+    # 下回合金币没扣、塔也没出现"）；只有实在无处落脚时才退回旧行为。
+    if turn.is_day:
+        build_sites = _reserved_build_sites(turn)
+        outside = [pos for pos in cells if pos not in build_sites]
+        if outside or target not in build_sites:
+            cells = outside
+        else:
+            cells = [pos for pos in cells if pos != target]
 
     # 按离基地的距离排序（优先靠近基地）
     cells.sort(key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y))
