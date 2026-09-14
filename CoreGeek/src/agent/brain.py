@@ -185,6 +185,10 @@ GOLD_FLUSH_TOWERS = WEAPON_BUILD_COST * 2
 
 # 可卖给小贩的矿石（按优先级排序，石矿既是围墙材料也是主要收入来源）
 SELLABLE_MINES = (STONE_MINE, IRON_MINE, COPPER_MINE)
+# 纯收入矿石：只用来换金币，不参与砌墙。围墙配额没铺满时经济分支整段被跳过，
+# 铁/铜必须有一条独立于围墙的变现通道，否则防守方的金币会一直冻结
+# （三场复盘里 gold 从 R6/R8/R9 起一路为 0 直到 R17，背包里却一直躺着矿石）。
+INCOME_MINES = (IRON_MINE, COPPER_MINE)
 # 负责"矿石换金币"的工人的采集顺序：铁/铜是纯收入来源，石材只作兜底
 ECONOMY_MINE_ORDER = (IRON_MINE, COPPER_MINE, STONE_MINE)
 
@@ -220,6 +224,14 @@ TASK_FIND_PRUNE = ("/proc", "/sys", "/dev")
 TASK_FILE_NAMES = ("task*", "spec*")
 # 探测沙盒时放宽一档：描述里连文件名都没有时，任何文档都可能是任务说明
 TASK_PROBE_NAMES = ("task*", "spec*", "*.md")
+# 任务文件的扩展名闸门（与 TASK_FILE_PATTERN 的扩展名一致）。
+# 沙盒里文件名带 task 前缀的不止任务书本身：Debian 的 docbook 样式表
+# /usr/share/sgml/docbook/xsl-stylesheets-<版本>/html/task.xsl 同样命中
+# `task*`。三场复盘（PK589253/589255/589257）里沙盒每次回读回来的都是这份
+# 三万三千多字符的样式表，任务正文一次都没读到，开拓者的 phase 因此卡了
+# 6~7 个回合、任务分全丢（"沙盒读错文件而非没执行"）。名字像任务文件、
+# 扩展名却不是文档的一律不算任务文件。
+TASK_FILE_EXTS = (".md", ".txt", ".json", ".csv", ".log")
 # find 命中后执行的动作：只列出路径（探测与回读任务文件都用它）
 TASK_FIND_PRINT = "-print"
 # 任务文件分段标记：读任务文件时顺带把沙盒里的任务文件都读回来，
@@ -650,12 +662,22 @@ def _worker_day_logic(
     # 检查背包里的石头数量
     stones = worker.backpack.count(WALL_MATERIAL)
 
+    # 金币见底时先把"围墙用不上"的矿石变现：铁/铜是纯收入，不参与砌墙。
+    # 围墙配额没铺满时上面的经济分支整段被跳过（`not wall_quota` 那道门），
+    # 而下面的采集分支又会先就地补石材，背包里的铁/铜于是一直变不成金币
+    # ——三场复盘里防守方的金币从 R6/R8/R9 起冻结到 R17，工人背包里却始终
+    # 躺着可卖的矿石。这一步只认铁/铜，石材仍然留给围墙（见 `_trade_logic`）。
+    if _gold_critical(turn) and _trade_logic(
+        turn, worker, claimed, commands, minerals=INCOME_MINES,
+    ):
+        return
+
     # 如果旁边有矿且石头不足,采集
     # （负责矿石变现的工人跳过这一步：否则它会一直就地采石，
     #   永远轮不到铁/铜，矿种分工就落空了；但围墙配额没铺满时全员先采石）
     if _mine_order(turn, worker, prefer_stone=wall_quota)[0] == STONE_MINE:
         mine = _adjacent_mine(turn, worker, STONE_MINE)
-        if mine is not None and stones < STONE_BATCH:
+        if mine is not None and stones < _stone_reserve(turn, plan, wall_quota):
             commands[worker.unit_id] = collect_command(mine)
             claimed.add(mine)
             return
@@ -692,6 +714,33 @@ def _gold_critical(turn: Turn) -> bool:
     没有任何价值，先变现才有翻盘的可能。
     """
     return turn.gold < LOW_GOLD_THRESHOLD
+
+
+def _wall_gap(turn: Turn, plan: LlmPlan) -> int:
+    """围墙配额还欠几段（换算成石材块数，一段墙一块石头）
+
+    防守方每天至少 `DEFENDER_WALL_QUOTA` 段（见 `_wall_target`），还欠的
+    段数就是这一趟采石至少要带回的量。
+    """
+    return max(0, _wall_target(turn, plan) - len(turn.walls())) * WALL_STONE_COST
+
+
+def _stone_reserve(
+    turn: Turn,
+    plan: LlmPlan,
+    wall_quota: bool,
+) -> int:
+    """这一趟采石要攒到几块才回基地施工
+
+    默认攒够 `STONE_BATCH` 一批（一趟来回多带几块，省得来回跑）。但围墙配额
+    还欠着时只留够"还欠的段数"就回去开工：攒批的代价是首段围墙被拖后很久，
+    而 `wall_quota` 期间经济线整段被压住（见 `_worker_day_logic` 的经济分支），
+    一拖就是十几个回合——复盘里防守方首段围墙直到 R15 才出现（PK589253），
+    另外两场更是全程 0 段，金币从 R6/R8 冻结到 R17。
+    """
+    if not wall_quota:
+        return STONE_BATCH
+    return max(WALL_STONE_COST, _wall_gap(turn, plan))
 
 
 def _tower_picks(
@@ -1016,6 +1065,8 @@ def _trade_logic(
     worker: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    *,
+    minerals: tuple[str, ...] = SELLABLE_MINES,
 ) -> bool:
     """资源交易逻辑：把背包里多余的矿石卖给小贩换金币
 
@@ -1033,18 +1084,22 @@ def _trade_logic(
         worker: 当前决策的工人
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
+        minerals: 这次允许卖出的矿种（默认全部可卖；围墙配额没铺满时
+                  只卖铁/铜这类纯收入矿石，石材留给围墙）
 
     返回:
         True 表示本回合已下达指令（贩卖或走向小贩）
     """
+    if not minerals:
+        return False
     quantities = [
         (mine_type, worker.backpack.count(mine_type))
-        for mine_type in SELLABLE_MINES
+        for mine_type in minerals
     ]
-    # 数量最多的那种优先卖；数量相同时按 SELLABLE_MINES 的顺序取石材
+    # 数量最多的那种优先卖；数量相同时取 minerals 里靠前的那种
     mine_type, amount = max(
         quantities,
-        key=lambda item: (item[1], -SELLABLE_MINES.index(item[0])),
+        key=lambda item: (item[1], -minerals.index(item[0])),
     )
     # 背包满了就卖一批腾地方,否则等攒够一批再卖；金币见底时有几块卖几块
     batch = 1 if (worker.backpack_full or _gold_critical(turn)) else SELL_BATCH
@@ -1926,14 +1981,21 @@ def task_files():
 
 
 def endpoints(doc_text):
-    """接口文档里的调用样例：完整 URL 优先，其次退回文档给出的本地地址"""
+    """接口文档里的调用样例：本地接口优先，其次才是文档里抓到的其他地址
+
+    沙盒内的接口就在 BASE 上（TASK_API_DEFAULT），而 find_files(DOC_NAMES)
+    从全盘捞回来的文档里什么外链都有。旧实现把抓到的外链排在本地接口前面，
+    MAX_CALLS 被这些在无网沙盒里调不通的地址耗光，真正能取数的本地接口
+    一次都没被请求到，答案区永远是空的——三场复盘里"沙盒执行了（exitCode:0）
+    却拿不到答案"就是这么来的。
+    """
     urls = []
     for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
         raw = raw.strip().strip("\\"'").rstrip(".,;:!?、。）])")
         if raw and raw not in urls:
             urls.append(raw)
     local = [url for url in urls if "localhost" in url or "127.0.0.1" in url]
-    picked = local or urls or [BASE]
+    picked = local or [BASE] + [url for url in urls if url != BASE]
     return picked
 
 
@@ -2004,7 +2066,11 @@ for name, bodies in solutions:
 '''
 
 
-def _sandbox_find(names: tuple[str, ...], action: str) -> str:
+def _sandbox_find(
+    names: tuple[str, ...],
+    action: str,
+    exts: tuple[str, ...] = TASK_FILE_EXTS,
+) -> str:
     """沙盒里按文件名全盘查找的 find 片段
 
     复盘里沙盒的工作目录就是 `/`，`ls -a -- .` 只有 bin/dev/etc/home/lib/
@@ -2014,18 +2080,24 @@ def _sandbox_find(names: tuple[str, ...], action: str) -> str:
     卡在任务点。这里改成从根目录起全盘按文件名找，只跳过 `TASK_FIND_PRUNE`
     里的虚拟目录，读不到文件的目录由 `2>/dev/null` 静音。
 
+    命中还要过一道扩展名闸门（`exts`）：只有"名字像任务文件、且扩展名是
+    文档"的才算任务文件，`task.xsl` 这类同名样式表被挡在外面（见
+    `TASK_FILE_EXTS`；三场复盘里回读回来的正是它）。
+
     参数:
         names: 文件名通配（如 `task*`），多个通配之间是"或"关系
         action: 命中后执行的动作（`TASK_FIND_PRINT` 只列路径，内容由调用方按需读取）
+        exts: 扩展名白名单，命中文件必须以后缀之一结尾
 
     返回:
         可直接拼进沙盒命令的 find 片段
     """
     prune = " -o ".join(f'-path "{path}"' for path in TASK_FIND_PRUNE)
     wanted = " -o ".join(f'-name "{name}"' for name in names)
+    docs = " -o ".join(f'-name "*{ext}"' for ext in exts)
     return (
         f'find / \\( {prune} \\) -prune -o -type f \\( {wanted} \\)'
-        f" {action} 2>/dev/null"
+        f" -a \\( {docs} \\) {action} 2>/dev/null"
     )
 
 
@@ -2037,10 +2109,13 @@ def _task_dump(turn: Turn) -> str:
     （见 `_TASK_ANSWER_CACHE`）。只读文件名像任务文件的那几个，
     免得把沙盒里的无关文档一起吃回来占用输出行数。
 
-    上一回合什么任务文件都没回读到时（输出里没有 `TASK_FILE_MARKER`）放宽一档，
+    上一回合一份任务正文都没回读到（输出里没有 `TASK_FILE_MARKER`）放宽一档，
     连 `*.md` 一起扫：沙盒里任务文件的实际命名未必和任务描述里写的一致，
     卡在一个文件名上反复空转不如把候选都摊开（探测输出里的文件名同样会
-    被 `_task_file` 认出来，下一回合就能直接读中意的那份）。
+    被 `_task_file` 认出来，下一回合就能直接读中意的那份）。回读段里的
+    候选同样要过 `TASK_FILE_EXTS` 的扩展名闸门，所以"没回读到任务正文"
+    与"回读到的全是 task.xsl 这类无关文件"是同一个信号——两种情况都换用
+    放宽后的命令重试，最多退这两步（`TASK_FILE_NAMES` -> `TASK_PROBE_NAMES`）。
 
     参数:
         turn: 当前回合信息（用上一回合的沙盒输出判断要不要放宽）

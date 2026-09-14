@@ -22,6 +22,7 @@ from agent.brain import (
     TASK_DATA_MARKER,
     TASK_END_MARKER,
     TASK_FILE_END,
+    TASK_FILE_EXTS,
     TASK_FILE_MARKER,
     TASK_MARKER,
     TASK_PROBE_MARKER,
@@ -2739,3 +2740,108 @@ def test_repair_walls_buys_fixer_when_missing(payload_factory, role_factory):
     commands, _ = decide(payload)
 
     assert commands["10010"] == {"action": "buy", "name": WALL_FIXER, "num": 1}
+
+
+# === issue #39：沙盒读错文件 / 防守方经济冻结（PK589253/589255/589257） ===
+
+
+def test_task_find_only_reads_document_task_files(
+    payload_factory, role_factory,
+):
+    """沙盒里只回读文档类任务文件：命中 `task*` 的 docbook 样式表不算任务
+
+    回归：三场复盘（PK589253/589255/589257）里沙盒每次返回的都是
+    /usr/share/sgml/docbook/xsl-stylesheets-1.78.1/html/task.xsl（三万三千
+    多字符的样式表），任务正文一次都没读回来，开拓者的 phase 因此卡了
+    6~7 个回合、任务分全丢。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task="请阅读task_1_beijing.md，获取任务信息",
+    )
+    command = sandbox_command(payload)
+
+    # 文件名特征照旧（描述里点名的 task_1_beijing.md 仍然是第一候选）
+    assert "task_1_beijing.md" in command
+    assert '-name "task*"' in command
+    # 但多了一道扩展名闸门：只认文档，*.xsl/*.xml 这类同名文件被挡在外面
+    for ext in TASK_FILE_EXTS:
+        assert f'-name "*{ext}"' in command
+    assert '-name "*.xsl"' not in command
+    assert '-name "*.xml"' not in command
+
+
+def test_task_executor_prefers_local_api_over_doc_links():
+    """执行器优先请求沙盒内的本地接口，文档里抓到的无关外链排在后面
+
+    回归：`find_files(DOC_NAMES)` 从沙盘全盘捞回来的文档里什么外链都有，
+    旧实现把抓到的外链排在本地接口前面，`MAX_CALLS` 被这些在无网沙盒里
+    调不通的地址耗光，本地接口一次都没被请求到，答案区永远是空的。
+    """
+    assert "picked = local or [BASE] + " in brain.TASK_EXECUTOR
+
+
+def test_defender_cashes_out_income_ore_while_wall_quota_open(
+    payload_factory, role_factory,
+):
+    """围墙配额还没铺满时，防守方的铁/铜照样能变现（只有石材留给围墙）
+
+    回归：三场复盘里防守方的金币从 R6/R8/R9 起一路冻结到 R17（连续 9~12 个
+    回合为 0），工人背包里却一直躺着可卖的矿石——`wall_quota` 期间经济分支
+    整段被跳过，采集分支又先就地补石材，矿石一直没有出口。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        team_type="defender",
+        roles=[
+            role_factory(
+                10012, WORKER, 20, 17, backPackCapability=100,
+                backpack=[IRON_MINE] * 2,
+            ),
+        ],
+        # 地图上有石矿 -> 防守方的围墙配额生效（首段墙还没铺）；
+        # 石矿远在另一头够不到，工人这一回合只能先把手头的铁矿变现
+        zones=[(STONE_MINE, 35, 5), (VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": IRON_MINE,
+        "num": 2,
+    }
+
+
+def test_defender_stops_hoarding_stone_for_first_wall(
+    payload_factory, role_factory,
+):
+    """围墙配额还欠着时，工人凑够砌墙的那一块就回去施工，不再攒一整批
+
+    回归：防守方为了攒够 STONE_BATCH 一批石材，在矿点和基地之间往返十几个
+    回合，首段围墙拖到 R15 才出现（PK589253），另外两场更是全程 0 段——
+    而 `wall_quota` 没解除之前，经济线整段被压住、金币一直冻结在 0。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        team_type="defender",
+        roles=[
+            role_factory(
+                10012, WORKER, 13, 27, backPackCapability=100,
+                backpack=[WALL_MATERIAL],
+            ),
+        ],
+        # 石矿就在手边：旧策略会继续采到 STONE_BATCH 块才动身去建墙
+        zones=[(STONE_MINE, 12, 27)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10012"] == {
+        "action": "build",
+        "targetPos": [{"x": 13, "y": 26}],
+        "name": WALL,
+    }
