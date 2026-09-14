@@ -179,6 +179,24 @@ class GitHubClient:
             payload={"title": title, "head": head, "base": base, "body": body},
         )
 
+    def merge_pull_request(self, number: int, method: str = "squash",
+                           commit_title: str = "") -> dict[str, Any]:
+        """合并Pull Request
+
+        参数:
+            method: merge / squash / rebase
+        返回:
+            {"merged": true, "sha": "..."}；不可合并时抛 RuntimeError（含状态码与原因）
+        """
+        payload: dict[str, Any] = {"merge_method": method}
+        if commit_title:
+            payload["commit_title"] = commit_title
+        return self.request(
+            "PUT",
+            f"/repos/{self.owner}/{self.repo}/pulls/{number}/merge",
+            payload=payload,
+        ) or {}
+
     def default_branch(self) -> str:
         """获取仓库默认分支名"""
         raw = self.request("GET", f"/repos/{self.owner}/{self.repo}")
@@ -246,6 +264,12 @@ class ProcessedStore:
         entry["synced_time"] = datetime.now().isoformat(timespec="seconds")
         if detail:
             entry["sync_detail"] = detail
+        self._save()
+
+    def update(self, issue_number: int, **fields: Any) -> None:
+        """就地把字段合并进已有记录（保留原有字段）"""
+        entry = self._data.setdefault("issues", {}).setdefault(str(issue_number), {})
+        entry.update(fields)
         self._save()
 
 
@@ -321,3 +345,8 @@ class IssueMonitor:
         """标记PR已同步"""
         if self.store is not None:
             self.store.mark_synced(issue_number, detail)
+
+    def update_record(self, issue_number: int, **fields: Any) -> None:
+        """更新Issue处理记录的附加字段（如自动合并尝试次数）"""
+        if self.store is not None:
+            self.store.update(issue_number, **fields)

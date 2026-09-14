@@ -115,6 +115,11 @@ class GitPusher:
         """工作区是否存在未提交的改动"""
         return bool(self._git("status", "--porcelain").stdout)
 
+    def dirty_paths(self) -> list[str]:
+        """列出工作区中已改动/未跟踪的文件路径"""
+        lines = self._git("status", "--porcelain").stdout.splitlines()
+        return [line[3:].strip() for line in lines if line.strip()]
+
     def changed_files(self) -> list[str]:
         """列出改动的文件"""
         lines = self._git("status", "--porcelain").stdout.splitlines()
@@ -138,19 +143,42 @@ class GitPusher:
         LOGGER.info("creating branch %s", branch_name)
         self._git("checkout", "-B", branch_name, check=True)
 
-    def commit_all(self, message: str) -> bool:
-        """提交所有改动，无改动时返回False"""
-        if not self.has_changes():
+    def commit_all(self, message: str, pre_dirty: list[str] | None = None) -> bool:
+        """提交本次任务产生的改动，无可提交内容时返回False
+
+        参数:
+            pre_dirty: 本次任务开始前就已经是脏的文件（其他会话/人工的未提交
+                       改动）。这些文件不会被提交，避免把无关改动卷进PR。
+
+        注意: 只 add 明确列出的路径（而不是 `git add -A`），否则同仓库里
+        其他人的未提交工作会被一起提交进这个Issue的分支。
+        """
+        current = set(self.dirty_paths())
+        excluded = set(pre_dirty or ()) & current
+        paths = [path for path in self.dirty_paths() if path not in excluded]
+
+        if excluded:
+            LOGGER.warning(
+                "以下文件在本次任务前已有未提交改动，为安全起见不纳入本次提交：%s",
+                ", ".join(sorted(excluded)),
+            )
+        if not paths:
             LOGGER.warning("no changes to commit")
             return False
-        self._git("add", "-A", check=True)
+
+        self._git("add", "--", *paths, check=True)
+        if not self._git("diff", "--cached", "--name-only").stdout:
+            self._git("reset", "-q")
+            LOGGER.warning("no staged changes to commit")
+            return False
+
         self._git(
             "-c", f"user.name={self.user_name}",
             "-c", f"user.email={self.user_email}",
             "commit", "-m", message,
             check=True,
         )
-        LOGGER.info("committed: %s", message)
+        LOGGER.info("committed %d file(s): %s", len(paths), message)
         return True
 
     def push(self, branch_name: str) -> None:
@@ -291,19 +319,21 @@ class GitPusher:
 
     # === 组合动作 ===
 
-    def publish(self, task: Task, summary: str = "") -> str:
+    def publish(self, task: Task, summary: str = "",
+                pre_dirty: list[str] | None = None) -> str:
         """提交、推送、创建PR并回评Issue，返回PR链接
 
         参数:
             task: 待执行的任务
             summary: Claude 的执行摘要，会写入PR正文与Issue回评，便于人工复盘
+            pre_dirty: 任务开始前就已存在的未提交文件，不会被提交
 
         失败时回滚到原始分支，保证下一次任务从干净的起点开始。
         """
         original_branch = self.current_branch()
         self.create_branch(task.branch_name)
         try:
-            if not self.commit_all(task.commit_message):
+            if not self.commit_all(task.commit_message, pre_dirty):
                 self.rollback(task.branch_name, original_branch)
                 detail = (
                     f"\n\n<details><summary>执行摘要（Claude 自述）</summary>\n\n"

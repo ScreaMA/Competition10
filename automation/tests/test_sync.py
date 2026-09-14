@@ -15,8 +15,10 @@ from pathlib import Path
 import pytest
 
 from automation_main import Automation, pull_number
+from dispatcher import Task
+from executor import ExecResult
 from git_pusher import GitPusher
-from issue_monitor import ProcessedStore
+from issue_monitor import Issue, ProcessedStore
 
 SYNCED = "synced"
 
@@ -64,22 +66,36 @@ def test_pending_pull_requests_survives_reload(tmp_path):
 
 
 class FakeClient:
-    def __init__(self, pulls: dict[int, dict]) -> None:
+    def __init__(self, pulls: dict[int, dict], merge_error: str | None = None) -> None:
         self.pulls = pulls
+        self.merge_error = merge_error
         self.queried: list[int] = []
+        self.merged: list[tuple[int, str]] = []
 
     def get_pull_request(self, number: int) -> dict:
         self.queried.append(number)
         return self.pulls.get(number, {})
+
+    def merge_pull_request(self, number: int, method: str = "squash",
+                           commit_title: str = "") -> dict:
+        if self.merge_error:
+            raise RuntimeError(self.merge_error)
+        self.merged.append((number, method))
+        self.pulls.setdefault(number, {}).update({"merged": True, "state": "closed"})
+        return {"merged": True, "sha": "deadbeef"}
 
     def default_branch(self) -> str:
         return "main"
 
 
 class FakePusher:
-    def __init__(self, result: bool = True) -> None:
+    def __init__(self, result: bool = True, publish_url: str = "") -> None:
         self.result = result
+        self.publish_url = publish_url
         self.calls: list[tuple[str, str, bool, str]] = []
+        self.comments: list[tuple[int, str]] = []
+        self.dirty: list[str] = []
+        self.published_pre_dirty: list[str] = []
 
     def sync_main(self, main_branch: str, merged_branch: str = "",
                   delete_remote_branch: bool = False,
@@ -87,11 +103,23 @@ class FakePusher:
         self.calls.append((main_branch, merged_branch, delete_remote_branch, strategy))
         return self.result
 
+    def dirty_paths(self) -> list[str]:
+        return list(self.dirty)
+
+    def publish(self, task, summary: str = "", pre_dirty=None) -> str:
+        self.published_pre_dirty = list(pre_dirty or [])
+        return self.publish_url
+
+    def comment_issue(self, issue_number: int, body: str) -> None:
+        self.comments.append((issue_number, body))
+
 
 class FakeMonitor:
-    def __init__(self, pending: list[tuple[int, dict]]) -> None:
-        self._pending = pending
+    def __init__(self, pending: list[tuple[int, dict]] | None = None) -> None:
+        self._pending = list(pending or [])
+        self.records: dict[int, dict] = {}
         self.synced: list[tuple[int, str]] = []
+        self.processed: list[tuple[int, str, str, dict]] = []
 
     def pending_pull_requests(self):
         return list(self._pending)
@@ -99,20 +127,36 @@ class FakeMonitor:
     def mark_synced(self, issue_number: int, detail: str = "") -> None:
         self.synced.append((issue_number, detail))
 
+    def mark_processed(self, issue_number: int, status: str, detail: str = "",
+                       **extra) -> None:
+        self.processed.append((issue_number, status, detail, extra))
+        self.records[issue_number] = {"status": status, "detail": detail, **extra}
+
+    def record(self, issue_number: int) -> dict:
+        return dict(self.records.get(issue_number, {}))
+
+    def update_record(self, issue_number: int, **fields) -> None:
+        self.records.setdefault(issue_number, {}).update(fields)
+
 
 def _automation(pending, pulls, pusher_result=True, auto_sync=True,
-                delete_remote=False) -> tuple[Automation, FakePusher, FakeMonitor, FakeClient]:
-    """构造只装配了同步所需依赖的 Automation（不读配置、不联网）"""
+                delete_remote=False, auto_merge=False, merge_error=None,
+                max_merge_attempts=5):
+    """构造只装配了同步/合并所需依赖的 Automation（不读配置、不联网）"""
     automation = object.__new__(Automation)
     pusher = FakePusher(pusher_result)
     monitor = FakeMonitor(pending)
-    client = FakeClient(pulls)
+    client = FakeClient(pulls, merge_error)
     automation.pusher = pusher
     automation.monitor = monitor
     automation.client = client
     automation.auto_sync = auto_sync
+    automation.auto_merge = auto_merge
+    automation.auto_merge_method = "squash"
+    automation.max_merge_attempts = max_merge_attempts
     automation.delete_remote_branch = delete_remote
     automation.sync_strategy = "rebase"
+    automation.comment_on_issue = True
     automation._main_branch = None
     return automation, pusher, monitor, client
 
@@ -190,6 +234,105 @@ def test_sync_can_be_disabled():
 
     assert automation.sync_repository() == 0
     assert pusher.calls == [] and client.queried == []
+
+
+# === PR自动合并（免人工审批） ===
+
+
+def test_auto_merge_merges_open_pr_and_syncs():
+    """auto_merge开启：开放的PR被自动合并，随后同步本地代码"""
+    pending = [(2, {"pr": 3, "branch": "auto-fix/issue-2-x"})]
+    automation, pusher, monitor, client = _automation(
+        pending,
+        {3: {"merged": False, "state": "open", "head": {"ref": "auto-fix/issue-2-x"}}},
+        auto_merge=True,
+    )
+
+    assert automation.sync_repository() == 1
+    assert client.merged == [(3, "squash")]
+    assert pusher.calls == [("main", "auto-fix/issue-2-x", False, "rebase")]
+    assert monitor.synced == [(2, "PR #3 auto-merged")]
+
+
+def test_auto_merge_disabled_waits_for_human():
+    """auto_merge关闭：开放PR保持不动，等待人工审批"""
+    pending = [(2, {"pr": 3, "branch": "b"})]
+    automation, pusher, monitor, client = _automation(
+        pending, {3: {"merged": False, "state": "open", "head": {"ref": "b"}}},
+    )
+
+    assert automation.sync_repository() == 0
+    assert client.merged == []
+    assert monitor.synced == []
+
+
+def test_auto_merge_retries_then_gives_up():
+    """合并失败：保留重试次数，超过上限后标记失败并在Issue中说明"""
+    pending = [(2, {"pr": 3, "branch": "b", "merge_attempts": 4})]
+    automation, pusher, monitor, client = _automation(
+        pending, {3: {"merged": False, "state": "open", "head": {"ref": "b"}}},
+        auto_merge=True,
+        merge_error="405 Pull Request is not mergeable",
+    )
+
+    assert automation.sync_repository() == 0
+    assert monitor.records[2]["merge_attempts"] == 5
+    assert monitor.records[2]["status"] == "merge_failed"
+    assert monitor.synced == []
+    assert pusher.comments and "自动合并" in pusher.comments[0][1]
+
+
+def test_auto_merge_keeps_retrying_below_limit():
+    """未到重试上限：状态保持 published，下一轮继续尝试"""
+    pending = [(2, {"pr": 3, "branch": "b", "merge_attempts": 1})]
+    automation, pusher, monitor, client = _automation(
+        pending, {3: {"merged": False, "state": "open", "head": {"ref": "b"}}},
+        auto_merge=True,
+        merge_error="405 Pull Request is not mergeable",
+    )
+
+    assert automation.sync_repository() == 0
+    assert monitor.records[2]["merge_attempts"] == 2
+    assert monitor.records[2].get("status") != "merge_failed"
+    assert pusher.comments == []
+
+
+class FakeExecutor:
+    def run(self, task):
+        return ExecResult(ok=True, returncode=0, output="已按Issue修改", duration=1.0)
+
+
+class FakeDispatcher:
+    def dispatch(self, issue):
+        return Task(
+            issue_number=issue.number, title=issue.title, body=issue.body,
+            branch_name=f"auto-fix/issue-{issue.number}-x", prompt="prompt",
+            commit_message=f"[Auto-Fix] #{issue.number}", created_at="now",
+        )
+
+
+def test_handle_merges_right_after_publishing():
+    """创建PR后立即尝试合并，不必等下一轮轮询"""
+    automation, pusher, monitor, client = _automation(
+        [], {3: {"merged": False, "state": "open",
+                 "head": {"ref": "auto-fix/issue-2-x"}}},
+        auto_merge=True,
+    )
+    automation.executor = FakeExecutor()
+    automation.dispatcher = FakeDispatcher()
+    automation.auto_create_pr = True
+    automation.comment_on_issue = True
+    pusher.publish_url = "https://github.com/ScreaMA/Competition10/pull/3"
+    pusher.dirty = ["别人的WIP.py"]  # 任务开始前就已存在的未提交文件
+
+    issue = Issue(number=2, title="测试", body="正文", labels=("auto-fix",))
+    assert automation.handle(issue) is True
+
+    assert client.merged == [(3, "squash")]
+    assert monitor.synced == [(2, "PR #3 auto-merged")]
+    assert monitor.processed[0][1] == "published"
+    # 预先存在的WIP要传给publish，避免被卷进本次PR
+    assert pusher.published_pre_dirty == ["别人的WIP.py"]
 
 
 # === 真实 git 仓库上的 sync_main ===
@@ -351,3 +494,44 @@ def test_sync_main_cleans_branch_when_already_up_to_date(repo_pair):
 
     branches = _git(repo_pair, "branch", "--format=%(refname:short)").split()
     assert "merged-later" not in branches
+
+
+# === 提交时隔离别人的未提交改动 ===
+
+
+def test_commit_all_excludes_pre_existing_changes(repo_pair):
+    """只提交本次任务改动的文件，任务前就存在的WIP不卷进提交"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "wip.txt").write_text("other session WIP\n", encoding="utf-8")
+    pre_dirty = pusher.dirty_paths()
+    (repo_pair / "task.txt").write_text("task change\n", encoding="utf-8")
+
+    assert pusher.commit_all("[Auto-Fix] #1: task", pre_dirty) is True
+
+    committed = _git(repo_pair, "show", "--name-only", "--format=", "HEAD").split()
+    assert committed == ["task.txt"]
+    assert "wip.txt" in pusher.dirty_paths()  # 原样留在工作区，未被提交
+
+
+def test_commit_all_nothing_new_returns_false(repo_pair):
+    """工作区里只有别人的WIP时，本次任务视为没有改动"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "wip.txt").write_text("wip\n", encoding="utf-8")
+    pre_dirty = pusher.dirty_paths()
+    head_before = _git(repo_pair, "rev-parse", "HEAD")
+
+    assert pusher.commit_all("[Auto-Fix] #1: task", pre_dirty) is False
+    assert _git(repo_pair, "rev-parse", "HEAD") == head_before
+    assert pusher.dirty_paths() == pre_dirty  # 没有被暂存
+
+
+def test_commit_all_without_pre_dirty_commits_everything(repo_pair):
+    """没有预先存在的WIP时行为不变（提交本次全部改动）"""
+    pusher = GitPusher(client=None, repo_dir=repo_pair)
+    (repo_pair / "a.txt").write_text("a\n", encoding="utf-8")
+    (repo_pair / "b.txt").write_text("b\n", encoding="utf-8")
+
+    assert pusher.commit_all("msg") is True
+    committed = sorted(_git(repo_pair, "show", "--name-only", "--format=", "HEAD").split())
+    assert committed == ["a.txt", "b.txt"]
+    assert pusher.has_changes() is False

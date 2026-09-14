@@ -20,6 +20,12 @@ automation:
   # 每轮轮询先检查自己创建的PR是否已合并，合并后把本地主干同步到远端最新
   # 优先快进；本地与远端分叉时按下面的 sync_strategy 处理，冲突则回滚并下轮重试
   auto_sync: true
+  # 是否自动合并自己创建的PR（免人工审批）。设为 false 则恢复“人工审核后合并”
+  auto_merge: true
+  # 合并方式：squash(默认，压缩成单提交) / merge(保留提交并生成合并提交) / rebase
+  auto_merge_method: "squash"
+  # 自动合并的最大重试次数（PR刚创建时GitHub可能还没算完可合并性）
+  max_merge_attempts: 5
   # 分叉处理方式：
   #   rebase   把本地提交重放到远端之上（默认，保持线性历史）
   #   merge    生成一个合并提交
