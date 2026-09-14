@@ -6034,12 +6034,13 @@ def test_executor_keeps_the_near_doc_search_when_a_local_url_is_present():
     正常一局里接口文档的样例就写着 `http://localhost:8899/...`，那趟全盘
     搜索不该跑：沙盒命令整条限时 15 秒，多扫一遍目录树是白烧时间。
     """
-    task_file = f"{TASK_ROOTS[0]}/1-x/api_docs.md"
+    task_file = f"{TASK_ROOTS[0]}/1-x/task_1_alpha.md"
+    api_doc = f"{TASK_ROOTS[0]}/1-x/接口文档.md"
     calls: list[tuple] = []
 
     def _find_files(patterns, limit, roots=(), prune=()):
         calls.append((patterns, tuple(roots)))
-        return [task_file]
+        return [task_file, api_doc]
 
     namespace = _doc_search_namespace(
         task_file,
@@ -6051,8 +6052,47 @@ def test_executor_keeps_the_near_doc_search_when_a_local_url_is_present():
     assert calls == [(brain.TASK_API_DOC_NAMES, tuple(brain.TASK_ROOTS) + (
         f"{TASK_ROOTS[0]}/1-x",
     ))]
-    assert namespace["doc_files"] == [task_file]
+    assert namespace["doc_files"] == [task_file, api_doc]
     assert namespace["urls"] == [brain.TASK_API_DEFAULT]
+
+
+def test_executor_widens_the_doc_search_when_only_task_files_were_read():
+    """近处读回来的"文档"全是任务文件自己时，照样按宽名单再找一遍（S2）
+
+    复盘 PK591990 的 `[SCAN] docs=2 urls=2 key=yes` 却 `api=0 fail=8`：任务
+    根目录里的 `.md` 命中的是任务文件自己（两个任务点各有一份），题面里恰好
+    写着本地接口地址与 Key，`urls`/`key` 因此非空。旧判据只看"近处文档里有没有
+    本地接口地址"，于是认定接口文档已经到手、跳过兜底——真正的接口文档（名字
+    里写着"接口/文档"、但不在任务树里的那份）一次都没读进来，8 个候选地址全
+    打在题面猜出来的路径上，答案区连着几个回合都是空的。
+
+    这一趟先在任务树里按宽名单找（便宜）：找到了就不必再扫全盘，沙盒命令整条
+    限时 15 秒，全盘 walk 是最慢的一步（见 `_task_retry_budget`）。
+    """
+    task_file = f"{TASK_ROOTS[0]}/1-x/task_1_beijing.md"
+    api_doc = f"{TASK_ROOTS[0]}/1-x/接口文档.md"
+    docs = {
+        task_file: "请查询北京的文化遗产，接口在 http://localhost:8899，Key: sk-abc123",
+        api_doc: "调用样例：GET http://localhost:8899/heritage?city=<城市名>",
+    }
+    calls: list[tuple] = []
+
+    def _find_files(patterns, limit, roots=(), prune=()):
+        calls.append((patterns, tuple(roots)))
+        if patterns == brain.TASK_API_DOC_NAMES:
+            return [task_file]
+        return [api_doc]
+
+    namespace = _doc_search_namespace(
+        task_file, _find_files, lambda path: docs.get(path, ""),
+    )
+
+    assert (brain.TASK_DOC_WIDE_NAMES, tuple(brain.TASK_ROOTS) + (
+        f"{TASK_ROOTS[0]}/1-x",
+    )) in calls
+    assert not any(roots == ("/",) for _, roots in calls)  # 没扫全盘
+    assert api_doc in namespace["doc_files"]
+    assert "调用样例" in namespace["doc_text"]
 
 
 def _executor_fetch_loop():
