@@ -33,6 +33,7 @@ Judge 放行时由它止损（见 `_task_abandoned`），不再让开拓者被�
 
 import os
 import re
+import zlib
 from dataclasses import dataclass
 from itertools import combinations
 from typing import Any
@@ -295,6 +296,9 @@ ROBOT_THREAT = {
 TASK_FILE_PATTERN = re.compile(r"[A-Za-z0-9_./\\-]+\.(?:md|txt|json|csv|log)")
 # 沙盒输出中的任务标识前缀，用于确认输出属于当前任务
 TASK_MARKER = "[TASK]"
+# 任务标识里保留几个文件名字符（见 `_task_token`）：标识要短，但文件名是
+# 日志里唯一能一眼认出"这是哪个任务"的东西，不能被截没
+TASK_TOKEN_NAME_MAX = 16
 # 沙盒输出中的答案结束标记：它之后的诊断信息（目录列表等）永远不会被当成答案
 TASK_END_MARKER = "[TASK_END]"
 # 沙盒探测标记：任务描述里没给文件名时先探一次沙盒，这个标记下的输出
@@ -361,6 +365,15 @@ TASK_API_FAIL_MARKER = "[APIFAIL]"  # 取数失败也留一行诊断（URL + 异
 TASK_SCAN_MARKER = "[SCAN]"  # 沙盒里找到多少任务文件/接口文档/可用地址
 TASK_ANSWER_MIN_LEN = 4  # 答案最短长度（任务原文动辄几千字，这条挡住空答）
 TASK_ECHO_RUN = r"[一-鿿]{6,}"  # 任务描述里的中文长句（复读判定用）
+# 空答案闸门（S2）：答案是通过了长度闸门、却不是一份答案的情形——接口把
+# 空数组/空对象原样返回（`[]`、`{}`），或者 LLM 只回了 `null`/`n/a`。
+# 复盘 PK590610 的 R16 提交的就是 "[]"，Judge 判 0 分；这条提交既拿不到分，
+# 又白占一次提交额度（交满 `TASK_SUBMIT_LIMIT` 次任务就被看门狗止损了）。
+# 判定见 `_task_empty_answer`，四条产出答案的路径都过这道闸门。
+# 表里是"去掉全部空白并转小写"之后的形态。
+TASK_EMPTY_ANSWERS = frozenset({"[]", "{}", "null", "none", "n/a", '""', "''"})
+# 空壳的结构特征：整个答案只有括号/大括号/逗号/冒号（`[ ]`、`[,]`、`{ , }`）
+TASK_EMPTY_SHELL = re.compile(r"[\[\]{},:]+")
 TASK_API_DEFAULT = "http://localhost:8899"  # 沙盒内的本地接口
 TASK_API_TIMEOUT = 1  # 单次取数超时（秒），整条沙盒命令限时 15 秒
 TASK_API_MAX_CALLS = 8  # 一条命令里最多请求几次（本地接口，失败也是立刻返回）
@@ -511,6 +524,31 @@ LLM_PLAN_DEFAULT = LlmPlan()
 
 # 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
 TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
+
+# 接口错误响应体的特征（S2）：答案区里出现过取数证据（`[API]`）只说明
+# "这一次请求有响应"，不说明"响应就是答案"。接口把错误包成 200 的 JSON
+# （`{"status":"error",...,"code":404}`）、或者沙盒命令自己抛了异常时，
+# 执行器照样会把这段正文打进 `[SOLUTION]` 段——复盘 PK590598 的 R14/R16
+# 两次 submitAnswer 交的正是这段 404 错误原文，Judge 判 0，还各消耗掉一次
+# 提交额度（`TASK_SUBMIT_LIMIT`）。
+#
+# 只认"看着就是错误"的形态，正常数据不会被误伤：错误键（`"error"` 为非空值）、
+# 错误状态值、4xx/5xx 状态码、状态码后跟 HTTP 状态短语、Python 异常名与回溯。
+# 状态短语必须带状态码（`404 Not Found`）才算——"故宫"的英文是 Forbidden City，
+# 裸词匹配会把一份完全正确的答案拦下来。
+TASK_ERROR_BODY = re.compile(
+    r'"error"\s*:\s*(?!\s*(?:null\b|\[\s*\]|\{\s*\}|""|\'\'))|'
+    r'"status"\s*:\s*"?'
+    r"(?:err|fail|unauthor|forbidden|not[ _-]?found|invalid|denied|bad)|"
+    r'"(?:status|code)"\s*:\s*"?[45]\d\d\b|'
+    r"\b[45]\d\d\s+(?:Bad Request|Unauthorized|Forbidden|Not Found|"
+    r"Method Not Allowed|Internal Server Error|Bad Gateway|Service Unavailable)\b|"
+    r"\bendpoint\s+not\s+found\b|"
+    r"\[APIFAIL\]|"
+    r"\b(?:InvalidURL|HTTPError|URLError|SocketTimeout|TimeoutError)\b|"
+    r"Traceback \(most recent call last\)",
+    re.IGNORECASE,
+)
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -3291,8 +3329,12 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
+    if _task_error_body(answer):
+        return None  # "ANSWER: <接口的错误 JSON>" 同样不是答案（S2）
     if _task_path_answer(answer):
         return None  # "ANSWER: <任务文件的路径>" 同样不是答案（S1）
+    if _task_empty_answer(answer):
+        return None  # "ANSWER: []" 这种空壳同样交不得（S2）
     return answer
 
 
@@ -3311,8 +3353,12 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None
+    if _task_error_body(answer):
+        return None  # 命令把接口的错误提示打了出来，这一趟同样没取到数
     if _task_path_answer(answer):
         return None  # 命令只把任务文件的路径打了出来，不算取到数
+    if _task_empty_answer(answer):
+        return None  # 命令跑通了但输出是空壳（接口返回 `[]`），不算取到数
     return answer
 
 
@@ -3476,7 +3522,23 @@ def fetch(url):
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             return response.read().decode("utf-8", "replace").strip()[:BODY_LIMIT]
     except Exception as exc:
-        print(FAIL, url, type(exc).__name__)
+        # 异常名后面带上 HTTP 状态码：复盘里只有 `[APIFAIL] ... HTTPError`，
+        # 分不清 401（缺鉴权）还是 404（地址不对），下一次修复只能靠猜（S1）
+        code = getattr(exc, "code", "")
+        name = type(exc).__name__
+        status = "%s %s" % (name, code) if code else name
+        line = "%s %s" % (url, status)
+        # 错误响应体里常常写着"缺什么"（401 的鉴权格式、404 的可用地址），
+        # 压成一行跟在后面：下一轮照着改地址/补鉴权，不必再猜（S1）。
+        # 必须和状态码打在同一行：`[APIFAIL]` 的行数就是"取数失败了几次"
+        # （见 `task_brief` 的 fail 计数），一次失败拆成两行会让计数翻倍
+        try:
+            detail = " ".join(exc.read().decode("utf-8", "replace").split())
+        except Exception:
+            detail = ""
+        if detail:
+            line += " => " + detail[:BODY_LIMIT]
+        print(FAIL, line)
         return ""
 
 
@@ -3539,13 +3601,18 @@ def task_files():
 def refine_url(raw):
     """把文档里抓到的地址整成 urlopen 能吃的形式（整不出来就返回空串）
 
-    文档是中文的，地址常写在句子中间或反引号里，尾随的全角标点、引号会让
-    urllib 直接抛 `InvalidURL`——复盘 #67 里 R12–R17 连续 6 回合
-    `APIFAIL ... ），API InvalidURL`（URL 含反引号+中文）就是这么来的，
-    任务因此 8 个回合读不到题面、最终 0 分。这里做两件事：
+    文档是中文的，地址常写在句子中间或反引号里，整条抓回来时会连着尾随的
+    全角标点、引号甚至后面的英文一起带上，urllib 到取数那一步才抛
+    `InvalidURL`——PK590609 的 R12–R17 连续 6 回合
+    `[APIFAIL] http://localhost:8899`），API InvalidURL` 就是这么来的，
+    任务因此 8 个回合读不到题面、最终 0 分。这里做三件事：
 
-    1. 剥掉两端的标点/引号/括号（含全角）
-    2. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
+    1. 主机名与端口只保留前面合法的一段：脏字符落在 netloc 上时 `urlsplit`
+       并不报错（端口是惰性校验），整条地址一路放行到 urlopen 才炸。截到
+       第一个非主机字符为止（`http://localhost:8899`），把本地基址拿回来；
+       冒号后面不是数字的"端口"是截断留下的残渣，整段丢掉
+    2. 剥掉两端的标点/引号/括号（含全角）
+    3. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
     """
     text = raw.strip()
     trim = "`'\\\"、，。；：？！,.;:!?)]}>（）【】《》“”‘’"
@@ -3561,9 +3628,31 @@ def refine_url(raw):
         return ""
     if not parts.scheme or not parts.netloc:
         return ""
+    # 主机名只可能由 ASCII 组成（IDN 在 URL 里是 punycode），端口跟在冒号
+    # 后面，IPv6 字面量是方括号包起来的一段。逐字符截断而不是整条丢掉：
+    # 截断后剩下的往往正好是能用的基址
+    userinfo, at, authority = parts.netloc.rpartition("@")
+    if userinfo and not all(
+        char.isalnum() or char in "-._~%!$&'()*+,;=:" for char in userinfo
+    ):
+        userinfo, at = "", ""  # 认证段混进了脏字符：只丢认证段，别连主机一起丢
+    host_chars = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-_~%[]:")
+    host = ""
+    for char in authority:
+        if char.lower() not in host_chars:
+            break
+        host += char
+    if "]" not in host:
+        name, colon, port = host.rpartition(":")
+        if colon and not port.isdigit():
+            host = name  # 冒号后面不是数字：截断留下的残渣，整段丢掉
+    if not host:
+        return ""
     path = urllib.parse.quote(parts.path, safe="/%:@&=+$,-_.!~*'()")
     query = urllib.parse.quote(parts.query, safe="=&%:@+$,-_.!~*'()")
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+    return urllib.parse.urlunsplit(
+        (parts.scheme, userinfo + at + host, path, query, "")
+    )
 
 
 def endpoints(doc_text):
@@ -3805,8 +3894,34 @@ def _task_file(phase_task: str) -> str | None:
 
 
 def _task_token(phase_task: str) -> str:
-    """任务短标识：长任务描述只会用到开头几个可打印字符"""
-    return re.sub(r"\W+", "", phase_task)[:16]
+    """任务标识：沙盒标记与看门狗都靠它区分"这是哪一个任务"
+
+    标识要满足两件事——日志里一眼认得出是哪个任务，且不同的任务一定不同。
+
+    旧实现取描述开头的 16 个可打印字符，两条都不满足：任务描述是中文的，
+    "请阅读沙盒中的任务文件task_1_…"这类模板前缀本身就能把 16 个字符占满，
+    文件名被砍到一半（复盘日志里那个 `task_1_alpham` 就是 `task_1_alpha.md`
+    被截断的样子，分析报告因此把它误判成"文件名拼接 bug"）；更要命的是
+    两份描述只要共同前缀够长、文件名又都以 `task_` 开头，算出来的标识就
+    一模一样——标识撞车会让三处判断串味：归属判定（`_task_output`）认下
+    另一个任务的沙盒输出、看门狗（`_TASK_WATCH`）接着上一个任务的计数、
+    LLM 状态（`_TASK_LLM_STATE`）把上一个任务的答案交上去。
+
+    这里改成"描述里点名的文件名 + 整段描述的短摘要"：文件名让人一眼认出
+    是哪个任务，摘要保证描述不同标识就不同。摘要取 `zlib.crc32`（标准库、
+    每进程固定，不像 `hash()` 那样带随机种子），描述没点名文件时只剩摘要。
+    标识只由 `[A-Za-z0-9-]` 组成，可以安全地放进 `echo "…"` 里。
+
+    参数:
+        phase_task: 当前任务描述（来自报文的 `phaseTask`）
+
+    返回:
+        任务标识（如 `task_1_beijingmd-3fa1b2c4`）
+    """
+    name = os.path.basename((_task_file(phase_task) or "").replace("\\", "/"))
+    name = re.sub(r"[^A-Za-z0-9]", "", name)[:TASK_TOKEN_NAME_MAX] or "task"
+    digest = zlib.crc32(phase_task.encode("utf-8")) & 0xFFFFFFFF
+    return f"{name}-{digest:08x}"
 
 
 def _task_answer(turn: Turn) -> str | None:
@@ -3816,12 +3931,15 @@ def _task_answer(turn: Turn) -> str | None:
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
     答案取任务标识到 `TASK_END_MARKER` 之间、`[SOLUTION]` 段里的内容。
 
-    三道闸门保证交上去的是答案本体（复盘里 4 次 submitAnswer 交的全是
-    任务描述、PK590252 的 R17 交的又是文件路径，Judge 一次都没放行）：
+    四道闸门保证交上去的是答案本体（复盘里 4 次 submitAnswer 交的全是
+    任务描述、PK590252 的 R17 交的又是文件路径、PK590598 的 R14/R16 交的是
+    401/404 的错误 JSON，Judge 一次都没放行）：
         1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
            执行器取不到数据时答案区是空的，这一回合就不提交；
         2. 答案里不能出现任务描述里的中文长句（`_task_echo`）；
-        3. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
+        3. 答案不能是接口的错误响应体（`_task_error_body`）：那说明这次取数
+           其实没成功，只是把错误提示当成了正文；
+        4. 答案不能是一条文件路径（`_task_path_answer`）：那说明开拓者把
            "该读哪个文件"当成了答案。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
@@ -3837,7 +3955,8 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
     可解析的字段：`ok` / `llm_answer` / `no_marker`（本任务的沙盒输出还没到）/
     `exit_nonzero`（命令失败）/ `no_api_data`（取不到数）/ `error_in_output` /
     `short_or_missing` / `echo_task_text`（答案就是任务原文）/
-    `path_answer`（答案是一条文件路径）。
+    `error_body`（答案是接口的错误响应体）/ `path_answer`（答案是一条文件路径）/
+    `empty_answer`（答案是 `[]` 这样的空壳）。
     """
     if not turn.phase_task:
         return None, "no_task"
@@ -3871,9 +3990,43 @@ def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
         return None, "short_or_missing"
     if _task_echo(answer, turn.phase_task):
         return None, "echo_task_text"
+    if _task_error_body(answer):
+        return None, "error_body"  # 交上去的是接口的错误提示，不是答案
     if _task_path_answer(answer):
         return None, "path_answer"  # 交上去的是一条路径：文件里问的答案还没拿到
+    if _task_empty_answer(answer):
+        return None, "empty_answer"  # 取回来的数据是个空壳（`[]`/`{}`）：不是答案
     return answer, "ok"
+
+
+def _task_empty_answer(answer: str) -> bool:
+    """答案是不是一个空壳（S2 的提交闸门：交空答案 = 又一次 0 分）
+
+    复盘 PK590610 的 R16 提交的是 `"[]"`——接口把空数组原样返回，客户端没做
+    任何结构判断就交了上去，Judge 判 0 分。这条答案比"交任务原文"更隐蔽：
+    它不是复读、也不是文件路径，长度闸门（`TASK_ANSWER_MIN_LEN`）只拦得住
+    最短的那几种写法。交上去的代价不只是这一次 0 分，还白占一次提交额度
+    ——交满 `TASK_SUBMIT_LIMIT` 次任务就被看门狗止损（`_task_abandoned`），
+    开拓者提前回基地，这个任务点彻底没戏。
+
+    判定分两层（先去掉全部空白与大小写差异）：
+        1. 整条答案就是 `[]` / `{}` / `null` / `n/a` 这类空值写法
+        2. 整条答案只由括号、大括号、逗号、冒号组成（`[ ]`、`[,]`、`{ , }`）
+
+    `{"city": "北京"}`、`[1, 2]` 这类有内容的答案不受影响：里面有别的字符。
+
+    参数:
+        answer: 待提交的答案内容
+
+    返回:
+        True 表示这条答案是个空壳，不能提交
+    """
+    compact = re.sub(r"\s+", "", answer).lower()
+    if not compact:
+        return True
+    if compact in TASK_EMPTY_ANSWERS:
+        return True
+    return TASK_EMPTY_SHELL.fullmatch(compact) is not None
 
 
 def _task_path_answer(answer: str) -> bool:
@@ -3894,6 +4047,29 @@ def _task_path_answer(answer: str) -> bool:
     """
     text = answer.strip()
     return "\n" not in text and TASK_FILE_PATTERN.fullmatch(text) is not None
+
+
+def _task_error_body(answer: str) -> bool:
+    """答案是不是接口返回的错误体或异常回溯（S2）
+
+    执行器把"有响应的正文"直接打进 `[SOLUTION]` 段，而错误响应往往也是
+    200 + 一段 JSON（`{"status":"error","message":"missing query"}`，见
+    `TASK_ERROR_BODY`），于是一段错误提示就变成了"答案"。复盘 PK590598 的
+    R14/R16 两次 submitAnswer 交的正是 `{"status":"error",...,"code":404}`
+    这段原文，Judge 全部判 0；更糟的是每交一次就消耗一次提交额度，真正的
+    答案取到时反而可能已经撞上 `TASK_SUBMIT_LIMIT` 被看门狗放弃。
+
+    这里不做"答案应该长什么样"的正面判定（任务千变万化），只排掉一眼能
+    看出是错误体的那几种形态；命中时不提交，`_sandbox_command` 下一回合
+    照常重跑取数命令。
+
+    参数:
+        answer: 待提交的答案内容
+
+    返回:
+        True 表示这条答案是错误体的正文，不能提交
+    """
+    return TASK_ERROR_BODY.search(answer) is not None
 
 
 def _solution_answer(region: str, turn: Turn) -> str | None:
@@ -3974,15 +4150,19 @@ def _cached_answer(turn: Turn) -> str | None:
     任务描述里没点名文件时返回 None：探测出来的文件名与任务描述的对应关系
     不确定，宁可多花一个来回执行一次，也不拿别的任务的答案去作答。
 
-    缓存里那条答案本身也要过 `_task_path_answer` 的闸门：缓存是在执行器输出
-    上直接建的（`_remember_task_answers`），同一份"答案"从这里出去同样可能
-    是一条文件路径——提交闸门只在 `_task_answer` 里拦一道的话，这条路就绕过去了。
+    缓存里那条答案本身也要过 `_task_path_answer`、`_task_error_body` 与
+    `_task_empty_answer` 三道闸门：缓存是在执行器输出上直接建的
+    （`_remember_task_answers`），同一份"答案"从这里出去同样可能是一条文件
+    路径、一段接口错误提示或者一个空壳（接口返回 `[]`）——提交闸门只在
+    `_task_answer` 里拦一道的话，这条路就绕过去了。
     """
     target = _task_file(turn.phase_task)
     if target is None:
         return None
     answer = _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
-    if answer is None or _task_path_answer(answer):
+    if answer is None or _task_path_answer(answer) or _task_error_body(answer):
+        return None
+    if _task_empty_answer(answer):
         return None
     return answer
 

@@ -33,6 +33,7 @@ from agent.brain import (
     STONE_PLAN_MAX,
     STONE_RESERVE_MIN,
     TASK_DATA_MARKER,
+    TASK_EMPTY_ANSWERS,
     TASK_END_MARKER,
     TASK_FILE_END,
     TASK_FILE_EXTS,
@@ -46,6 +47,7 @@ from agent.brain import (
     TASK_SOLUTION_MARKER,
     TASK_SUBMIT_LIMIT,
     TASK_TIMEOUT,
+    TASK_TOKEN_NAME_MAX,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
     WALL_BUILD_ROUNDS,
@@ -4087,3 +4089,303 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+# === issue #80：沙盒 URL 净化 / 提交闸门 / 任务标识（PK590610 / PK590555） ===
+
+
+def test_executor_refine_url_truncates_dirty_netloc():
+    """沙盒执行器的 URL 净化：脏字符跟在端口后面时截断 netloc（#80 的 S1）
+
+    回归：PK590610 的 R12–R13（PK590609 的 R12–R17 同款）
+    `[APIFAIL] http://localhost:8899`），API InvalidURL`——文档里的地址被
+    反引号、全角括号连同后面的英文一起抓了进来，`urlsplit` 并不报错（端口是
+    惰性校验），整条地址一路走到 urlopen 才炸，8 个回合读不到题面、任务 0 分。
+    截到第一个非主机字符为止，本地基址就回来了。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
+    assert match
+    namespace: dict = {}
+    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    refine = namespace["refine_url"]
+
+    # 反引号 + 全角括号 + 英文粘在端口后面（复盘里的原始形态）
+    assert refine("http://localhost:8899`），API") == "http://localhost:8899"
+    assert refine("http://127.0.0.1:8899），API") == "http://127.0.0.1:8899"
+    # 主机名里混进脏字符：截到脏字符为止（端口与路径随之丢掉）
+    assert refine("http://localhost），:8899") == "http://localhost"
+    # 认证段与 IPv6 字面量照旧保留
+    assert refine("http://user:pass@localhost:8899/x") == (
+        "http://user:pass@localhost:8899/x"
+    )
+    assert refine("http://[::1]:8899/x") == "http://[::1]:8899/x"
+    # 主机名整段都是脏字符时丢弃（拼不出能用的地址）
+    assert refine("http://），") == ""
+
+
+def test_task_error_body_only_matches_real_error_shapes():
+    """错误体特征只认"看着就是错误"的形态，正常答案不会被误伤
+
+    "故宫"的英文是 Forbidden City、城市名单里也可能出现 404 这类数字，
+    裸词匹配会把一份完全正确的答案拦下来。
+    """
+    # 命中：错误键、错误状态值、4xx/5xx 状态码、HTTP 状态短语、异常名、回溯
+    assert brain._task_error_body('{"status":"error","code":404}')
+    assert brain._task_error_body('{"code": 503}')
+    assert brain._task_error_body("404 Not Found")
+    assert brain._task_error_body("Endpoint not found")
+    assert brain._task_error_body("[APIFAIL] http://localhost:8899） InvalidURL")
+    assert brain._task_error_body("Traceback (most recent call last):")
+
+    # 不命中：正常的取数结果（含 Forbidden City 这种"看着像错误"的正文）
+    assert not brain._task_error_body('{"city": "北京", "count": 7}')
+    assert not brain._task_error_body("故宫（Forbidden City）共 404 处遗产点")
+    assert not brain._task_error_body('{"error": null, "count": 3}')
+    assert not brain._task_error_body('{"status": "ok", "count": 3}')
+
+
+def test_task_answer_never_submits_an_api_error_body(payload_factory, role_factory):
+    """答案区里是接口的错误响应体时绝不提交（PK590598 的 R14/R16 交的就是它）
+
+    回归：执行器把"有响应的正文"直接打进 `[SOLUTION]` 段，而 404 的错误 JSON
+    也是 200 + 一段正文，于是 `{"status":"error",...,"code":404}` 被当成答案
+    交了两遍，Judge 判 0，还各消耗掉一次提交额度。同一个局面下换成真正的
+    取数结果照样交卷——错误体闸门不会误伤正常答案。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    brain._TASK_LLM_STATE.clear()  # 上一个用例留下的 LLM 答案不参与本用例
+    payload = _stuck_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task,
+        "task_1_beijing.md",
+        '{"status":"error","message":"Endpoint not found","code":404}',
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 错误体不是答案：沙盒命令照旧下发，下一回合重新取数
+    assert sandbox_command(payload) != ""
+
+    # 取数取回来的才是答案：同一个局面下换成真正的取数结果照样交卷
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": '{"city": "北京", "count": 7}',
+    }
+
+
+def test_cached_answer_never_submits_an_api_error_body(payload_factory, role_factory):
+    """缓存里的答案同样要过错误体闸门（缓存是在执行器输出上直接建的）
+
+    回归：`_remember_task_answers` 只按"这一份出现过取数证据（`[API]`）"入
+    缓存，而 401/404 的错误正文同样带着 `[API]`——命中缓存时这条路会绕开
+    提交闸门，把一段错误提示直接交上去。
+    """
+    phase_task = "请阅读task_2_beijing.md"
+    payload = payload_factory(
+        round_no=2,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = (
+        "[exitCode:0]\n"
+        "[TASK]上一个任务\n"
+        "[API] http://localhost:8899/heritage?city=alpha => 12\n"
+        f"{TASK_SOLUTION_MARKER}/tmp/selfEvolutionTask/task_2_beijing.md\n"
+        '{"status":"error","code":401}\n'
+        f"{TASK_SOLUTION_END}\n"
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 缓存里的错误体不算答案：沙盒命令照旧下发，重新取数
+    assert sandbox_command(payload) != ""
+
+
+def test_task_token_keeps_the_task_file_name():
+    """标识里带上任务文件名：日志一眼认得出是哪个任务
+
+    回归：旧标识取描述开头 16 个可打印字符，而"请阅读"三个字先占掉 3 个位置，
+    中文描述"请阅读task_1_beijing.md，获取任务信息"算出来的是
+    `请阅读task_1_beijin`——文件名被砍掉一截，复盘报告因此把这种截断误判成
+    "文件名拼接 bug"（#80 的 R2-S1 记的 `task_1_alpham` 正是 `task_1_alpha.md`
+    截断后的样子）。
+    """
+    token = _task_token("请阅读task_1_beijing.md，获取任务信息")
+
+    assert token.startswith("task_1_beijing")
+    assert len(token.split("-")[0]) <= TASK_TOKEN_NAME_MAX
+    # 标识会被放进 `echo "…"`，只能是 ASCII 字母数字与短横线
+    assert re.fullmatch(r"[A-Za-z0-9-]+", token)
+
+
+def test_task_token_survives_long_shared_prefix():
+    """共同前缀很长的两份描述必须算出不同的标识
+
+    回归：旧标识只看开头 16 个字符，而任务描述是中文的——共同前缀（模板话术）
+    加上都以 `task_` 开头的文件名，两份不同的任务会撞到同一个标识上。
+    """
+    prefix = "请从沙盒中读取任务文件并按文档要求作答"  # 19 个字，超过旧的 16 字符窗口
+    alpha = _task_token(f"{prefix}task_1_alpha.md")
+    beta = _task_token(f"{prefix}task_1_beta.md")
+
+    assert alpha != beta
+    # 旧公式下这两条完全一样，用来盯住回归
+    assert re.sub(r"\W+", "", f"{prefix}task_1_alpha.md")[:16] == (
+        re.sub(r"\W+", "", f"{prefix}task_1_beta.md")[:16]
+    )
+
+
+def test_task_token_falls_back_without_file_name():
+    """描述里没点名文件时用通用前缀 + 摘要，标识依旧唯一且可放进命令"""
+    token = _task_token("请按沙盒里的任务说明作答")
+
+    assert token.startswith("task-")
+    assert re.fullmatch(r"[A-Za-z0-9-]+", token)
+    assert token != _task_token("请按沙盒里的任务要求作答")
+
+
+def test_task_output_ignores_another_task_with_shared_prefix(
+    payload_factory, role_factory,
+):
+    """另一份任务的沙盒输出不算本任务的输出
+
+    回归：标识撞车之后 `_task_output` 会把别人的输出认成自己的，看门狗
+    （`_TASK_WATCH`）接着上一个任务的计数、LLM 状态（`_TASK_LLM_STATE`）
+    串用上一个任务的答案——三处判断一起串味。
+    """
+    prefix = "请从沙盒中读取任务文件并按文档要求作答"
+    mine = f"{prefix}task_1_alpha.md"
+    payload = _stuck_task_payload(payload_factory, role_factory, mine, 11)
+
+    # 沙盒吐回来的是另一份任务的输出（带的是它自己的标识）
+    payload["lastCmdResult"] = _sandbox_result(
+        f"{prefix}task_1_beta.md", "另一份任务的输出\n",
+    )
+    assert brain._task_output(Turn.load(payload)) == ""
+
+    # 自己的输出照样认
+    payload["lastCmdResult"] = _sandbox_result(mine, "自己的输出\n")
+    assert brain._task_output(Turn.load(payload)) != ""
+
+
+def test_task_answer_rejects_empty_shell_from_sandbox(payload_factory, role_factory):
+    """沙盒取回来的数据是个空壳时不交卷（PK590610 的 R16 交的就是 "[]"）
+
+    两层闸门各拦一种写法：最短的 `[]` 过不了长度闸门（`short_or_missing`），
+    长度过了线的空壳（`[ , ]`）由 `_task_empty_answer` 拦下（`empty_answer`）。
+    两种都不该交——既拿不到分，又白占一次提交额度（交满 `TASK_SUBMIT_LIMIT`
+    次任务就被看门狗止损了）。有内容的答案不受影响。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    payload = _stuck_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", "[]",
+    )
+    assert "state=short_or_missing" in brain.task_brief(Turn.load(payload))
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", "[ , ]",
+    )
+    assert "state=empty_answer" in brain.task_brief(Turn.load(payload))
+    commands, _ = decide(payload)
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 空壳不是答案：沙盒命令照旧下发，下一回合重新取数
+    assert sandbox_command(payload) != ""
+
+    # 取到数据就照交不误：空壳闸门不会误伤正常答案
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": '{"city": "北京", "count": 7}',
+    }
+
+
+def test_llm_answer_is_not_submitted_when_it_is_empty(
+    payload_factory, role_factory,
+):
+    """LLM 回的 ANSWER 是个空壳时不交卷
+
+    `TASK_LLM_ANSWER_MIN_LEN` 只有 2（LLM 可能只给一个数），`[]`/`{}` 正好从
+    长度闸门里漏过去；交上去 Judge 判 0 分，还白占一次提交额度。
+    """
+    phase_task = "请阅读沙盒里的任务说明并作答"
+
+    for empty in sorted(TASK_EMPTY_ANSWERS) + ["[ ]", "[ , ]"]:
+        brain._TASK_LLM_STATE.clear()
+        payload = payload_factory(
+            round_no=11,
+            gold=0,
+            roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+            tasks=[(14, 14)],
+            phase_task=phase_task,
+        )
+        payload["llmResp"] = f"ANSWER: {empty}"
+        commands, _ = decide(payload)
+
+        command = commands.get("10011")
+        assert command is None or command["action"] != "submitAnswer", empty
+
+
+def test_llm_command_empty_output_is_not_an_answer(payload_factory, role_factory):
+    """LLM 指定的取数命令只吐回 `[]` 时不算取到数（#80 的 R16）"""
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: curl -s http://localhost:8899/heritage?city=beijing"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13, evidence="[]",
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+
+    # 命令取到真数据时照旧交卷
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13, evidence="晴，26℃",
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"]["action"] == "submitAnswer"
+
+
+def test_cached_empty_payload_is_not_submitted(payload_factory, role_factory):
+    """答案缓存里存的是空壳时同样不交卷（缓存直接建在执行器输出上）
+
+    这条路绕开了答案区的那道闸门，`[]` 一旦进了缓存，之后每个领到同一份
+    任务的任务点都会被原样交上去。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    brain._TASK_LLM_STATE.clear()
+    brain._TASK_ANSWER_CACHE["task_1_beijing.md"] = "[]"
+
+    payload = _stuck_task_payload(payload_factory, role_factory, phase_task, 11)
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+
+    # 缓存里是一条真答案时照样秒交
+    brain._TASK_ANSWER_CACHE["task_1_beijing.md"] = '{"city": "北京", "count": 7}'
+    commands, _ = decide(payload)
+    assert commands["10011"]["action"] == "submitAnswer"
