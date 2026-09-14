@@ -377,6 +377,18 @@ TASK_API_BODY_LIMIT = 400  # 单个响应体最多带回的字符数
 TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一）
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
+# 全盘兜底找接口文档时的文件名特征（S1，复盘 PK591809）：任务根目录里的
+# `.md` 首先命中的就是任务文件自己（任务书就是 `.md`，同样落在
+# `TASK_API_DOC_NAMES` 里），所以近处搜到的"文档"可能一份接口说明都不含，
+# 取数地址与鉴权 Key 都读不到——`[SCAN] docs=2 urls=1 key=no` 那个形态里，
+# `urls` 只剩本地接口那一条兜底，取数只能一路 404 到止损。手上这几份文档里
+# 一个本地接口地址都没有时，到全盘再找一遍（见执行器里的这段），但只认
+# 名字里写着"接口/文档"的那些：比 `\.md$` 窄得多，免得又把 /usr 下的库文档
+# 与任务文件自己捞回来占满名额。
+TASK_DOC_WIDE_NAMES = (
+    r"api", r"interface", r"swagger", r"openapi", r"readme", r"doc",
+    r"接口", r"说明", r"文档",
+)
 # 接口鉴权（S3，复盘 PK590918/PK590917）：接口文档的样例里写着该带哪个头，而
 # 执行器一直只发 `Accept`，R16 的 `[APIFAIL] ... HTTPError 401 => missing
 # 'Authorization' header` 就是这么来的——同一回合对手已经带着 Bearer 取到数
@@ -4052,6 +4064,7 @@ def _task_executor(task_path: str, offset: int = 0) -> str:
         .replace("__BODY_LIMIT__", str(TASK_API_BODY_LIMIT))
         .replace("__SOLVE_MAX__", str(TASK_SOLVE_MAX))
         .replace("__DOC_NAMES__", repr(TASK_API_DOC_NAMES))
+        .replace("__WIDE_DOC_NAMES__", repr(TASK_DOC_WIDE_NAMES))
         .replace("__SUFFIXES__", repr(TASK_API_PATH_SUFFIXES))
         .replace("__PRUNE__", repr(TASK_EXEC_PRUNE))
         .replace("__ROOTS__", repr(TASK_ROOTS))
@@ -4107,6 +4120,7 @@ SUFFIXES = __SUFFIXES__
 PRUNE = __PRUNE__
 ROOTS = __ROOTS__
 DOC_PRUNE = __DOC_PRUNE__
+WIDE_DOC_NAMES = __WIDE_DOC_NAMES__
 SOLUTION = __SOLUTION__
 SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
@@ -4474,6 +4488,21 @@ doc_files = find_files(DOC_NAMES, 6, doc_roots, DOC_PRUNE)
 if not doc_files:
     doc_files = find_files(DOC_NAMES, 6, ("/",), DOC_PRUNE)
 doc_text = "\\n".join(read(path) for path in doc_files)
+# 近处这几份文档里连一个本地接口地址都没抓到（S1，复盘 PK591809 的
+# `[SCAN] docs=2 urls=1 key=no`）时，到全盘再找一遍接口文档并进来：任务
+# 根目录里的 `.md` 首先命中的是任务文件自己（任务书就是 `.md`），上面那条
+# `if not doc_files` 的兜底因此永远触发不了——接口文档不在任务树里时一次都
+# 读不到，`endpoints` 只剩本地接口那一行兜底，取数只能一路 404 到止损
+# （`api=0`、答案区永远为空）。只认 `WIDE_DOC_NAMES` 那几种名字，避免把
+# 无关的 `.md` 再捞一堆回来。
+if not re.search(r"https?://(?:localhost|127\\.0\\.0\\.1)", doc_text):
+    wide = [
+        path for path in find_files(WIDE_DOC_NAMES, 6, ("/",), DOC_PRUNE)
+        if path not in doc_files
+    ]
+    if wide:
+        doc_files += wide
+        doc_text += "\\n" + "\\n".join(read(path) for path in wide)
 urls = endpoints(doc_text)
 # 鉴权 Key 先从接口文档里找，找不到再退到任务文件（S3）：文档写的是"该带哪个
 # 头"，偶尔也有把 Key 直接写在题面里的。两处都没有时 headers 里只剩 Accept，
