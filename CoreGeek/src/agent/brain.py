@@ -4198,14 +4198,38 @@ def queries(text, name):
     return picked[:QUERY_MAX]
 
 
+def swap_path(url, value):
+    """样例地址末尾那段数字换成任务自己的查询词（换不出来时返回空串）
+
+    接口文档给的调用样例常常是个模板：`http://localhost:8899/api/task/1`
+    里的 `1` 是"第几个样例"，照抄下来只会得到一行
+    `Endpoint not found:/api/task/1`（复盘 PK591787 的 R16 就是这条），而把
+    查询词接在样例后面（`.../api/task/1/beijing`）同样不是文档里那个接口。
+    这时的正解是把末尾那段数字换成自己的查询词（`.../api/task/beijing`）。
+    末尾不是数字（样例已经写成真实路径，或压根没有路径）时返回空串，
+    调用方不加这条候选，取数名额照旧留给原来那几条。
+    """
+    match = re.match(r"^(.*/)(\\d+)([?#].*)?$", url)
+    if not match:
+        return ""
+    return match.group(1) + value + (match.group(3) or "")
+
+
 def candidates(text, name, urls):
-    """这一份任务要试的调用地址：文档样例 + 把样例里的查询词换成任务自己的"""
+    """这一份任务要试的调用地址：文档样例 + 把样例里的查询词换成任务自己的
+
+    样例地址的改法两种都算：带查询串的换查询串里的值，末尾是数字的换整段
+    路径（见 `swap_path`）。后一种排在清单末尾：它只在样例确实是个模板时才
+    有意义，而清单会被 `TASK_API_MAX_CALLS` 截断——真到截断那一步，该先
+    保住的是文档里那几条样例与根地址那几个兜底后缀。
+    """
     urls = urls or [BASE]
+    values = queries(text, name)
     out = []
     for url in urls[:2]:
         if url not in out:
             out.append(url)
-        for value in queries(text, name):
+        for value in values:
             variant = (
                 re.sub(r"=([^&/]+)", "=" + value, url, count=1)
                 if "=" in url
@@ -4217,6 +4241,11 @@ def candidates(text, name, urls):
         variant = BASE.rstrip("/") + suffix
         if variant not in out:
             out.append(variant)
+    for url in urls[:2]:
+        for value in values:
+            variant = swap_path(url, value)
+            if variant and variant not in out:
+                out.append(variant)
     return out
 
 

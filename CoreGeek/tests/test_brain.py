@@ -5035,6 +5035,51 @@ def test_executor_candidates_never_append_task_file_stem():
     assert f"{brain.TASK_API_DEFAULT}/alpha" in out
 
 
+def test_executor_candidates_swap_numeric_path_sample():
+    """样例地址末尾是数字时补一条"换成查询词"的候选（PK591787 的 R16）
+
+    接口文档里的调用样例常常写成 `http://localhost:8899/api/task/1` 这样的
+    模板，照抄下来只会拿到一行 `Endpoint not found:/api/task/1`（R16 的
+    404 诊断行），而把查询词接在样例后面（`.../api/task/1/beijing`）同样不是
+    文档里那个接口。这条候选把末尾那段数字换成自己的查询词，正解
+    `.../api/task/beijing` 因此进得了取数清单。
+    """
+    _, candidates = _executor_queries()
+
+    out = candidates(
+        "请查询该城市的文化遗产", "task_1_beijing.md",
+        ["http://localhost:8899/api/task/1"],
+    )
+    # 样例本身排在最前（先照文档原样试一次），两条改写都要在清单里
+    assert out[0] == "http://localhost:8899/api/task/1"
+    assert "http://localhost:8899/api/task/beijing" in out
+    assert "http://localhost:8899/api/task/1/beijing" in out
+    # 清单没有被取数名额截断：正解确实轮得到（一条命令最多请求 MAX_CALLS 次）
+    assert len(out) <= brain.TASK_API_MAX_CALLS
+
+
+def test_executor_candidates_leave_real_paths_alone():
+    """样例地址不是模板（末尾没有数字）时不凭空造候选，清单维持原样"""
+    _, candidates = _executor_queries()
+
+    out = candidates(
+        "请查询该城市的文化遗产", "task_1_beijing.md",
+        ["http://localhost:8899/api/city"],
+    )
+    assert out == [
+        "http://localhost:8899/api/city",
+        "http://localhost:8899/api/city/beijing",
+        f"{brain.TASK_API_DEFAULT}/",
+        f"{brain.TASK_API_DEFAULT}/api",
+        f"{brain.TASK_API_DEFAULT}/docs",
+    ]
+    # 根地址（host 后面没有路径）同样不换
+    assert candidates("", "task_1_beijing.md", [])[:2] == [
+        brain.TASK_API_DEFAULT,
+        f"{brain.TASK_API_DEFAULT}/beijing",
+    ]
+
+
 def test_executor_api_fail_reports_status_and_body(capsys):
     """取数失败的诊断行带上 HTTP 状态码与响应体（#77 的 S1）
 
