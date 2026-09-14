@@ -39,7 +39,7 @@ automation:
 claude:
   executable: "claude"  # Claude Code CLI路径
   work_dir: "."  # 项目根目录
-  timeout: 600
+  timeout: 1200  # 单任务上限（实测复杂复盘任务需 500~900s，600s 会被误杀）
   # 无人值守执行参数（自动化场景必需）:
   #   -p                             打印模式，执行完立即退出（不加会进入交互模式而挂住）
   #   --permission-mode acceptEdits  自动接受文件编辑；如需执行命令改为 bypassPermissions
