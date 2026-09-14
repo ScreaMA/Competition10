@@ -4,8 +4,10 @@
 
 策略概览：
     白天：工人优先建造武器工事（加特林/电磁狙击炮/火箭发射台），
-          再采集石头建造围墙；围墙建完后用富余资源换取金币和武器升级。
-          开拓者优先完成自进化类任务（任务点领取 + 沙盒作答），
+          再采集石头建造围墙（先封敌方来路那一侧）；
+          围墙建完后用富余资源换取金币和武器升级。
+          开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
+          描述里没给文件名时先探测沙盒任务目录），
           无任务时跟随武器塔；天黑前工人回防到武器旁，
           但火力/围墙不达标时先抢建，角色不会整回合空转。
     夜晚：每个角色操控一座武器攻击机器人，优先攻击威胁最高的目标。
@@ -79,6 +81,10 @@ MIN_TOWERS_BEFORE_NIGHT = 2  # 入夜前的最低火力：不足时优先抢建�
 # 入夜前的最低围墙段数：复盘里首夜防线只有一座光塔、零段围墙，这里要求
 # 临天黑时再抢铺一段（手里有石材才抢建，没石材仍然按原策略回防）
 MIN_WALLS_BEFORE_NIGHT = 2
+# 防守方每天至少要保证铺好的围墙段数：复盘里防守方整天零围墙、正面毫无阻挡，
+# 机器人直接贴脸打基地，而同一局的进攻方反倒把来路封得严严实实。
+# LLM 计划把墙压到 0 时防守方仍按下限留出石材（见 `_wall_target`）。
+DEFENDER_WALL_QUOTA = 1
 WEAPON_UPGRADE_VOUCHER = "WeaponUpgradeVoucher1"  # 武器升级券（level1->level2）
 UPGRADE_GOLD = 100  # 购买一张武器升级券所需金币
 # 金币闲置熔断线：手里攥着够再建两座塔的金币时，不允许再把塔数配额压到满编
@@ -115,6 +121,11 @@ TASK_FILE_PATTERN = re.compile(r"[A-Za-z0-9_./\\-]+\.(?:md|txt|json|csv|log)")
 TASK_MARKER = "[TASK]"
 # 沙盒输出中的答案结束标记：它之后的诊断信息（目录列表等）永远不会被当成答案
 TASK_END_MARKER = "[TASK_END]"
+# 沙盒探测标记：任务描述里没给文件名时先探一次任务目录，这个标记下的输出
+# 只是目录/文件名清单，`_task_answer` 永远不会把它当成答案提交（见 `_sandbox_probe`）
+TASK_PROBE_MARKER = "[TASK_PROBE]"
+# 沙盒里自进化任务的目录约定：描述没给文件名时到这些目录里找任务文件
+TASK_PROBE_DIRS = ("/tmp/selfEvolutionTask", "/tmp/selfEvolution")
 
 # 是否提交LLM策略咨询prompt（可用环境变量 LLM_PROMPT=0 关闭）
 # 接口文档：每队每个游戏日的 LLM 调用额度为 3 次（自进化任务期间不计入），
@@ -332,7 +343,8 @@ def _worker_day_logic(
 
     `plan` 是LLM建议落下来的有界计划（见 `_llm_plan`）：今天要保证几座塔、
     先铺几段围墙、能不能买升级券。默认计划与改造前的行为完全一致；计划里的
-    塔数还要再经 `_tower_target` 做一次金币闲置熔断，金币富余时不会被压低。
+    塔数还要再经 `_tower_target` 做一次金币闲置熔断，金币富余时不会被压低，
+    围墙段数同理要走一遍 `_wall_target`（防守方有下限）。
 
     参数:
         turn: 当前回合信息
@@ -346,8 +358,8 @@ def _worker_day_logic(
     """
     economy = _is_economy_worker(turn, worker)
     # 围墙配额还没铺满时先施工、不急着变现，对应复盘建议的
-    # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"
-    wall_quota = len(turn.walls()) < plan.wall
+    # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"（防守方还有下限，见 `_wall_target`）
+    wall_quota = len(turn.walls()) < _wall_target(turn, plan)
 
     # 优先建造武器（塔数由 `_tower_target` 决定：计划配额 + 金币闲置熔断）
     if (
@@ -1046,13 +1058,19 @@ def _sandbox_command(turn: Turn) -> str:
     一条命令里尽量多拿信息（复盘里敌方逐次试错 401→400，白丢好几个回合）：
     描述里的路径读不到时，按文件名在沙盒里再找一次；末尾附上目录列表作为
     诊断线索。答案由 `TASK_END_MARKER` 界定，诊断信息不会被当成答案提交。
+
+    描述里连文件名都没有时（"请按沙盒里的任务说明作答"这类），先按
+    `_sandbox_probe` 探一次沙盒任务目录，下一回合从探测结果里认出文件名
+    再走上面的读文件流程——复盘里"任务卡在任务点反复答非所问、整个任务
+    周期空转"就是从"不知道该读哪个文件"开始的。
     """
     if not turn.phase_task or _task_answer(turn) is not None:
         return ""
 
-    target = _task_file(turn.phase_task)
+    # 描述里没给文件名时，用上一回合的探测结果找；还没探过就先探一次
+    target = _task_file(turn.phase_task) or _task_file(turn.last_cmd_result)
     if target is None:
-        return ""
+        return _sandbox_probe(turn)
 
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
     # 描述里给的可能是带目录的路径，兜底搜索只按文件名找
@@ -1063,6 +1081,41 @@ def _sandbox_command(turn: Turn) -> str:
     )
     scan = "ls -a -- . 2>&1 | head -40"
     return f'echo "{marker}"; {read}; echo "{TASK_END_MARKER}"; {scan}'
+
+
+def _sandbox_probe(turn: Turn) -> str:
+    """任务描述里找不到文件名时，探测沙盒里的任务文件
+
+    列出沙盒里存放任务说明的目录（`TASK_PROBE_DIRS`），并把目录下
+    文件名像任务文件的那些连同完整路径一起打印出来，下一回合
+    `_sandbox_command` 就能从输出里认出该读哪个文件。
+
+    探测输出带 `TASK_PROBE_MARKER`：`_task_answer` 只认 `TASK_MARKER`，
+    所以目录列表永远不会被当成答案提交；`find` 排在 `ls` 前面是为了先拿到
+    完整路径（`cat` 才找得到文件），`ls` 只作诊断线索。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        需要提交给沙盒执行的探测命令
+    """
+    token = _task_token(turn.phase_task)
+    dirs = " ".join(f'"{path}"' for path in TASK_PROBE_DIRS)
+    # 先找任务文件本身（task*），再退到 spec/说明文档：只按文件名找，
+    # 免得把沙盒里的其他文档当成任务文件读回来
+    found = "; ".join(
+        f'find "{path}" -maxdepth 2 -type f -name "task*" 2>/dev/null;'
+        f' find "{path}" -maxdepth 2 -type f'
+        ' \\( -name "spec*" -o -name "*.md" \\) 2>/dev/null'
+        for path in TASK_PROBE_DIRS
+    )
+    return (
+        f'echo "{TASK_PROBE_MARKER}{token}"; '
+        f"( {found} ) | head -40; "
+        f"ls -a -- {dirs} 2>&1 | head -40; "
+        f'echo "{TASK_END_MARKER}"'
+    )
 
 
 def _task_file(phase_task: str) -> str | None:
@@ -1446,11 +1499,38 @@ def _side_room(
     return ymin
 
 
+def _wall_side_order(turn: Turn) -> tuple[str, ...]:
+    """围墙的铺设优先顺序：先封敌方来路，其余按"上 -> 左 -> 下 -> 右"
+
+    复用塔位那套方位判定（`_enemy_sides`），让围墙与炮塔压在同一侧：来路先被
+    墙压窄、再被塔罩住，机器人只能顶着火力拆墙（复盘里"防守方 0 段围墙、正面
+    无任何阻挡"，以及"用墙把来路压缩进塔的射程"）。
+
+    看不到敌方单位时各方位的优先级相同，顺序退化成"上 -> 左 -> 下 -> 右"，
+    与改造前完全一致。
+
+    参数:
+        turn: 当前回合信息
+
+    返回:
+        四个方位的铺设顺序（up/left/down/right 的一个排列）
+    """
+    enemy_sides = _enemy_sides(turn)
+    return tuple(sorted(
+        TOWER_SIDES,
+        key=lambda side: (
+            _side_priority(side, enemy_sides, None),
+            TOWER_SIDES.index(side),
+        ),
+    ))
+
+
 def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
     """计算围墙建造顺序（基地周围第二圈）
 
-    按“上边 -> 左边 -> 下边 -> 右边”的顺序环绕基地铺一圈围墙，
-    并在右下角留一个入口供角色进出。超出地图或落在非陆地上的点会被过滤掉。
+    按 `_wall_side_order` 给出的方位顺序（先敌方来路、其余上左下右）环绕基地
+    铺一圈围墙，并在右下角留一个入口供角色进出。超出地图或落在非陆地上的点
+    会被过滤掉。
     """
     station = turn.station()
     if station is None:
@@ -1462,16 +1542,21 @@ def _calc_wall_order(turn: Turn) -> tuple[Pos, ...]:
     xmin, xmax = min(xs), max(xs)
     ymin, ymax = min(ys), max(ys)
 
-    # 矩形外围（留一个入口）
-    order = [
+    # 矩形四条边各自的格子（同一格不会落在两条边上）
+    by_side: dict[str, list[Pos]] = {
         # 上边（从右到左）
-        *(Pos(x, ymax + 2) for x in range(xmax + 2, xmin - 3, -1)),
+        "up": [Pos(x, ymax + 2) for x in range(xmax + 2, xmin - 3, -1)],
         # 左边（从上到下）
-        *(Pos(xmin - 2, y) for y in range(ymax + 1, ymin - 2, -1)),
+        "left": [Pos(xmin - 2, y) for y in range(ymax + 1, ymin - 2, -1)],
         # 下边（从左到右）
-        *(Pos(x, ymin - 2) for x in range(xmin - 2, xmax + 3)),
+        "down": [Pos(x, ymin - 2) for x in range(xmin - 2, xmax + 3)],
         # 右边（从下到上）
-        *(Pos(xmax + 2, y) for y in range(ymin - 1, ymax + 2)),
+        "right": [Pos(xmax + 2, y) for y in range(ymin - 1, ymax + 2)],
+    }
+    order = [
+        pos
+        for side in _wall_side_order(turn)
+        for pos in by_side[side]
     ]
 
     # 留一个入口（右下角）
@@ -1580,15 +1665,47 @@ def _plan_summary(turn: Turn, plan: LlmPlan) -> str:
     """把本回合的既定计划写成一句人话
 
     计划出自 `_calc_tower_sites`/任务排序等同一套决策函数，LLM 因此可以对
-    具体数字提意见，而不是和指令生成器各说各话。塔数报的是
-    `_tower_target`（含金币闲置熔断），所以 LLM 看到的就是执行层真正要建的座数。
+    具体数字提意见，而不是和指令生成器各说各话。塔数与围墙段数报的是
+    `_tower_target`/`_wall_target`（含金币闲置熔断与防守方下限），
+    所以 LLM 看到的就是执行层真正要建的座数/段数。
     """
     return (
         f"武器目标 {_tower_target(turn, plan)} 座（现有 {len(turn.weapons())} 座）；"
-        f"优先铺围墙 {plan.wall} 段（现有 {len(turn.walls())} 段）；"
+        f"优先铺围墙 {_wall_target(turn, plan)} 段（现有 {len(turn.walls())} 段）；"
         f"升级券 {'可买' if plan.upgrade else '今天不买'}；"
         f"布防方位 {plan.defend or _enemy_brief(turn)}"
     )
+
+
+def _wall_target(turn: Turn, plan: LlmPlan) -> int:
+    """本回合要保证铺好的围墙段数（防守方有下限）
+
+    正常情况下就是 LLM 计划里的 `wall`；但防守方在此基础上至少保证
+    `DEFENDER_WALL_QUOTA` 段：防守方考的是扛住进攻，正面没有围墙时机器人会
+    直接贴脸打基地（复盘里"防守方围墙 0 段、正面无任何阻挡、射程只覆盖基地
+    贴脸区"）。进攻方不受影响，仍然完全按 LLM 计划走（0 段就是不铺）。
+
+    配额管的是"今天要铺几段"这个目标：配额没铺满时工人优先采石、先施工，
+    矿石不急着变现、金币也留到围墙立起来再花（见 `_worker_day_logic`）。
+    地图上既没有石矿、背包里也没有存货时限额自动失效——没有石材就铺不出墙，
+    再扣着经济线只会让矿石卖不掉、金币闲置。
+
+    参数:
+        turn: 当前回合信息
+        plan: 本回合的LLM计划
+
+    返回:
+        要保证铺好的围墙段数（0..LLM_MAX_WALLS）
+    """
+    if turn.team_type == "defender":
+        # 没有石材来源（地图上没石矿、背包里也没存货）时围墙根本无从铺起，
+        # 这时不能因为"还差一段墙"把经济线扣住——矿石卖不掉就是金币闲置
+        has_stone = bool(turn.stone_mines()) or any(
+            WALL_MATERIAL in unit.backpack for unit in turn.workers()
+        )
+        if has_stone:
+            return max(plan.wall, DEFENDER_WALL_QUOTA)
+    return plan.wall
 
 
 def _enemy_brief(turn: Turn) -> str:
