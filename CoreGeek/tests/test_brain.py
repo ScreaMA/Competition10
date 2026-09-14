@@ -5284,7 +5284,9 @@ def _executor_queries():
         "QUERY_MAX": brain.TASK_API_QUERY_MAX,
         "SUFFIXES": brain.TASK_API_PATH_SUFFIXES,
     }
-    prelude = "import os\nimport re\n" + skips.group(0) + "\n"
+    # 查询词里的中文要先百分号编码（见 `candidates`），与沙盒脚本顶部的
+    # `import urllib.parse` 对应
+    prelude = "import os\nimport re\nimport urllib.parse\n" + skips.group(0) + "\n"
     exec(prelude + body.group(0), namespace)  # noqa: S102
     return namespace["queries"], namespace["candidates"]
 
@@ -5303,6 +5305,69 @@ def test_executor_query_words_drop_task_file_stem():
     assert queries("请查询该城市的文化遗产", "task_1_alpha.md") == ["alpha"]
     # 正文里再提到一次这个文件名时，同样不该把它当成查询词
     assert queries("请阅读task_1_alpha.md", "task_1_alpha.md") == ["alpha"]
+
+
+def test_executor_query_words_read_the_cjk_task_file_stem():
+    """任务文件名写成中文时，中文词干本身就是查询词（S1）
+
+    按非字母切词的旧写法在 `task_1_北京.md` 上一个查询词都取不出来，
+    `QUERY_MAX` 两个名额全落到文档正文里的英文词上（`GET`、`heritage`
+    这类模板里的路径名/动词），拼进样例地址必然取不到数——与"整段文件名
+    当查询词"是同一个坑的另一种形态，而中文词干恰恰是这一段里唯一能当
+    查询值用的东西。
+    """
+    queries, _ = _executor_queries()
+
+    # task_1_北京.md -> 北京：英文词干排在前，中文词干紧随其后
+    assert queries("请查询该城市的文化遗产", "task_1_北京.md") == ["北京"]
+    # 中英混排时两边的词都在，英文词干照旧优先
+    assert queries("请查询该城市的文化遗产", "task_1_beijing_北京.md") == [
+        "beijing", "北京",
+    ]
+    # 正文里再提到一次这个中文名时，中文词干照旧排在正文切出来的英文片段
+    # （`task_1`，`re` 的字符类跨不过中文）前面
+    assert queries("请阅读task_1_北京.md", "task_1_北京.md")[0] == "北京"
+
+
+def test_executor_candidates_encode_a_cjk_query_word():
+    """中文查询词拼进样例地址前先做百分号编码（S1）
+
+    `urlopen` 只吃 ASCII 地址：`.../weather?city=北京` 这种写法在沙盒里只会
+    换来一行 `[APIFAIL] ... UnicodeEncodeError`（异常被 `fetch` 兜住，这一
+    回合照旧 `api=0`），取数名额白烧一次。编码之后拼出来的候选与文档样例
+    自己那一份同形（`endpoints`/`refine_url` 就是这么处理文档里的中文的）。
+    """
+    _, candidates = _executor_queries()
+
+    out = candidates("请查询该城市的文化遗产", "task_1_北京.md", [])
+    assert f"{brain.TASK_API_DEFAULT}/%E5%8C%97%E4%BA%AC" in out
+    # 候选地址全是 ASCII：发不出去的地址一个都不该混进取数清单
+    for url in out:
+        assert url == url.encode("ascii", "ignore").decode("ascii")
+
+    # 样例地址末尾是数字（模板）时，换进去的查询词同样要编码
+    out = candidates(
+        "请查询该城市的文化遗产", "task_1_北京.md",
+        ["http://localhost:8899/api/task/1"],
+    )
+    assert "http://localhost:8899/api/task/%E5%8C%97%E4%BA%AC" in out
+
+
+def test_executor_runs_the_script_unbuffered():
+    """执行器用 `python3 -u -` 跑（S1）
+
+    整条沙盒命令限时 15 秒，超时会被判题器掐掉；管道里的 Python 默认按块
+    缓冲，被 kill 时缓冲区里的 `[SCAN]` / `[API]` / `[APIFAIL]` 会一起丢掉
+    ——输出里于是"看不出执行器开过工"，看门狗按读文件死循环计数，接上任务
+    后的第 3 个回合就熔断（报告里"读题成功、api=0、watch r0→r3 后放弃"）。
+    无缓冲至少保住已经打出来的那几行取数凭证。
+    """
+    command = _task_executor("task_1_beijing.md")
+
+    assert "-u - <<'PYEOF'" in command
+    # 解释器仍然是挑出来的那一个，heredoc 结束符照旧独占一行
+    assert "for P in python3 python" in command
+    assert command.endswith("PYEOF")
 
 
 def test_executor_candidates_never_append_task_file_stem():
