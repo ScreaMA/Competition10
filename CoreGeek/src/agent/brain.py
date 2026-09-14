@@ -3795,6 +3795,11 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
     "缺 Authorization 头"（复盘 PK591784 的 R16 401）而命令里一点鉴权材料都
     没有时同样丢掉——执行器的请求会带上文档里的 Key，比这条必然 401 的命令
     更接近答案。
+
+    最后一道是路径闸门（`_task_command_path_ok`，S3）：命令拿裸任务文件名读文件、
+    而这一回合手上又没有它的真实路径时（上一回合的回读段不在输出里）同样丢掉
+    ——`cat task_1_alpha.md` 必然只换来一行 `No such file or directory`
+    （PK591930 的 R16、PK592086 的 R17），改走执行器还能顺手把真实路径读回来。
     """
     reply = str(payload.get("llmResp") or "")
     if not turn.phase_task or not reply:
@@ -3808,6 +3813,9 @@ def _consume_task_reply(turn: Turn, payload: dict[str, Any]) -> None:
                 command
                 and _shell_command_ok(command)
                 and _task_command_auth_ok(command, turn.last_cmd_result or "")
+                and _task_command_path_ok(
+                    command, turn.phase_task, turn.last_cmd_result or "",
+                )
             ):
                 state["pending_cmd"] = command
                 return
@@ -3929,6 +3937,54 @@ def _task_command_auth_ok(command: str, evidence: str) -> bool:
     if TASK_AUTH_REQUEST_PATTERN.search(command):
         return True  # 带过鉴权材料，放行给接口判
     return TASK_AUTH_DEMAND_PATTERN.search(evidence) is None
+
+
+def _task_command_path_ok(
+    command: str,
+    phase_task: str,
+    result: str,
+) -> bool:
+    """LLM 的命令是不是在拿"沙盒里根本找不到"的裸任务文件名读文件（S3）
+
+    沙盒的工作目录是 `/`，任务文件在 `/tmp/selfEvolutionTask/...` 这类目录下，
+    `cat task_1_alpha.md` 这样的裸文件名一律解析不到，只会换来一行
+    `cat: task_1_alpha.md: No such file or directory`——复盘 PK591930 的 R16 与
+    PK592086 的 R17 都是这条：命令一个字都没读到，一个任务回合白搭（任务窗口
+    一共 `TASK_TIMEOUT_ROUNDS` 个回合），LLM 还得再猜一次路径。
+
+    真实路径从上一回合的回读段里取（`_task_paths`：`[TASK_FILE]<绝对路径>` 行，
+    执行器那条命令每回合都会把沙盒里的任务文件读回来一遍）。文件在表里就放行：
+    `_absolute_paths` 会把命令里的裸文件名补成表里那个绝对路径，命令跑得通。
+    **不在表里**说明这一回合手上根本没有它的路径（上一回合跑的是 LLM 的命令、
+    或者交卷指令，回读段不在输出里），这时裸文件名必然解析不到，命令丢掉、改走
+    执行器兜底（`_sandbox_command`）——执行器的命令自带回读段，下一回合的真实
+    路径就在手里，LLM 再给的命令也就能补全了。取舍与 `_shell_command_ok`/
+    `_task_command_auth_ok` 一致：宁可换一条更接近答案的命令，也不拿一个任务
+    回合去赌一条注定报 `No such file` 的命令。
+
+    只认任务描述点名的那一份文件（`_task_file`）：命令里的其他文件（自己生成的
+    `out.json` 之类）不归这条闸门管，误伤面因此最小；描述里给的本来就是路径
+    （含 `/`）时同样不判——那多半是 LLM 从回读段里抄来的，交给 `_absolute_paths`。
+    命令自己 `cd` 进了某个目录时也不判：裸文件名在那边解析得到，这条命令本来就
+    是能跑的（`_absolute_paths` 只在表里有真实路径时才补它，表里没有时原样放行，
+    这条命令在沙盒里照样跑得通）。
+
+    参数:
+        command: LLM 给的沙盒命令（已过前面两道体检）
+        phase_task: 当前任务描述（其中点名了要读哪份任务文件）
+        result: 报文的 `lastCmdResult`（回读段在其中）
+
+    返回:
+        True 表示这条命令可以下发
+    """
+    name = _task_file(phase_task)
+    if not name or "/" in name or "\\" in name:
+        return True  # 描述里没点名文件，或给的本来就是路径
+    if re.search(r"\bcd\s", command):
+        return True  # 命令自己换了工作目录，裸文件名在那边的含义无从判起
+    if re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w.-])", command) is None:
+        return True  # 命令没碰这份任务文件，与路径无关
+    return name in _task_paths(result)
 
 
 # 沙盒里被调用的脚本可能是 CRLF 行尾（S1）：任务自带的校验脚本按 Windows 换行
