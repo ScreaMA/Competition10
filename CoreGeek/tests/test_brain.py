@@ -1707,6 +1707,93 @@ def test_pioneer_skips_sandbox_error_output(payload_factory, role_factory):
     assert "10011" not in commands
 
 
+def test_task_answer_never_submits_an_api_error_body(payload_factory, role_factory):
+    """答案区里是接口的错误响应体时绝不提交（PK590598 的 R14/R16 交的就是它）
+
+    回归：执行器把"有响应的正文"直接打进 `[SOLUTION]` 段，而 404 的错误 JSON
+    也是 200 + 一段正文，于是 `{"status":"error",...,"code":404}` 被当成答案
+    交了两遍，Judge 判 0，还各消耗掉一次提交额度。同一个局面下换成真正的
+    取数结果照样交卷——错误体闸门不会误伤正常答案。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    brain._TASK_LLM_STATE.clear()  # 上一个用例留下的 LLM 答案不参与本用例
+    payload = _stuck_task_payload(payload_factory, role_factory, phase_task, 11)
+
+    payload["lastCmdResult"] = _solution_result(
+        phase_task,
+        "task_1_beijing.md",
+        '{"status":"error","message":"Endpoint not found","code":404}',
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 错误体不是答案：沙盒命令照旧下发，下一回合重新取数
+    assert sandbox_command(payload) != ""
+
+    # 取数取回来的才是答案：同一个局面下换成真正的取数结果照样交卷
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md", '{"city": "北京", "count": 7}',
+    )
+    commands, _ = decide(payload)
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": '{"city": "北京", "count": 7}',
+    }
+
+
+def test_cached_answer_never_submits_an_api_error_body(payload_factory, role_factory):
+    """缓存里的答案同样要过错误体闸门（缓存是在执行器输出上直接建的）
+
+    回归：`_remember_task_answers` 只按"这一份出现过取数证据（`[API]`）"入
+    缓存，而 401/404 的错误正文同样带着 `[API]`——命中缓存时这条路会绕开
+    提交闸门，把一段错误提示直接交上去。
+    """
+    phase_task = "请阅读task_2_beijing.md"
+    payload = payload_factory(
+        round_no=2,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = (
+        "[exitCode:0]\n"
+        "[TASK]上一个任务\n"
+        "[API] http://localhost:8899/heritage?city=alpha => 12\n"
+        f"{TASK_SOLUTION_MARKER}/tmp/selfEvolutionTask/task_2_beijing.md\n"
+        '{"status":"error","code":401}\n'
+        f"{TASK_SOLUTION_END}\n"
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("10011")
+    assert command is None or command["action"] != "submitAnswer"
+    # 缓存里的错误体不算答案：沙盒命令照旧下发，重新取数
+    assert sandbox_command(payload) != ""
+
+
+def test_task_error_body_only_matches_real_error_shapes():
+    """错误体特征只认"看着就是错误"的形态，正常答案不会被误伤
+
+    "故宫"的英文是 Forbidden City、城市名单里也可能出现 404 这类数字，
+    裸词匹配会把一份完全正确的答案拦下来。
+    """
+    # 命中：错误键、错误状态值、4xx/5xx 状态码、HTTP 状态短语、异常名、回溯
+    assert brain._task_error_body('{"status":"error","code":404}')
+    assert brain._task_error_body('{"code": 503}')
+    assert brain._task_error_body("404 Not Found")
+    assert brain._task_error_body("Endpoint not found")
+    assert brain._task_error_body("[APIFAIL] http://localhost:8899） InvalidURL")
+    assert brain._task_error_body("Traceback (most recent call last):")
+
+    # 不命中：正常的取数结果（含 Forbidden City 这种"看着像错误"的正文）
+    assert not brain._task_error_body('{"city": "北京", "count": 7}')
+    assert not brain._task_error_body("故宫（Forbidden City）共 404 处遗产点")
+    assert not brain._task_error_body('{"error": null, "count": 3}')
+    assert not brain._task_error_body('{"status": "ok", "count": 3}')
+
+
 # === 夜晚决策 ===
 
 
@@ -4087,3 +4174,34 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+def test_executor_refine_url_truncates_dirty_netloc():
+    """沙盒执行器的 URL 净化：脏字符跟在端口后面时截断 netloc（S1）
+
+    回归：PK590609 的 R12–R17 连续 6 回合
+    `[APIFAIL] http://localhost:8899`），API InvalidURL`——文档里的地址被
+    反引号、全角括号连同后面的英文一起抓了进来，`urlsplit` 并不报错（端口是
+    惰性校验），整条地址一路走到 urlopen 才炸，8 个回合读不到题面、任务 0 分。
+    截到第一个非主机字符为止，本地基址就回来了。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
+    assert match
+    namespace: dict = {}
+    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    refine = namespace["refine_url"]
+
+    # 反引号 + 全角括号 + 英文粘在端口后面（复盘里的原始形态）
+    assert refine("http://localhost:8899`），API") == "http://localhost:8899"
+    assert refine("http://127.0.0.1:8899），API") == "http://127.0.0.1:8899"
+    # 主机名里混进脏字符：截到脏字符为止（端口与路径随之丢掉）
+    assert refine("http://localhost），:8899") == "http://localhost"
+    # 认证段与 IPv6 字面量照旧保留
+    assert refine("http://user:pass@localhost:8899/x") == (
+        "http://user:pass@localhost:8899/x"
+    )
+    assert refine("http://[::1]:8899/x") == "http://[::1]:8899/x"
+    # 主机名整段都是脏字符时丢弃（拼不出能用的地址）
+    assert refine("http://），") == ""
