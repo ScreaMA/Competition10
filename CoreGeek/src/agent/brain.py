@@ -23,6 +23,10 @@
 `_TASK_ANSWER_CACHE`（内容全部来自执行器的产出），未命中就走原来的
 执行流程；LLM 建议也从请求里的 `llmResp` 现解析成有界计划（`_llm_plan`），
 建议与指令出自同一套决策函数。
+任务看门狗（`_TASK_WATCH`）同样只保留最近一回合的观察值（任务标识 + 回合号
++ 沙盒输出），回合号不连续就从头计数，因此它描述的是"当前这一局这个任务"；
+沙盒反复回读同一份文件或任务超时交不上卷时由它止损（见 `_task_abandoned`），
+不再让开拓者被一个拿不到答案的任务永久占死。
 """
 
 import os
@@ -99,6 +103,11 @@ TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)  # 武器建造顺序（按射程由�
 STONE_BATCH = 3  # 工人采集石头的批次大小（越小围墙越早开工）
 WALL_BUILD_PRIORITY = 1000  # 围墙建造优先级
 SELL_BATCH = 10  # 卖给小贩的矿石批次大小
+# 纯收入矿石（铁/铜）的出售下限（S2）：铁/铜不参与砌墙，攒批没有任何好处，
+# 手里有一块就变现一块。石材另算——它既是收入也是围墙材料，攒够一批再卖
+# 更省回合（见 `_trade_logic`）。复盘里防守方的背包一直堆着 iron/copper、
+# 金币却从 R6/R8 起冻结到 R17，就是"只采不卖"卡在攒批上。
+MINERAL_SELL_THRESHOLD = 1
 # 一段围墙只要石头*1（任务书4.5.1），所以手里有石头就该立刻变成墙，
 # 不必攒够 STONE_BATCH 那么多段再一起铺。
 WALL_STONE_COST = 1
@@ -151,6 +160,11 @@ MIN_WALLS_BEFORE_NIGHT = 2
 # 机器人直接贴脸打基地，而同一局的进攻方反倒把来路封得严严实实。
 # LLM 计划把墙压到 0 时防守方仍按下限留出石材（见 `_wall_target`）。
 DEFENDER_WALL_QUOTA = 1
+# 防守方开局动工第一段围墙的回合（S3，每个游戏日的第 1..WALL_FIRST_ROUND 个回合）：
+# 这段时间里分管经济的工人先跑"采石 -> 砌墙"这条线，塔由另一名工人照建。
+# 复盘里塔位优先的建造分支把工人一直占在基地旁等金币，首段围墙因此拖到
+# 金币花光才开工——PK589649 落到 R10、PK589653 全程一段都没有，防线整局不成型。
+WALL_FIRST_ROUND = 5
 WEAPON_UPGRADE_VOUCHER = "WeaponUpgradeVoucher1"  # 武器升级券（level1->level2）
 WEAPON_UPGRADE_VOUCHER2 = "WeaponUpgradeVoucher2"  # 武器升级券2（level2->level3）
 WALL_UPGRADE_VOUCHER = "WallUpgradeVoucher1"  # 围墙升级券（level1->level2）
@@ -266,6 +280,17 @@ TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试�
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
 
+# 任务止损（S1）：自进化任务的闭环是"下发沙盒命令 -> 取数 -> submitAnswer"，
+# 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
+# 合不上。复盘里 PK589649/589653 的沙盒从 R11 起连续 6~7 个回合返回逐字相同
+# 的输出（exitCode:0 但没有取数证据），开拓者被读文件死循环占死，任务分丢光、
+# 这名劳动力也一起白搭。这里给任务两条止损线，到线就放弃任务、把开拓者还给
+# 战斗调度（见 `_task_abandoned`）：
+#   - 同一份沙盒输出连续出现 TASK_LOOP_LIMIT 次（读文件循环）
+#   - 任务已经占用开拓者 TASK_TIMEOUT 个回合（任务书：单个任务时限 15 回合）
+TASK_LOOP_LIMIT = 3
+TASK_TIMEOUT = 15
+
 # 任务答案缓存：任务文件名 -> 沙盒执行产出的答案（`[SOLUTION]` 段的内容）
 # 任务书5.3节要求"根据任务1探索的内容形成固定SOP或者SKILL，实现Agent自进化"，
 # 积分又是"任务奖励 + 5 × 标准回合数 / (完成回合 - 接取回合)"（任务书第六章），
@@ -274,6 +299,32 @@ TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过�
 # 接取后下一回合就能直接作答（复盘里敌方就是靠答案缓存秒交，两次提交各拿 155 分）。
 # 这是纯缓存：没有命中的任务仍然走"下发沙盒命令 -> 下一回合读输出"的原路径。
 _TASK_ANSWER_CACHE: dict[str, str] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class TaskWatch:
+    """任务看门狗：最近一回合的那次观察（不是跨回合的战场状态）
+
+    字段:
+        token: 当时进行中的任务标识（`_task_token`）
+        round_no: 记下这条观察的回合号
+        output: 当时那份属于本任务的沙盒输出（没有输出时为空串）
+        rounds: 这个任务已经占用开拓者的回合数
+        repeats: 当前这份输出已经连续出现了几次
+    """
+
+    token: str
+    round_no: int
+    output: str
+    rounds: int
+    repeats: int
+
+
+# 任务看门狗（模块级单例，只存最近一回合的观察值）：每回合由 `decide` 用当前
+# 报文刷新一次，任务分支与 `sandbox_command` 只读不改。换任务、换局、或者回合号
+# 不连续时从头计数（见 `_watch_task`），所以它只描述"当前这一局这个任务"，
+# 不是跨回合累积的战场缓存。放弃的判据见 `_task_abandoned`。
+_TASK_WATCH: TaskWatch | None = None
 
 # 是否提交LLM策略咨询prompt（可用环境变量 LLM_PROMPT=0 关闭）
 # 接口文档：每队每个游戏日的 LLM 调用额度为 3 次（自进化任务期间不计入），
@@ -337,6 +388,8 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     输出: (角色ID字符串: 指令字典, 提交给LLM的prompt)
     """
     turn = Turn.load(payload)
+    # 任务看门狗：记录本回合的任务与沙盒输出，判断任务是否已经该止损
+    _watch_task(turn)
     # 上回合执行器解出来的任务答案按文件名缓存，后续任务一到手就能直接作答
     _remember_task_answers(turn.last_cmd_result)
     # 上一回合的LLM建议解析成有界计划，和指令生成器共用（解析不出来时是默认计划）
@@ -602,6 +655,20 @@ def _worker_day_logic(
     # "先补第 2 座炮塔，再沿进攻路径铺 2 段围墙"（防守方还有下限，见 `_wall_target`）
     wall_quota = len(turn.walls()) < _wall_target(turn, plan)
 
+    # 防守方的第一段围墙要在开局就动工（S3）：塔位优先的建造分支会把工人一直
+    # 占在基地旁等金币，首段围墙因此要等到金币花光（R8~R10）才开工，甚至整局
+    # 一段都没有。这里让分管经济的工人在开局窗口内先跑石材线，塔交给另一名
+    # 工人照建（只剩一名工人时不动——一双手还是先建塔）。
+    if (
+        economy
+        and len(turn.workers()) >= 2
+        and turn.team_type == "defender"
+        and not turn.walls()
+        and _day_round(turn) < WALL_FIRST_ROUND
+        and _early_wall(turn, worker, walls_missing, claimed, commands)
+    ):
+        return
+
     # 优先建造武器（塔数由 `_tower_target` 决定：计划配额 + 金币闲置熔断）。
     # 余额按 `_gold_left` 算：本回合已经发出去的建造指令结算时才扣款，
     # 只够一座塔的钱时第二个工人不该再下一条注定失败的 build。
@@ -743,6 +810,51 @@ def _stone_reserve(
     return max(WALL_STONE_COST, _wall_gap(turn, plan))
 
 
+def _early_wall(
+    turn: Turn,
+    worker: Unit,
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """防守方开局的第一段围墙：手里有石材就先砌墙，否则先去采石材（S3）
+
+    只在"基地还没有任何围墙、且还在开局窗口内"时由分管经济的工人执行
+    （见 `_worker_day_logic`）。塔位优先的建造分支会让工人一直在基地旁等金币，
+    首段围墙因此拖到金币花光才开工——复盘里 PK589649 的首段围墙落到 R10、
+    PK589653 全程 0 段，机器人直接贴脸打基地。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        walls_missing: 尚未建造（且这一回合能施工）的围墙位置
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达指令（砌墙或采石）
+    """
+    # 金币见底、手里又攥着纯收入矿石时先变现（这个问题留给下面的卖矿分支，
+    # 跑去石矿转一圈只会把最后一点收入也拖后）
+    if _gold_critical(turn) and any(
+        worker.backpack.count(kind) for kind in INCOME_MINES
+    ):
+        return False
+
+    # 手里有石头: 一段围墙只要一块石头，直接开工
+    if worker.backpack.count(WALL_MATERIAL) >= WALL_STONE_COST:
+        sites = _retry_sites(
+            turn, worker, [site for site in walls_missing if site not in claimed],
+        )
+        if sites and _build_or_walk(turn, worker, sites[0], WALL, claimed, commands):
+            claimed.add(sites[0])
+            return True
+        return False
+
+    # 手里还没有石材: 去石矿采一铲（背包满了时留给下面的卖矿分支腾地方）
+    return _go_mine(turn, worker, STONE_MINE, claimed, commands)
+
+
 def _tower_picks(
     worker: Unit,
     tower_sites: tuple[Pos, ...],
@@ -872,7 +984,12 @@ def _pioneer_day_logic(
     优先级: 维持进行中的任务（含提交答案，命中答案缓存时接取后即交卷）
             > 前往任务点领取任务（本回合走不动就原地等，不退回去跟随武器塔）
             > 守候正在冷却的任务点（白天守在下一个会开放的任务点旁，天黑前回防）
-            > 跟随武器塔（只在没有任何任务点时才做）
+            > 跟随武器塔（只在没有任何任务点时，或者任务已被看门狗放弃时）
+
+    任务止损（S1）：进行中的任务连续多回合没有任何进展（沙盒反复回读同一份
+    文件）或已经占满 `TASK_TIMEOUT` 个回合时，`_task_abandoned` 判定放弃，
+    开拓者不再守任务点、`_sandbox_command` 也不再下发读文件命令，直接回基地
+    跟队——离开任务点周围一格会让判题系统强制结束这个任务。
 
     任务规则（任务书5章）:
         - 开拓者需在己方任务点周围一格内领取任务
@@ -897,6 +1014,14 @@ def _pioneer_day_logic(
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
     """
+    # 0. 任务已被看门狗放弃（沙盒反复回读同一份文件 / 超时交不上卷）:
+    #    不再守任务点、也不再下发沙盒命令，直接回基地跟队——离开任务点周围
+    #    一格会让判题系统强制结束这个任务，开拓者因此回到战斗调度，
+    #    而不是被一个永远拿不到答案的任务占死（S1）
+    if turn.phase_task and _task_abandoned(turn):
+        _pioneer_follow_weapons(turn, pioneer, wall_order, claimed, commands)
+        return
+
     # 1. 任务进行中: 留在任务点周围（离开会强制结束任务），拿到沙盒输出后作答
     if turn.phase_task:
         task_pos = _nearest_task_position(turn, pioneer.pos)
@@ -947,6 +1072,29 @@ def _pioneer_day_logic(
             return
 
     # 4. 没有可接取的任务: 跟随武器塔,为夜晚操控武器做准备
+    _pioneer_follow_weapons(turn, pioneer, wall_order, claimed, commands)
+
+
+def _pioneer_follow_weapons(
+    turn: Turn,
+    pioneer: Unit,
+    wall_order: tuple[Pos, ...],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> None:
+    """开拓者跟随武器塔（没有任务可做，或任务已被看门狗放弃时）
+
+    武器工事要有角色操控才会开火（任务书4.4节），所以没有任务时开拓者守在
+    最近的武器旁待命；`wall_order` 用来避开围墙的建造点——站上去会把那一格
+    占住，那段围墙整局都建不起来（见 `_valid_stand_cells`）。
+
+    参数:
+        turn: 当前回合信息
+        pioneer: 当前决策的开拓者
+        wall_order: 围墙建造顺序，用于避免开拓者占住建造点
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+    """
     weapons = turn.weapons()
     if not weapons:
         return
@@ -1078,6 +1226,8 @@ def _trade_logic(
     金币见底（低于一座塔的造价）时不再等凑够一批：手里有多少卖多少。复盘里
     R6 建完第三座塔后 gold=0 冻结 13 个回合，而背包里 stone:6 一直躺在背包里
     ——等凑够 `SELL_BATCH` 的话，这点矿石永远变不成钱，经济也就永远转不起来。
+    铁/铜这类纯收入矿石同样不等攒批（`MINERAL_SELL_THRESHOLD`）：它们不参与
+    砌墙，留在背包里只是占地方，金币没见底也该有几块卖几块。
 
     参数:
         turn: 当前回合信息
@@ -1101,8 +1251,14 @@ def _trade_logic(
         quantities,
         key=lambda item: (item[1], -minerals.index(item[0])),
     )
-    # 背包满了就卖一批腾地方,否则等攒够一批再卖；金币见底时有几块卖几块
-    batch = 1 if (worker.backpack_full or _gold_critical(turn)) else SELL_BATCH
+    # 背包满了就卖一批腾地方,否则等攒够一批再卖；金币见底时有几块卖几块。
+    # 铁/铜是纯收入矿石（不参与砌墙），攒批没有任何好处——有几块卖几块，
+    # 每回合都能有一笔进账（S2：复盘里"只采不卖、金币冻结在 0"）。
+    batch = SELL_BATCH
+    if worker.backpack_full or _gold_critical(turn):
+        batch = 1
+    elif mine_type in INCOME_MINES:
+        batch = MINERAL_SELL_THRESHOLD
     if amount < batch:
         return False
 
@@ -1804,6 +1960,86 @@ def _nearest_task_position(turn: Turn, origin: Pos) -> Pos | None:
 # === 自进化任务（沙盒） ===
 
 
+def _task_output(turn: Turn) -> str:
+    """上一回合沙盒输出里属于当前任务的那一份（没有时为空串）
+
+    判题系统把沙盒命令的输出放在 `lastCmdResult` 里，但那份输出可能属于上一个
+    任务（命令刚下发、或者任务刚换）。这里按任务标识认领：带本任务标识
+    （`TASK_MARKER`，或描述里没给文件名时的 `TASK_PROBE_MARKER`）才算数。
+    """
+    if not turn.phase_task or not turn.last_cmd_result:
+        return ""
+    token = _task_token(turn.phase_task)
+    if (
+        f"{TASK_MARKER}{token}" in turn.last_cmd_result
+        or f"{TASK_PROBE_MARKER}{token}" in turn.last_cmd_result
+    ):
+        return turn.last_cmd_result
+    return ""
+
+
+def _watch_task(turn: Turn) -> None:
+    """刷新任务看门狗（每回合由 `decide` 调用一次）
+
+    看门狗只回答一个问题："这个任务还有没有进展"。判题系统不回任务状态，
+    报文里能看到的只有 `lastCmdResult` 里属于本任务的沙盒输出，所以这里只记
+    最近一回合的观察值（`_TASK_WATCH`），并且只在回合号连续时往上累计：
+    换任务、换局、回合号跳变都从这一回合重新计数，不会把别的一局的观察带进来。
+
+    参数:
+        turn: 当前回合信息
+    """
+    global _TASK_WATCH
+    if not turn.phase_task:
+        _TASK_WATCH = None
+        return
+
+    token = _task_token(turn.phase_task)
+    output = _task_output(turn)
+    previous = _TASK_WATCH
+    if (
+        previous is None
+        or previous.token != token
+        or turn.round_no != previous.round_no + 1
+    ):
+        # 新任务（或接不上上一回合的观察）：这一份输出算第 1 次出现
+        _TASK_WATCH = TaskWatch(token, turn.round_no, output, 1, 1 if output else 0)
+        return
+
+    # 又读到同一份输出说明这一回合没有任何进展，往上累计；换了新输出则重新数
+    if not output:
+        repeats = 0
+    elif output == previous.output:
+        repeats = previous.repeats + 1
+    else:
+        repeats = 1
+    _TASK_WATCH = TaskWatch(
+        token, turn.round_no, output, previous.rounds + 1, repeats,
+    )
+
+
+def _task_abandoned(turn: Turn) -> bool:
+    """当前任务是不是已经被看门狗放弃（只读，不刷新观察值）
+
+    两条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT`）：同一份沙盒输出连续
+    出现了 `TASK_LOOP_LIMIT` 次，或者任务已经占用了 `TASK_TIMEOUT` 个回合。
+    复盘里开拓者就是被"每回合回读同一份任务文件"的死循环占死的（PK589649
+    的 R11–R17、PK589653 的 R12–R17），任务分拿不到，这名劳动力也一起白搭。
+
+    观察值必须是本回合或上一回合记下的（`sandbox_command` 排在 `decide` 之前
+    调用时，看到的是上一回合那条），回合号对不上就当作没有观察，免得把别的
+    一局的观察套到当前任务上。
+    """
+    watch = _TASK_WATCH
+    if watch is None or not turn.phase_task:
+        return False
+    if watch.token != _task_token(turn.phase_task):
+        return False
+    if turn.round_no not in (watch.round_no, watch.round_no + 1):
+        return False
+    return watch.repeats >= TASK_LOOP_LIMIT or watch.rounds >= TASK_TIMEOUT
+
+
 def _sandbox_command(turn: Turn) -> str:
     """任务期间需要提交给沙盒执行的命令
 
@@ -1825,11 +2061,15 @@ def _sandbox_command(turn: Turn) -> str:
     答案区之后依次是工作目录诊断与任务文件回读（`[TASK_FILE]` 分段，供
     `_task_file` 认出沙盒里的真实文件名、给执行器圈定候选任务文件）。
     这两段都排在 `TASK_END_MARKER` 之后，永远不会被当成答案。
+
+    任务已经被看门狗放弃（读文件死循环 / 超时）时返回空串：继续下发读文件
+    命令只会把同一个循环再跑一遍，开拓者却已经被放回去干别的了。
     """
     if (
         not turn.phase_task
         or _task_answer(turn) is not None
         or _cached_answer(turn) is not None
+        or _task_abandoned(turn)
     ):
         return ""
 
@@ -2959,6 +3199,11 @@ def _opening_round(turn: Turn) -> bool:
     先把火力补回下限，否则白天又要在没有塔的情况下空转好几个回合。
     """
     return (turn.round_no - 1) % ROUNDS_PER_DAY < OPENING_ROUNDS
+
+
+def _day_round(turn: Turn) -> int:
+    """当前是这一天的第几个回合（从 0 开始，与 `_opening_round` 同一套算法）"""
+    return (turn.round_no - 1) % ROUNDS_PER_DAY
 
 
 def _tower_target(turn: Turn, plan: LlmPlan) -> int:

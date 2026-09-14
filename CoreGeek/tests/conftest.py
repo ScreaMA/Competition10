@@ -30,16 +30,19 @@ def _build_task(task, task_factory):
 
 @pytest.fixture(autouse=True)
 def _clear_task_answer_cache():
-    """每个用例前后清空自进化任务的答案缓存
+    """每个用例前后清空自进化任务的答案缓存与任务看门狗
 
-    `agent.brain._TASK_ANSWER_CACHE` 是模块级缓存（沙盒里读回来的任务文件
-    内容），跨用例残留会让上一个用例缓存的内容变成下一个用例的答案。
+    `agent.brain._TASK_ANSWER_CACHE` 与 `agent.brain._TASK_WATCH` 都是模块级
+    状态（沙盒里读回来的任务答案、上一回合的任务观察值），跨用例残留会让
+    上一个用例的答案/观察值影响到下一个用例。
     """
     from agent import brain
 
     brain._TASK_ANSWER_CACHE.clear()
+    brain._TASK_WATCH = None
     yield
     brain._TASK_ANSWER_CACHE.clear()
+    brain._TASK_WATCH = None
 
 
 @pytest.fixture

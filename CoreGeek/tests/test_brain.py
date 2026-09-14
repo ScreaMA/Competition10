@@ -16,6 +16,7 @@ from agent.brain import (
     LLM_PLAN_TEMPLATE,
     LLM_PROMPT_PER_DAY,
     LOW_GOLD_THRESHOLD,
+    MINERAL_SELL_THRESHOLD,
     SELL_BATCH,
     STATION_UPGRADE_VOUCHER,
     STONE_BATCH,
@@ -24,12 +25,15 @@ from agent.brain import (
     TASK_FILE_END,
     TASK_FILE_EXTS,
     TASK_FILE_MARKER,
+    TASK_LOOP_LIMIT,
     TASK_MARKER,
     TASK_PROBE_MARKER,
     TASK_SOLUTION_END,
     TASK_SOLUTION_MARKER,
+    TASK_TIMEOUT,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
+    WALL_FIRST_ROUND,
     WALL_FIXER,
     WALL_STONE_COST,
     WALL_UPGRADE_GOLD,
@@ -2844,4 +2848,274 @@ def test_defender_stops_hoarding_stone_for_first_wall(
         "action": "build",
         "targetPos": [{"x": 13, "y": 26}],
         "name": WALL,
+    }
+
+
+# === issue #42：任务止损 / 卖矿收入 / 开局围墙（PK589649/589653） ===
+
+
+def _stuck_task_payload(
+    payload_factory, role_factory, phase_task: str, round_no: int,
+) -> dict:
+    """构造"任务进行中、沙盒回读同一份任务文件"的局面（开拓者守在任务点旁）
+
+    开拓者与任务点重合，它会一直在任务点周围一格内等答案（离开会强制结束
+    任务）；基地旁留一座武器塔，便于观察它被放回去之后往哪走。
+    """
+    payload = payload_factory(
+        round_no=round_no,
+        gold=0,
+        roles=[
+            role_factory(10011, PIONEER, 14, 14, backPackCapability=40),
+            role_factory(10020, GATLING, 9, 24, attackRange=4),
+        ],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    # 沙盒每回合回读回来的都是这份任务文件（exitCode:0，答案区没有取数证据）
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task,
+        "# 自进化任务 A-1：查询北京文化遗产\n## 任务背景\n"
+        "请阅读task_1_beijing.md，获取任务信息\n",
+    )
+    return payload
+
+
+def test_task_loop_breaker_releases_pioneer_after_repeated_sandbox_output(
+    payload_factory, role_factory,
+):
+    """沙盒连续回读同一份文件时熔断：不提交任务原文、停发沙盒命令、开拓者回防
+
+    回归：PK589649/589653 里沙盒从 R11 起连续 6~7 个回合返回逐字相同的输出
+    （exitCode:0，但没有取数证据），开拓者被读文件死循环占死——任务分丢光，
+    这名劳动力也一起白搭（任务书 5 章：单个任务时限 15 回合）。
+    """
+    phase_task = "请阅读task_1_beijing.md，获取任务信息"
+    weapon = Pos(9, 24)
+    waiting, released = [], None
+
+    for offset in range(TASK_LOOP_LIMIT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        commands, _ = decide(payload)
+        if offset < TASK_LOOP_LIMIT - 1:
+            waiting.append((commands, payload))
+        else:
+            released = (commands, payload)
+
+    # 还没到止损线时继续守在任务点上等答案：不提交任务原文，也不放弃任务
+    for commands, payload in waiting:
+        assert "10011" not in commands
+        assert sandbox_command(payload) != ""
+
+    # 第 TASK_LOOP_LIMIT 次读到同一份输出：放弃任务，开拓者回基地跟队
+    commands, payload = released
+    assert commands["10011"]["action"] == "move"
+    step = Pos(
+        commands["10011"]["targetPos"][0]["x"],
+        commands["10011"]["targetPos"][0]["y"],
+    )
+    assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+    # 放弃之后不再下发读文件命令（避免把同一个死循环再跑一遍）
+    assert sandbox_command(payload) == ""
+
+
+def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
+    payload_factory, role_factory,
+):
+    """沙盒一直解不出答案时按任务时限止损：占满 TASK_TIMEOUT 个回合就放弃
+
+    每回合的输出都不一样（不是死循环，没触发读文件熔断），但始终取不到数据，
+    这时按回合数兜底——开拓者不再被一个拿不到答案的任务永久占死。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    weapon = Pos(9, 24)
+
+    for offset in range(TASK_TIMEOUT):
+        payload = _stuck_task_payload(
+            payload_factory, role_factory, phase_task, 11 + offset,
+        )
+        # 每回合的输出都不一样：有进展，但始终没解出答案
+        payload["lastCmdResult"] = _sandbox_result(
+            phase_task, f"第 {offset} 次搜索，仍无任务文件\n",
+        )
+        commands, _ = decide(payload)
+
+        if offset == TASK_TIMEOUT - 1:
+            assert sandbox_command(payload) == ""
+            assert commands["10011"]["action"] == "move"
+            step = Pos(
+                commands["10011"]["targetPos"][0]["x"],
+                commands["10011"]["targetPos"][0]["y"],
+            )
+            assert distance(step, weapon) < distance(Pos(14, 14), weapon)
+        else:
+            # 时限内继续守在任务点旁等答案
+            assert commands.get("10011") is None
+            assert sandbox_command(payload) != ""
+
+
+def test_task_watchdog_starts_over_for_another_task(payload_factory, role_factory):
+    """换了任务就从头计数：上一个任务的死循环不会把新任务一起拖下水"""
+    for offset in range(TASK_LOOP_LIMIT - 1):
+        decide(_stuck_task_payload(
+            payload_factory, role_factory, "请阅读task_1_beijing.md", 11 + offset,
+        ))
+
+    # 同一局里的另一个任务（描述不同），沙盒输出的标识也随之改变
+    payload = _stuck_task_payload(
+        payload_factory, role_factory, "请阅读task_2_shanghai.md", 13,
+    )
+    commands, _ = decide(payload)
+
+    # 仍在任务点旁等答案，没有被上一个任务的计数带走
+    assert "10011" not in commands
+    assert sandbox_command(payload) != ""
+
+
+def test_income_ore_sells_without_waiting_for_batch(payload_factory, role_factory):
+    """铁/铜这类纯收入矿石不攒批：手里有一块就卖给小贩换金币
+
+    回归：两场复盘里防守方的背包一直堆着可卖的 iron/copper，金币却从 R6/R8 起
+    冻结到 R17——卖矿卡在"攒够 SELL_BATCH 一批"上，手里那几块永远变不成钱。
+    石材是例外（它同时是围墙材料，攒够一批再卖更省回合）。
+    """
+    payload = _payload_with_full_defense(
+        payload_factory, role_factory,
+        gold=LOW_GOLD_THRESHOLD,  # 金币还没见底，攒批的规则仍然拦着它
+        worker_pos=Pos(20, 17),
+        backpack=[IRON_MINE] * MINERAL_SELL_THRESHOLD,
+        zones=[(VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "sell",
+        "name": IRON_MINE,
+        "num": MINERAL_SELL_THRESHOLD,
+    }
+
+
+def test_stone_still_waits_for_a_batch(payload_factory, role_factory):
+    """石材照旧攒够一批再卖（铁/铜的即时变现不影响围墙材料）"""
+    payload = _payload_with_full_defense(
+        payload_factory, role_factory,
+        gold=LOW_GOLD_THRESHOLD,
+        worker_pos=Pos(20, 17),
+        backpack=[WALL_MATERIAL] * (SELL_BATCH - 1),
+        zones=[(VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert "10010" not in commands
+
+
+def test_defender_starts_first_wall_before_towers(payload_factory, role_factory):
+    """防守方开局：分管经济的工人先跑石材线，第一段围墙不再等到金币花光
+
+    回归：PK589649 的首段围墙落到 R10、PK589653 全程一段都没有——塔位优先的
+    建造分支把两名工人都占在基地旁等金币，采石要等金币花光才开始，防线整局
+    不成型。塔交给另一名工人照建，建造节奏不受影响。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST * 2,  # 够建两座塔：旧策略会把两名工人都派去建塔
+        team_type="defender",
+        roles=[
+            role_factory(10010, WORKER, 11, 22, backPackCapability=100),
+            role_factory(10012, WORKER, 5, 23, backPackCapability=100),
+        ],
+        zones=[(STONE_MINE, 4, 24)],
+    )
+    commands, _ = decide(payload)
+
+    # 第 1 名工人照旧开工建塔
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 12, "y": 23}],
+        "name": ROCKET,
+    }
+    # 第 2 名工人（分工里的经济工人）先去采石材，而不是跟着挤塔位
+    assert commands["10012"] == {
+        "action": "collect",
+        "targetPos": [{"x": 4, "y": 24}],
+    }
+
+
+def test_defender_cashes_income_ore_before_opening_wall_line(
+    payload_factory, role_factory,
+):
+    """开局围墙与"卖矿解除金币冻结"撞在一起时，先变现再跑石材线
+
+    手里那几块铁/铜是金币见底时唯一的收入，先绕去石矿只会把最后一点现金流
+    拖到后面；围墙线下一回合再来。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=LOW_GOLD_THRESHOLD - 1,
+        team_type="defender",
+        roles=[
+            role_factory(10010, WORKER, 11, 22, backPackCapability=100),
+            role_factory(
+                10012, WORKER, 20, 17, backPackCapability=100,
+                backpack=[IRON_MINE] * 2,
+            ),
+        ],
+        zones=[(STONE_MINE, 4, 24), (VENDOR, 20, 16)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": IRON_MINE,
+        "num": 2,
+    }
+
+
+def test_defender_leaves_opening_wall_line_after_window(
+    payload_factory, role_factory,
+):
+    """过了开局窗口就不再抢在塔前面：建造顺序回到"先塔后墙"
+
+    开局窗口只覆盖前 `WALL_FIRST_ROUND` 个回合，之后仍按原来的优先级走，
+    免得一整天压在石材线上，塔与升级反被拖住。
+    """
+    payload = payload_factory(
+        round_no=WALL_FIRST_ROUND + 1,
+        gold=WEAPON_BUILD_COST * 2,
+        team_type="defender",
+        roles=[
+            role_factory(10010, WORKER, 11, 22, backPackCapability=100),
+            role_factory(10012, WORKER, 5, 23, backPackCapability=100),
+        ],
+        zones=[(STONE_MINE, 4, 24)],
+    )
+    commands, _ = decide(payload)
+
+    # 经济工人这一回合不再被派去采石材，而是照常参与建塔
+    assert commands["10012"]["action"] == "move"
+    step = Pos(
+        commands["10012"]["targetPos"][0]["x"],
+        commands["10012"]["targetPos"][0]["y"],
+    )
+    sites = _calc_tower_sites(Turn.load(payload))
+    assert any(distance(step, site) < distance(Pos(5, 23), site) for site in sites)
+
+
+def test_early_wall_keeps_single_worker_on_towers(payload_factory, role_factory):
+    """只剩一名工人时不抢石材线：一双手还是先建塔（围墙等金币见底再补）"""
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST,
+        team_type="defender",
+        roles=[role_factory(10010, WORKER, 11, 22, backPackCapability=100)],
+        zones=[(STONE_MINE, 4, 24)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 12, "y": 23}],
+        "name": ROCKET,
     }
