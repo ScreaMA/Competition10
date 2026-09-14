@@ -523,7 +523,10 @@ TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
 # 特别地，HTTP 状态短语必须带状态码（`404 Not Found`）才判定——"故宫"的
 # 英文是 Forbidden City，裸词匹配会把一份完全正确的答案拦下来。
 TASK_ERROR_BODY = re.compile(
-    r'"error"\s*:\s*(?!null\b|\[\s*\]|\{\s*\}|""|\'\')|'
+    # 负向断言里也要吃掉空白：`"error"\s*:\s*(?!...)` 里的 `\s*` 会回溯成零个
+    # 字符，断言于是盯着空格而不是值看，`{"error": null}`（值就是空的）会被
+    # 误判成错误体，把一份正常答案拦下来。
+    r'"error"\s*:\s*(?!\s*(?:null\b|\[\s*\]|\{\s*\}|""|\'\'))|'
     r'"status"\s*:\s*"?'
     r"(?:err|fail|unauthor|forbidden|not[ _-]?found|invalid|denied|bad)|"
     r'"(?:status|code)"\s*:\s*"?[45]\d\d\b|'
