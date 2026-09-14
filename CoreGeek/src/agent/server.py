@@ -19,7 +19,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .brain import decide, sandbox_command
+from .brain import decide, sandbox_command, task_brief
 from .protocol import (
     COPPER_MINE,
     IRON_MINE,
@@ -481,6 +481,12 @@ class Handler(BaseHTTPRequestHandler):
                 "prompt": llm_prompt,
                 "executeCmd": sandbox_cmd,  # 沙盒命令
             }
+
+            # 7.1 任务链路的单行状态（#67：复盘只能看到"沙盒在跑"，看不到卡在哪）：
+            # 判定结果/看门狗/取数成功失败次数/答案缓存/LLM 求助进度全在一行里
+            if turn.phase_task:
+                LOGGER.info("task_state id=%d round=%d %s", req_id, round_no,
+                            task_brief(turn, bool(sandbox_cmd)))
 
             # 8. 记录策略完成（含决策耗时、理论花费与关键动作）
             telemetry.note_commands(response)

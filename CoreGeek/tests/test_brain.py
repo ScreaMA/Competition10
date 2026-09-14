@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,7 @@ from agent.brain import (
     _reserved_build_sites,
     _step_toward,
     _stone_demand,
+    _task_executor,
     _task_token,
     _tower_site_brief,
     _tower_sites_reachable,
@@ -4003,3 +4005,85 @@ def test_sandbox_searches_task_root_and_skips_system_docs(
     assert '-path "/usr/share/sgml"' in command
     # 执行器同样把任务根目录当主搜索路径、接口文档也不去系统文档树里捞
     assert f"ROOTS = {TASK_ROOTS!r}" in command
+
+
+# === 任务链路日志（#67：让复盘看到"卡在哪一步"） ===
+
+
+def _task_payload(payload_factory, role_factory, phase_task, round_no, output=""):
+    """构造"开拓者正在做某个任务"的局面（可带上一回合的沙盒输出）"""
+    payload = payload_factory(
+        round_no=round_no,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    if output:
+        payload["lastCmdResult"] = _sandbox_result(phase_task, output)
+    return payload
+
+
+def test_task_brief_reports_reason_codes(payload_factory, role_factory):
+    """task_brief 把"为什么没交卷"写成可解析字段（state=...）"""
+    phase_task = "请阅读task_1_beijing.md"
+    brain._TASK_LLM_STATE.clear()
+
+    # 沙盒还没回本任务的输出
+    turn = Turn.load(_task_payload(payload_factory, role_factory, phase_task, 11))
+    brief = brain.task_brief(turn)
+    assert "state=no_marker" in brief
+    assert 'phase="请阅读task_1_beijing.md"' in brief
+
+    # 沙盒回了输出但没取到数（执行器 APIFAIL 循环的典型形态，#67 的根因）
+    turn = Turn.load(_task_payload(
+        payload_factory, role_factory, phase_task, 12,
+        output="[APIFAIL] http://localhost:8899） InvalidURL\n任务原文若干行\n",
+    ))
+    brief = brain.task_brief(turn)
+    assert "state=no_api_data" in brief
+    assert "fail=1" in brief  # 取数失败次数也进日志
+
+    # 执行器取到数：state 变成 ok、api 计数 1
+    turn = Turn.load(_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        output=f"{TASK_DATA_MARKER} http://localhost:8899/x => 12\n"
+               f"{TASK_SOLUTION_MARKER}task_1_beijing.md\n晴，26℃\n{TASK_SOLUTION_END}\n",
+    ))
+    brief = brain.task_brief(turn)
+    assert "state=ok" in brief
+    assert "api=1" in brief
+
+
+def test_task_brief_without_task(payload_factory):
+    """没有任务时不打任务字段（避免日志里出现无意义的行）"""
+    turn = Turn.load(payload_factory())
+    assert brain.task_brief(turn) == "phase=- state=no_task"
+
+
+def test_executor_template_has_no_placeholders():
+    """执行器命令里的占位符必须全部替换掉（漏一个脚本就整个跑不起来）"""
+    command = _task_executor("task_1_beijing.md")
+    assert re.findall(r"__[A-Z_]+__", command) == []
+
+
+def test_executor_refine_url_survives_cjk_and_backticks():
+    """沙盒执行器的 URL 净化：中文标点/反引号不再让 urllib 抛 InvalidURL（#67）
+
+    复盘里 R12–R17 连续 6 回合 `APIFAIL ... ），API InvalidURL`，任务因此
+    8 个回合读不到题面。这里直接从生成的脚本里取出 refine_url 验证行为。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
+    assert match
+    namespace: dict = {}
+    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    refine = namespace["refine_url"]
+
+    assert refine("http://localhost:8899/weather?city=北京。") == (
+        "http://localhost:8899/weather?city=%E5%8C%97%E4%BA%AC"
+    )
+    assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
+    assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
+    assert refine("不是地址") == ""

@@ -549,6 +549,58 @@ def decide(payload: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], str]:
     return {str(key): value for key, value in commands.items()}, prompt
 
 
+def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
+    """任务链路的单行状态（对战分析靠它定位"为什么没交卷"）
+
+    复盘里"任务 0 分"只能看到"沙盒在跑"，看不到卡在哪一步。这一行把整条链路
+    摊开，全部是 `k=v`（日志按行正则解析）：
+
+        phase=...      当前任务描述（截断）
+        state=...      答案判定结果（见 `_task_answer_with_reason` 的原因码）
+        watch=r2/t3    看门狗：同一份沙盒输出重复 r 次 / 任务已占用 t 回合
+        abandoned=yes  是否已止损（开拓者被放回战斗调度）
+        sandbox=发送   本回合是否下发了沙盒命令
+        api=1 fail=3   上一份沙盒输出里取数成功 / 取数失败（`[APIFAIL]`）次数
+        solution=yes   输出里有没有 `[SOLUTION]` 段
+        cache=hit      答案缓存里有没有当前任务文件的答案
+        llm=ask2/cmd   LLM 求助了几次 / 是否已拿到待执行命令或直接答案
+
+    参数:
+        turn: 当前回合信息
+        sandbox_sent: 本回合是否真的下发了沙盒命令（server 侧知道）
+
+    返回:
+        单行状态字符串；没有任务时返回 `phase=- state=no_task`
+    """
+    if not turn.phase_task:
+        return "phase=- state=no_task"
+
+    _, reason = _task_answer_with_reason(turn)
+    token = _task_token(turn.phase_task)
+    watch = _TASK_WATCH
+    repeats = rounds = 0
+    if watch is not None and watch.token == token:
+        repeats, rounds = watch.repeats, watch.rounds
+    result = turn.last_cmd_result or ""
+    llm_state = _TASK_LLM_STATE.get(token, {})
+    phase = " ".join(str(turn.phase_task).split())[:60]
+    flags = ""
+    if llm_state.get("pending_cmd"):
+        flags += "/cmd"
+    if llm_state.get("answer"):
+        flags += "/answer"
+    return (
+        f'phase="{phase}" state={reason} watch=r{repeats}/t{rounds} '
+        f"abandoned={'yes' if _task_abandoned(turn) else 'no'} "
+        f"sandbox={'发送' if sandbox_sent else '空闲'} "
+        f"api={result.count(TASK_DATA_MARKER)} "
+        f"fail={result.count(TASK_API_FAIL_MARKER)} "
+        f"solution={'yes' if TASK_SOLUTION_MARKER in result else 'no'} "
+        f"cache={'hit' if _cached_answer(turn) is not None else 'miss'} "
+        f"llm=ask{int(llm_state.get('prompts') or 0)}{flags}"
+    )
+
+
 def sandbox_command(payload: dict[str, Any]) -> str:
     """生成提交给沙盒执行的命令（自进化任务期间使用）
 
@@ -3379,6 +3431,7 @@ TASK_EXECUTOR = '''\
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
 
 TASK_PATH = __TASK_PATH__
@@ -3483,6 +3536,36 @@ def task_files():
     return named + others
 
 
+def refine_url(raw):
+    """把文档里抓到的地址整成 urlopen 能吃的形式（整不出来就返回空串）
+
+    文档是中文的，地址常写在句子中间或反引号里，尾随的全角标点、引号会让
+    urllib 直接抛 `InvalidURL`——复盘 #67 里 R12–R17 连续 6 回合
+    `APIFAIL ... ），API InvalidURL`（URL 含反引号+中文）就是这么来的，
+    任务因此 8 个回合读不到题面、最终 0 分。这里做两件事：
+
+    1. 剥掉两端的标点/引号/括号（含全角）
+    2. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
+    """
+    text = raw.strip()
+    trim = "`'\\\"、，。；：？！,.;:!?)]}>（）【】《》“”‘’"
+    while text and text[-1] in trim:
+        text = text[:-1]
+    while text and text[0] in trim:
+        text = text[1:]
+    if not text:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        return ""
+    if not parts.scheme or not parts.netloc:
+        return ""
+    path = urllib.parse.quote(parts.path, safe="/%:@&=+$,-_.!~*'()")
+    query = urllib.parse.quote(parts.query, safe="=&%:@+$,-_.!~*'()")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+
+
 def endpoints(doc_text):
     """接口文档里的调用样例：本地接口优先，其次才是文档里抓到的其他地址
 
@@ -3494,7 +3577,7 @@ def endpoints(doc_text):
     """
     urls = []
     for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
-        raw = raw.strip().strip("\\"'").rstrip(".,;:!?、。）])")
+        raw = refine_url(raw)
         if raw and raw not in urls:
             urls.append(raw)
     local = [url for url in urls if "localhost" in url or "127.0.0.1" in url]
@@ -3743,39 +3826,54 @@ def _task_answer(turn: Turn) -> str | None:
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
+    answer, _ = _task_answer_with_reason(turn)
+    return answer
+
+
+def _task_answer_with_reason(turn: Turn) -> tuple[str | None, str]:
+    """答案判定的结果与原因码（原因码供 `task_brief` 写进日志）
+
+    复盘里"任务没交卷"只能靠人翻沙盒输出猜原因，这里把判定过程本身变成
+    可解析的字段：`ok` / `llm_answer` / `no_marker`（本任务的沙盒输出还没到）/
+    `exit_nonzero`（命令失败）/ `no_api_data`（取不到数）/ `error_in_output` /
+    `short_or_missing` / `echo_task_text`（答案就是任务原文）/
+    `path_answer`（答案是一条文件路径）。
+    """
     if not turn.phase_task:
-        return None
+        return None, "no_task"
 
     # 1. LLM 已经直接给出答案（不用绕沙盒）
     direct = _llm_direct_answer(turn)
     if direct is not None:
-        return direct
+        return direct, "llm_answer"
 
     marker = f"{TASK_MARKER}{_task_token(turn.phase_task)}"
     result = turn.last_cmd_result
-    if marker not in result or "[exitCode:0]" not in result:
-        return None
+    if marker not in result:
+        return None, "no_marker"
+    if "[exitCode:0]" not in result:
+        return None, "exit_nonzero"
 
     region = result.split(marker, 1)[1].split(TASK_END_MARKER, 1)[0]
 
     # 2. 上一回合跑的是 LLM 指定的取数命令：标记之间的输出本身就是答案
     llm_output = _llm_command_answer(turn, region)
     if llm_output is not None:
-        return llm_output
+        return llm_output, "llm_cmd_output"
 
     if TASK_DATA_MARKER not in region:
-        return None  # 没取到数据：沙盒里只有任务原文，不能当答案交上去
+        return None, "no_api_data"  # 没取到数据：沙盒里只有任务原文
     if any(bad in region for bad in TASK_ERROR_MARKERS):
-        return None
+        return None, "error_in_output"
 
     answer = _solution_answer(region, turn)
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
-        return None
+        return None, "short_or_missing"
     if _task_echo(answer, turn.phase_task):
-        return None
+        return None, "echo_task_text"
     if _task_path_answer(answer):
-        return None  # 交上去的是一条路径：文件里问的答案还没拿到
-    return answer
+        return None, "path_answer"  # 交上去的是一条路径：文件里问的答案还没拿到
+    return answer, "ok"
 
 
 def _task_path_answer(answer: str) -> bool:
