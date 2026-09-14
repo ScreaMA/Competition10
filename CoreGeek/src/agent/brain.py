@@ -6,7 +6,8 @@
     白天：工人优先建造武器工事（加特林/电磁狙击炮/火箭发射台），
           再采集石头建造围墙；围墙建完后用富余资源换取金币和武器升级。
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答），
-          无任务时跟随武器塔；天黑前工人回防到武器旁。
+          无任务时跟随武器塔；天黑前工人回防到武器旁，
+          但火力/围墙不达标时先抢建，角色不会整回合空转。
     夜晚：每个角色操控一座武器攻击机器人，优先攻击威胁最高的目标。
 
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
@@ -68,10 +69,19 @@ from .protocol import (
 TOWER_LOADOUT = (GATLING, RAILGUN, ROCKET)  # 武器建造顺序
 STONE_BATCH = 3  # 工人采集石头的批次大小（越小围墙越早开工）
 WALL_BUILD_PRIORITY = 1000  # 围墙建造优先级
-SELL_BATCH = 10  # 卖给小贩的石头批次大小
+SELL_BATCH = 10  # 卖给小贩的矿石批次大小
 DUSK_ROUNDS = 5  # 天黑前提前回防的回合数
+MIN_TOWERS_BEFORE_NIGHT = 2  # 入夜前的最低火力：不足时优先抢建而不是回防待命
 WEAPON_UPGRADE_VOUCHER = "WeaponUpgradeVoucher1"  # 武器升级券（level1->level2）
 UPGRADE_GOLD = 100  # 购买一张武器升级券所需金币
+
+# 可卖给小贩的矿石（按优先级排序，石矿既是围墙材料也是主要收入来源）
+SELLABLE_MINES = (STONE_MINE, IRON_MINE, COPPER_MINE)
+
+# 任务点排序权重：报文缺少 timeoutRounds 时用最大值，不抢占"临期优先"
+TASK_TIMEOUT_UNKNOWN = 10 ** 9
+# 任务冷却剩余回合不超过该值时，开拓者提前到任务点旁待命
+TASK_WAIT_ROUNDS = 3
 
 # 基地四个方位（用于让武器塔分散布防，顺序仅用于同分时的稳定排序）
 TOWER_SIDES = ("up", "left", "down", "right")
@@ -93,6 +103,9 @@ TASK_MARKER = "[TASK]"
 # 是否在每天第一个回合提交LLM策略咨询prompt（可用环境变量 LLM_PROMPT=0 关闭）
 # 每个游戏日的LLM调用有限额，每天只请求一次以节省额度
 LLM_PROMPT_ENABLED = os.getenv("LLM_PROMPT", "1") != "0"
+
+# 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
+TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -159,12 +172,15 @@ def _decide_day(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
     # 已分配的位置（防止多个角色走向同一位置）
     claimed: set[Pos] = set()
 
-    # 天黑前留出回防时间，避免夜晚武器无人操控而空转
+    # 天黑前留出回防时间，避免夜晚武器无人操控而空转；
+    # 但防线没达标时（火力不足或一段围墙都没立）先抢建：多一座塔比多一个
+    # 站在武器旁待命的角色更能提升夜晚火力
     dusk = _rounds_to_night(turn) <= DUSK_ROUNDS
+    must_build = dusk and _needs_last_build(turn, free_towers, free_walls)
 
     # 为每个工人分配任务
     for worker in turn.workers():
-        if dusk:
+        if dusk and not must_build:
             _fall_back_to_weapons(turn, worker, claimed, commands)
             continue
         _worker_day_logic(
@@ -190,7 +206,10 @@ def _worker_day_logic(
     """工人白天逻辑
 
     优先级: 建造武器工事 > 采集石头 > 建造围墙
-            > 围墙建完后: 武器升级 > 卖石头换金币
+            > 围墙建完后: 武器升级 > 卖矿换金币 > 采集任意矿石
+
+    任何分支最后都会落到"采集/交易"上，保证工人每回合都有产出，
+    不会出现整回合没有任何指令的空转。
 
     参数:
         turn: 当前回合信息
@@ -209,15 +228,14 @@ def _worker_day_logic(
                 _build_or_walk(turn, worker, site, weapon_type, claimed, commands)
                 return
 
-    # 围墙已建完: 把富余资源换成战力（武器升级 > 卖石头换金币）
+    # 围墙已建完: 把富余资源换成战力（武器升级 > 卖矿换金币）
     if not walls_missing:
         if _upgrade_weapon_with_gold(turn, worker, claimed, commands):
             return
-        _trade_logic(turn, worker, claimed, commands)
-        if worker.unit_id in commands:
+        if _trade_logic(turn, worker, claimed, commands):
             return
         # 手里还没有可卖的矿石: 继续采集,攒够一批再换金币
-        _go_mine(turn, worker, STONE_MINE, claimed, commands)
+        _gather_logic(turn, worker, claimed, commands)
         return
 
     # 检查背包里的石头数量
@@ -230,16 +248,17 @@ def _worker_day_logic(
         claimed.add(mine)
         return
 
-    # 如果有石头,去建造围墙
+    # 如果有石头,去建造围墙（位置都被其他角色占住时继续往下走,别空转）
     if stones > 0:
         for site in walls_missing:
             if site not in claimed:
                 _build_or_walk(turn, worker, site, WALL, claimed, commands)
                 return
-        return
 
-    # 没石头,去采矿
-    _go_mine(turn, worker, STONE_MINE, claimed, commands)
+    # 没石头(或暂时没位置建): 就近采矿; 采不到就把背包里的矿石卖掉腾地方
+    if _gather_logic(turn, worker, claimed, commands):
+        return
+    _trade_logic(turn, worker, claimed, commands)
 
 
 def _pioneer_day_logic(
@@ -259,6 +278,9 @@ def _pioneer_day_logic(
         - 领取后离开任务点周围一格会导致任务强制结束
         - 任务结束后需要等待冷却，冷却期内 isValid 为 false
         - 自进化类任务需在沙盒中取数后作答，答案经 `submitAnswer` 提交
+
+    任务点的选择是"临期优先、其次就近"：单个任务只有 15 回合时限，
+    先去快过期的那个才能把两个任务的分数都拿到手。
 
     参数:
         turn: 当前回合信息
@@ -286,20 +308,24 @@ def _pioneer_day_logic(
     # 2. 有可接取的任务: 前往任务点并领取
     valid_tasks = [task for task in turn.player_tasks if task.is_valid]
     if valid_tasks:
-        nearest_task = min(valid_tasks, key=lambda task: (
+        target_task = min(valid_tasks, key=lambda task: (
+            task.timeout_rounds if task.timeout_rounds > 0 else TASK_TIMEOUT_UNKNOWN,
             distance(pioneer.pos, task.task_position),
             task.task_position.x,
             task.task_position.y,
         ))
-        if distance(pioneer.pos, nearest_task.task_position) <= 1:
-            commands[pioneer.unit_id] = accept_task_command()
-            return
-        step = _step_toward(turn, pioneer, nearest_task.task_position, claimed)
-        if step is not None:
-            commands[pioneer.unit_id] = move_command(step)
+        if _head_to_task(turn, pioneer, target_task.task_position, claimed, commands):
             return
 
-    # 3. 没有可接取的任务: 跟随武器塔,为夜晚操控武器做准备
+    # 3. 任务点都在冷却中: 冷却快结束时提前到任务点旁待命，任务一开放就能接
+    elif _rounds_until_task(turn) <= TASK_WAIT_ROUNDS:
+        task_pos = _nearest_task_position(turn, pioneer.pos)
+        if task_pos is not None and _head_to_task(
+            turn, pioneer, task_pos, claimed, commands,
+        ):
+            return
+
+    # 4. 没有可接取的任务: 跟随武器塔,为夜晚操控武器做准备
     weapons = turn.weapons()
     if not weapons:
         return
@@ -318,38 +344,91 @@ def _pioneer_day_logic(
         commands[pioneer.unit_id] = move_command(step)
 
 
+def _head_to_task(
+    turn: Turn,
+    pioneer: Unit,
+    task_pos: Pos,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """走向任务点，到了就领取任务
+
+    返回:
+        True 表示本回合已下达指令（领取或移动）
+    """
+    if distance(pioneer.pos, task_pos) <= 1:
+        commands[pioneer.unit_id] = accept_task_command()
+        return True
+
+    step = _step_toward(turn, pioneer, task_pos, claimed)
+    if step is None:
+        return False
+
+    commands[pioneer.unit_id] = move_command(step)
+    return True
+
+
+def _rounds_until_task(turn: Turn) -> int:
+    """己方任务点里最早可以再接任务的剩余冷却回合数
+
+    任务点数据缺失（报文没有 playerTasks）时返回 0：此时按地图上的任务点
+    直接前往，到点后下一回合再领取，避免整局都不去任务点。
+    """
+    if not turn.player_tasks:
+        return 0
+    return min(task.cold_down_rounds for task in turn.player_tasks)
+
+
 def _trade_logic(
     turn: Turn,
     worker: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
-) -> None:
-    """资源交易逻辑：围墙建完后把多余石头卖给小贩换金币
+) -> bool:
+    """资源交易逻辑：把背包里多余的矿石卖给小贩换金币
 
     小贩收购价随世界新闻波动（任务书4.6.1节），卖出所得可用于购买升级券。
+    背包还有空间时攒够一批再卖；背包已经满了就先卖掉手头最多的那种矿腾地方，
+    既换到金币又避免工人因为塞满背包而无法采集。
 
     参数:
         turn: 当前回合信息
         worker: 当前决策的工人
         claimed: 已被其他角色占用的目标集合
         commands: 指令输出字典（角色ID -> 指令）
+
+    返回:
+        True 表示本回合已下达指令（贩卖或走向小贩）
     """
-    if worker.backpack.count(WALL_MATERIAL) < SELL_BATCH:
-        return
+    quantities = [
+        (mine_type, worker.backpack.count(mine_type))
+        for mine_type in SELLABLE_MINES
+    ]
+    # 数量最多的那种优先卖；数量相同时按 SELLABLE_MINES 的顺序取石材
+    mine_type, amount = max(
+        quantities,
+        key=lambda item: (item[1], -SELLABLE_MINES.index(item[0])),
+    )
+    # 背包满了就卖一批腾地方,否则等攒够一批再卖
+    if amount < (1 if worker.backpack_full else SELL_BATCH):
+        return False
 
     vendor = _nearest_zone(turn, VENDOR, worker.pos)
     if vendor is None:
-        return
+        return False
 
     # 已在小贩旁边: 直接贩卖
     if distance(worker.pos, vendor) <= 1:
-        commands[worker.unit_id] = sell_command(WALL_MATERIAL, SELL_BATCH)
-        return
+        commands[worker.unit_id] = sell_command(mine_type, amount)
+        return True
 
     # 否则走向小贩
     step = _step_toward(turn, worker, vendor, claimed)
     if step is not None:
         commands[worker.unit_id] = move_command(step)
+        return True
+
+    return False
 
 
 def _upgrade_weapon_with_gold(
@@ -422,6 +501,38 @@ def _rounds_to_night(turn: Turn) -> int:
     """距离天黑还剩多少回合（含当前回合）"""
     day_round = (turn.round_no - 1) % ROUNDS_PER_DAY
     return DAY_ROUNDS - day_round
+
+
+def _needs_last_build(
+    turn: Turn,
+    towers_missing: list[Pos],
+    walls_missing: list[Pos],
+) -> bool:
+    """天黑前是否还要抢建（入夜前的火力/防线预算检查）
+
+    只在天黑前的最后几个回合使用。火力不够又买得起塔时先补塔，手里有石头
+    却还没立起第一段围墙时先补墙；这两件事都在基地旁边完成，做完再回防
+    也来得及，比整队提前回防更划算。
+
+    参数:
+        turn: 当前回合信息
+        towers_missing: 尚未建造（且未被占据）的武器位置
+        walls_missing: 尚未建造（且未被占据）的围墙位置
+
+    返回:
+        True 表示本回合应当继续建造而不是回防
+    """
+    if (
+        towers_missing
+        and len(turn.weapons()) < MIN_TOWERS_BEFORE_NIGHT
+        and turn.gold >= WEAPON_BUILD_COST
+    ):
+        return True
+
+    if walls_missing and not turn.walls():
+        return any(WALL_MATERIAL in worker.backpack for worker in turn.workers())
+
+    return False
 
 
 def _fall_back_to_weapons(
@@ -649,6 +760,8 @@ def _task_answer(turn: Turn) -> str | None:
 
     输出格式约定为 "[exitCode:N]\\n<输出>"（见接口文档），因此只有执行成功
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
+    命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
+    又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
     if not turn.phase_task:
         return None
@@ -659,7 +772,9 @@ def _task_answer(turn: Turn) -> str | None:
         return None
 
     answer = result.split(marker, 1)[1].strip()
-    return answer or None
+    if not answer or any(bad in answer for bad in TASK_ERROR_MARKERS):
+        return None
+    return answer
 
 
 def _go_mine(
@@ -696,6 +811,26 @@ def _go_mine(
             commands[unit.unit_id] = move_command(step)
             return True
 
+    return False
+
+
+def _gather_logic(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """保证工人每回合都有产出：按 石矿 -> 铁矿 -> 铜矿 的顺序就近采集
+
+    石矿是围墙材料，优先采；附近没有石矿（或已被其他角色占住）时退而采集
+    铁/铜，卖给小贩同样能换金币。这样工人不会出现"整回合没有任何指令"的空转。
+
+    返回:
+        True 表示本回合已下达采集或移动指令
+    """
+    for mine_type in SELLABLE_MINES:
+        if _go_mine(turn, worker, mine_type, claimed, commands):
+            return True
     return False
 
 
@@ -771,8 +906,11 @@ def _valid_stand_cells(
     逻辑:
         1. 取目标位置的八方向相邻格子
         2. 过滤掉非陆地、被阻挡（建筑/单位/机器人/中立元素）以及已被占用的格子
-        3. inside_only 为 True 时进一步限制在基地周围
-        4. 按离基地的切比雪夫距离排序
+        3. 白天再过滤掉武器塔/围墙的建造点（角色占住建造位会让建筑永远建不起来）；
+           目标本身就是建造点时（走去施工）不过滤，否则角色会因为"相邻格全是
+           建造点"而无处落脚，反而建不起来
+        4. inside_only 为 True 时进一步限制在基地周围
+        5. 按离基地的切比雪夫距离排序
     """
     station = turn.station()
     footprint = station_footprint(station.pos) if station else ()
@@ -781,10 +919,18 @@ def _valid_stand_cells(
     # 目标的八方向相邻格子
     neighbors = get_neighbors(target)
 
+    # 白天避开建造点: 角色站上去会把这一格占住,武器/围墙就再也建不起来了
+    reserved: frozenset[Pos] = frozenset()
+    if turn.is_day:
+        build_sites = _reserved_build_sites(turn)
+        if target not in build_sites:
+            reserved = build_sites
+
     cells = [
         pos for pos in neighbors
         if turn.land(pos)
         and pos not in blocked
+        and pos not in reserved
         and (pos == unit.pos or pos not in claimed)
         and (
             not inside_only
@@ -795,6 +941,15 @@ def _valid_stand_cells(
     # 按离基地的距离排序（优先靠近基地）
     cells.sort(key=lambda pos: (_footprint_distance(pos, footprint), pos.x, pos.y))
     return cells
+
+
+def _reserved_build_sites(turn: Turn) -> frozenset[Pos]:
+    """本回合规划中的建造点（武器塔 + 围墙）
+
+    这些格子要留给施工：一旦被角色占住，建造点就会被判为"已占用"而从
+    待建列表里消失，对应的塔或围墙整局都建不起来。
+    """
+    return frozenset(_calc_tower_sites(turn)) | frozenset(_calc_wall_order(turn))
 
 
 def _footprint_distance(pos: Pos, footprint: tuple[Pos, ...]) -> int:

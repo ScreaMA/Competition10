@@ -20,13 +20,16 @@ from agent.brain import (
     _generate_strategy_prompt,
     _pair_controllers_and_weapons,
     _task_token,
+    _valid_stand_cells,
     decide,
     sandbox_command,
 )
 from agent.protocol import (
     CHALLENGER_TASK_1,
+    COPPER_MINE,
     DAY_ROUNDS,
     GATLING,
+    IRON_MINE,
     PIONEER,
     RAILGUN,
     ROCKET,
@@ -194,6 +197,68 @@ def test_worker_stone_batch_makes_it_keep_collecting(payload_factory, role_facto
     assert commands["10010"]["action"] == "collect"
 
 
+def test_worker_gathers_iron_when_no_stone(payload_factory, role_factory):
+    """附近没有石矿时退而采集铁矿，避免整回合没有任何产出（空转）"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10010, WORKER, 5, 23, backPackCapability=100)],
+        zones=[(IRON_MINE, 4, 24)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "collect",
+        "targetPos": [{"x": 4, "y": 24}],
+    }
+
+
+def test_worker_keeps_building_when_defense_not_ready_before_night(
+    payload_factory, role_factory,
+):
+    """天黑前火力不足且买得起塔时先补塔，而不是回防待命"""
+    payload = payload_factory(
+        round_no=DAY_ROUNDS - 3,  # 距天黑还有4回合
+        gold=WEAPON_BUILD_COST,
+        roles=[role_factory(10010, WORKER, 11, 22, backPackCapability=100)],
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 12, "y": 23}],
+        "name": GATLING,
+    }
+
+
+def test_units_avoid_standing_on_build_sites(payload_factory, role_factory):
+    """白天角色不站到武器塔/围墙的建造点上（占住建造位会让建筑建不起来）"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10010, WORKER, 20, 20, backPackCapability=100)],
+    )
+    turn = Turn.load(payload)
+    worker = turn.workers()[0]
+
+    # (12,23) 是规划中的武器塔位置，(11,22) 的相邻格里包含它
+    assert Pos(12, 23) in _calc_tower_sites(turn)
+    assert Pos(12, 23) not in _valid_stand_cells(turn, worker, Pos(11, 22), set())
+    # 目标本身就是建造点时（走去施工）不过滤，否则相邻格全是建造位就无处落脚
+    assert Pos(13, 23) in _calc_wall_order(turn)
+    assert Pos(13, 23) in _valid_stand_cells(turn, worker, Pos(12, 23), set())
+
+    # 夜晚不施工，建造点可以正常站人（操控武器时站位更自由）
+    night = Turn.load(payload_factory(
+        round_no=71,
+        gold=0,
+        roles=[role_factory(10010, WORKER, 20, 20, backPackCapability=100)],
+    ))
+    assert Pos(12, 23) in _valid_stand_cells(
+        night, night.workers()[0], Pos(11, 22), set(),
+    )
+
+
 def test_worker_falls_back_to_weapon_before_night(payload_factory, role_factory):
     """天黑前工人停止采集，回到武器旁待命，保证夜晚火力不空转"""
     before = Pos(5, 23)
@@ -219,7 +284,7 @@ def test_worker_falls_back_to_weapon_before_night(payload_factory, role_factory)
 
 
 def _payload_with_full_walls(payload_factory, role_factory, worker_pos: Pos,
-                             zones=(), backpack=()) -> dict:
+                             zones=(), backpack=(), capacity: int = 100) -> dict:
     """构造“围墙已建完”的局面"""
     order = _calc_wall_order(Turn.load(payload_factory()))
     walls = [
@@ -229,7 +294,7 @@ def _payload_with_full_walls(payload_factory, role_factory, worker_pos: Pos,
     walls.append(
         role_factory(
             10010, WORKER, worker_pos.x, worker_pos.y,
-            backPackCapability=100, backpack=list(backpack),
+            backPackCapability=capacity, backpack=list(backpack),
         ),
     )
     return payload_factory(gold=0, roles=walls, zones=list(zones))
@@ -280,6 +345,24 @@ def test_trade_keeps_stone_when_backpack_not_full(payload_factory, role_factory)
     commands, _ = decide(payload)
 
     assert "10010" not in commands
+
+
+def test_trade_sells_ore_when_backpack_full(payload_factory, role_factory):
+    """背包被矿石塞满时先卖一批腾地方（铁/铜同样能换金币）"""
+    payload = _payload_with_full_walls(
+        payload_factory, role_factory,
+        worker_pos=Pos(20, 17),
+        zones=[(VENDOR, 20, 16)],
+        backpack=[COPPER_MINE] * 3,
+        capacity=3,
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "sell",
+        "name": COPPER_MINE,
+        "num": 3,
+    }
 
 
 def test_worker_keeps_mining_for_gold_after_walls_done(
@@ -429,19 +512,82 @@ def test_pioneer_returns_to_task_point_when_task_running(payload_factory, role_f
 
 
 def test_pioneer_falls_back_to_weapon(payload_factory, role_factory):
-    """没有可接取任务时跟随武器塔"""
+    """任务都在冷却中且短期不会开放时跟随武器塔"""
+    before = Pos(11, 22)
+    weapon_pos = Pos(9, 24)
+    task_pos = Pos(14, 14)
     payload = payload_factory(
         round_no=1,
         gold=0,
         roles=[
-            role_factory(10011, PIONEER, 11, 22, backPackCapability=40),
-            role_factory(10020, GATLING, 9, 24, attackRange=4),
+            role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40),
+            role_factory(10020, GATLING, weapon_pos.x, weapon_pos.y, attackRange=4),
         ],
-        tasks=[(14, 14, {"isValid": False})],
+        tasks=[(task_pos.x, task_pos.y, {"isValid": False, "coldDownRounds": 20})],
     )
     commands, _ = decide(payload)
 
-    assert commands["10011"]["action"] == "move"
+    command = commands["10011"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    # 走向武器塔备战，而不是跑去冷却中的任务点
+    assert distance(step, weapon_pos) <= distance(before, weapon_pos)
+    assert distance(step, task_pos) >= distance(before, task_pos)
+
+
+def test_pioneer_prefers_task_closer_to_timeout(payload_factory, role_factory):
+    """两个任务都可接时先去快过期的那个（临期优先，避免任务白白过期）"""
+    before = Pos(10, 12)
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40)],
+        tasks=[(14, 14, {"timeoutRounds": 30}), (10, 28, {"timeoutRounds": 5})],
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10011"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    assert distance(step, Pos(10, 28)) < distance(before, Pos(10, 28))
+
+
+def test_pioneer_waits_near_task_point_when_on_cooldown(
+    payload_factory, role_factory,
+):
+    """任务点还在冷却但快开放时，开拓者提前到任务点旁待命"""
+    before = Pos(10, 12)
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40)],
+        tasks=[(14, 14, {"isValid": False, "coldDownRounds": 2})],
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10011"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    assert distance(step, Pos(14, 14)) < distance(before, Pos(14, 14))
+
+
+def test_pioneer_uses_map_task_point_without_task_data(
+    payload_factory, role_factory,
+):
+    """报文没有 playerTasks 时，按地图上的己方任务点前往，而不是原地游走"""
+    before = Pos(10, 12)
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, before.x, before.y, backPackCapability=40)],
+        zones=[(CHALLENGER_TASK_1, 14, 14)],
+    )
+    commands, _ = decide(payload)
+
+    command = commands["10011"]
+    assert command["action"] == "move"
+    step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+    assert distance(step, Pos(14, 14)) < distance(before, Pos(14, 14))
 
 
 # === 自进化任务（沙盒作答） ===
@@ -514,6 +660,23 @@ def test_pioneer_ignores_stale_or_failed_sandbox_output(
     # 本任务但命令执行失败
     payload["lastCmdResult"] = _sandbox_result(
         phase_task, "No such file or directory", exit_code=1,
+    )
+    commands, _ = decide(payload)
+    assert "10011" not in commands
+
+
+def test_pioneer_skips_sandbox_error_output(payload_factory, role_factory):
+    """沙盒输出是"文件读不到"这类错误时不提交：提交错误答案只会白费任务冷却"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task, "cat: task_1_beijing.md: No such file or directory",
     )
     commands, _ = decide(payload)
     assert "10011" not in commands
