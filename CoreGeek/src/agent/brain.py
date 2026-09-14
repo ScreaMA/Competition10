@@ -3542,10 +3542,17 @@ def refine_url(raw):
     文档是中文的，地址常写在句子中间或反引号里，尾随的全角标点、引号会让
     urllib 直接抛 `InvalidURL`——复盘 #67 里 R12–R17 连续 6 回合
     `APIFAIL ... ），API InvalidURL`（URL 含反引号+中文）就是这么来的，
-    任务因此 8 个回合读不到题面、最终 0 分。这里做两件事：
+    任务因此 8 个回合读不到题面、最终 0 分。这里做三件事：
 
     1. 剥掉两端的标点/引号/括号（含全角）
-    2. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
+    2. 主机段只留 `host[:port]`：地址后面紧跟着中文说明时
+       （`http://localhost:8899），API 调用…`），`），API` 会被 urlsplit
+       整段吃进 netloc——netloc 是从 `//` 一直取到第一个 `/ ? #`，中间没有
+       斜杠就全是主机名。而 urlopen 要把 netloc 拆成 `host:port`，端口不是
+       纯数字时立刻抛 `InvalidURL`，所以只剥两端的标点拦不住它：PK590512/
+       PK590608 的 R11/R12/R14/R16 四回合 APIFAIL 就是这个形态，日志里的
+       URL 是 `http://localhost:8899），API`（旧实现把 netloc 原样带回）。
+    3. 路径与查询里的非 ASCII 字符（如 `?city=北京`）按 UTF-8 百分号编码
     """
     text = raw.strip()
     trim = "`'\\\"、，。；：？！,.;:!?)]}>（）【】《》“”‘’"
@@ -3561,9 +3568,17 @@ def refine_url(raw):
         return ""
     if not parts.scheme or not parts.netloc:
         return ""
+    # 主机段只认 域名/IPv4/[IPv6] 加一个可选端口，后面挂着的说明文字一律截掉
+    host = re.match(
+        r"(?:\\[[0-9A-Fa-f:.]+\\]|[A-Za-z0-9._-]+)(?::(?P<port>[0-9]+))?",
+        parts.netloc.rsplit("@", 1)[-1],
+    )
+    if host is None or int(host.group("port") or 0) > 65535:
+        return ""  # 主机名认不出来（或端口越界）的地址同样会被 urllib 判成 InvalidURL
     path = urllib.parse.quote(parts.path, safe="/%:@&=+$,-_.!~*'()")
     query = urllib.parse.quote(parts.query, safe="=&%:@+$,-_.!~*'()")
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, query, ""))
+    netloc = host.group(0)
+    return urllib.parse.urlunsplit((parts.scheme, netloc, path, query, ""))
 
 
 def endpoints(doc_text):

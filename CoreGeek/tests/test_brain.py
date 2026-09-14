@@ -4078,7 +4078,7 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
     assert match
     namespace: dict = {}
-    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    exec("import re\nimport urllib.parse\n" + match.group(0), namespace)  # noqa: S102
     refine = namespace["refine_url"]
 
     assert refine("http://localhost:8899/weather?city=北京。") == (
@@ -4087,3 +4087,38 @@ def test_executor_refine_url_survives_cjk_and_backticks():
     assert refine("`http://localhost:8899/x`") == "http://localhost:8899/x"
     assert refine("http://localhost:8899/a），") == "http://localhost:8899/a"
     assert refine("不是地址") == ""
+
+
+def test_executor_refine_url_drops_text_glued_to_the_host():
+    """URL 净化要截掉粘在主机段后面的说明文字（#79：APIFAIL InvalidURL 复发）
+
+    回归：文档写成"本地接口在 `http://localhost:8899`），API 调用…"时，
+    地址后面没有斜杠，`），API` 被 urlsplit 整段算进 netloc，而两端剥标点
+    只从整串的末尾往前剥、剥到 `I` 就停了，端口于是成了 `8899），API`——
+    urlopen 按 `host:port` 拆号时抛 InvalidURL，取数循环又空转 4 个回合
+    （PK590512/590608 的 R11/R12/R14/R16）。主机段只留 host[:port] 之后，
+    这类地址会退回可用的本地接口地址，其余候选地址照常参与取数。
+    """
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]
+    match = re.search(r"def refine_url\(raw\):.*?(?=\ndef )", script, re.S)
+    assert match
+    namespace: dict = {}
+    exec("import re\nimport urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    refine = namespace["refine_url"]
+
+    # 复盘里 APIFAIL 打出来的那条 URL：说明文字与反引号粘在端口后面
+    assert refine("http://localhost:8899），API") == "http://localhost:8899"
+    assert refine("`http://localhost:8899`），API 调用样例") == (
+        "http://localhost:8899"
+    )
+    # 路径还在时只截主机段，路径照常保留
+    assert refine("http://localhost:8899/api?city=北京），见文档") == (
+        "http://localhost:8899/api?city=%E5%8C%97%E4%BA%AC%EF%BC%89%EF%BC%8C"
+        "%E8%A7%81%E6%96%87%E6%A1%A3"
+    )
+    # IPv6 字面量与端口照常认出来
+    assert refine("http://[::1]:8899/api") == "http://[::1]:8899/api"
+    # 端口越界同样会被 urllib 判成 InvalidURL，这种地址直接丢掉
+    assert refine("http://localhost:99999/x") == ""
+    assert refine("http://:8899/x") == ""
