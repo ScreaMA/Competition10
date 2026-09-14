@@ -9,15 +9,22 @@ import pytest
 
 import agent.brain as brain
 from agent.brain import (
+    LLM_MAX_WALLS,
+    LLM_MIN_TOWERS,
+    LLM_PLAN_DEFAULT,
+    LLM_PLAN_TEMPLATE,
     SELL_BATCH,
     STONE_BATCH,
+    TASK_END_MARKER,
     TASK_MARKER,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
     WEAPON_UPGRADE_VOUCHER,
+    LlmPlan,
     _calc_tower_sites,
     _calc_wall_order,
     _generate_strategy_prompt,
+    _llm_plan,
     _pair_controllers_and_weapons,
     _task_token,
     _valid_stand_cells,
@@ -91,6 +98,33 @@ def test_tower_sites_without_station(payload_factory):
     """没有基地时不规划武器塔（不崩溃）"""
     turn = Turn.load(payload_factory(station=None))
     assert _calc_tower_sites(turn) == ()
+
+
+def test_tower_sites_prefer_enemy_side(payload_factory, role_factory):
+    """塔位优先罩住敌方来路
+
+    回归：以前塔位只按"朝地图内侧的空间大小"排，敌人在哪个方向完全没参考
+    （复盘里"塔位未按敌方路径规划，是否覆盖来路无法确认"）。
+    """
+    payload = payload_factory(
+        roles=[role_factory(10010, WORKER, 9, 25, backPackCapability=100)],
+        enemies=[role_factory(20010, WORKER, 3, 25)],  # 敌方单位在基地左侧
+    )
+    sites = _calc_tower_sites(Turn.load(payload))
+
+    # 左侧是敌方来路，第一座塔建在左侧；看不到敌人时第一座塔在右侧
+    assert sites[0] == Pos(9, 23)
+    assert _calc_tower_sites(Turn.load(payload_factory()))[0] == Pos(12, 23)
+
+
+def test_tower_sites_accept_llm_preferred_side(payload_factory):
+    """塔位接受 LLM 计划指定的布防方位（建议与指令生成器共用同一决策函数）"""
+    turn = Turn.load(payload_factory())
+
+    assert _calc_tower_sites(turn, "left")[0] == Pos(9, 23)
+    assert _calc_tower_sites(turn, "up")[0] == Pos(10, 25)
+    # 不带偏好时保持原顺序
+    assert _calc_tower_sites(turn, None) == _calc_tower_sites(turn)
 
 
 def test_wall_order_shape(payload_factory):
@@ -883,6 +917,56 @@ def test_sandbox_command_idle_without_task(payload_factory):
     assert sandbox_command(payload_factory(round_no=1)) == ""
 
 
+def test_sandbox_command_gathers_clues_in_one_shot(
+    payload_factory, role_factory,
+):
+    """一条沙盒命令同时带上兜底搜索与目录诊断，减少逐次试错回合
+
+    复盘里敌方"用错鉴权头→401、补参数又缺字段→400"逐次试错，白丢好几个
+    回合；这里把"读任务文件 + 路径不对时按文件名再找 + 列出沙盒目录"合成
+    一条命令，一次就能拿到更多线索。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task="请阅读tasks/task_1_beijing.md",
+    )
+    command = sandbox_command(payload)
+
+    assert 'cat -- "tasks/task_1_beijing.md"' in command
+    # 描述里的路径读不到时按文件名在沙盒里再找一次（只按文件名，不带目录）
+    assert 'find . -maxdepth 3 -type f -name "task_1_beijing.md"' in command
+    # 诊断信息排在答案结束标记之后，不会被当成答案提交
+    assert command.index(TASK_MARKER) < command.index(TASK_END_MARKER)
+    assert command.index(TASK_END_MARKER) < command.index("ls -a")
+
+
+def test_sandbox_answer_ignores_diagnostics_after_end_marker(
+    payload_factory, role_factory,
+):
+    """沙盒输出里结束标记之后的诊断信息不会被当成答案"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = (
+        _sandbox_result(phase_task, "北京 晴 25摄氏度")
+        + f"\n{TASK_END_MARKER}\ntask_1_beijing.md\ntask_2_shanghai.md\n"
+    )
+    commands, _ = decide(payload)
+
+    assert commands["10011"] == {
+        "action": "submitAnswer",
+        "taskAnswer": "北京 晴 25摄氏度",
+    }
+
+
 def test_pioneer_submits_answer_from_sandbox(payload_factory, role_factory):
     """开拓者拿到沙盒输出后在任务点旁提交答案"""
     phase_task = "请阅读task_1_beijing.md"
@@ -1108,6 +1192,169 @@ def test_strategy_prompt_uses_previous_llm_reply(payload_factory, monkeypatch):
     turn = Turn.load(payload_factory(round_no=131))
     prompt = _generate_strategy_prompt(turn, {"llmResp": "优先升级火箭发射台"})
     assert "优先升级火箭发射台" in prompt
+
+
+def test_strategy_prompt_asks_for_plan_line(payload_factory, monkeypatch):
+    """prompt 给出本回合既定计划并要求回一行可解析的 PLAN（建议与指令合一）"""
+    monkeypatch.setattr(brain, "LLM_PROMPT_ENABLED", True)
+    prompt = _generate_strategy_prompt(Turn.load(payload_factory(round_no=1)), {})
+
+    assert "本回合既定计划" in prompt
+    assert LLM_PLAN_TEMPLATE in prompt
+
+
+def test_strategy_prompt_includes_task_points(payload_factory, monkeypatch):
+    """prompt 带上任务点坐标/奖励，LLM 的建议才能落到具体任务上"""
+    monkeypatch.setattr(brain, "LLM_PROMPT_ENABLED", True)
+    turn = Turn.load(payload_factory(round_no=1, tasks=[(23, 14)]))
+    prompt = _generate_strategy_prompt(turn, {})
+
+    assert "(23,14)" in prompt
+
+
+# === LLM 计划落地（issue #14） ===
+
+
+def test_llm_plan_defaults_without_plan_line():
+    """没有 LLM 回复、或回复里没有 PLAN 行时退回默认计划（等价改造前策略）"""
+    assert _llm_plan({}) == LLM_PLAN_DEFAULT
+    assert _llm_plan({"llmResp": "优先升级火箭发射台"}) == LLM_PLAN_DEFAULT
+
+
+def test_llm_plan_parses_known_fields():
+    """PLAN 行里的已知字段被解析成计划，未知字段忽略"""
+    plan = _llm_plan({
+        "llmResp": "先补炮塔再铺墙\nPLAN: tower=2 wall=2 upgrade=off defend=left",
+    })
+
+    assert plan == LlmPlan(tower=2, wall=2, upgrade=False, defend="left")
+
+
+def test_llm_plan_clamps_out_of_range_values():
+    """越界与非法值被钳制：LLM 不能把塔数调成 0 让白天完全不设防"""
+    plan = _llm_plan({"llmResp": "PLAN: tower=0 wall=99 upgrade=maybe defend=左上"})
+
+    assert plan.tower == LLM_MIN_TOWERS
+    assert plan.wall == LLM_MAX_WALLS
+    assert plan.upgrade is True
+    assert plan.defend is None
+
+
+def test_llm_plan_ignores_unfilled_template():
+    """LLM 照抄模板占位符时不会被解析成 tower=1 这类误读（尖括号挡住）"""
+    assert _llm_plan({"llmResp": LLM_PLAN_TEMPLATE}) == LLM_PLAN_DEFAULT
+
+
+def test_llm_plan_skips_echoed_template_before_real_plan():
+    """建议里先复述模板、再给真正的计划时，以真正的那一行为准"""
+    reply = f"请按 {LLM_PLAN_TEMPLATE} 输出\nPLAN: tower=2 upgrade=off"
+    plan = _llm_plan({"llmResp": reply})
+
+    assert plan.tower == 2
+    assert plan.upgrade is False
+
+
+def test_llm_plan_tower_cap_stops_extra_tower(payload_factory, role_factory):
+    """计划里 tower=2 时不再开工第 3 座塔，金币不被继续压在塔上"""
+    sites = _calc_tower_sites(Turn.load(payload_factory()))
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST,
+        roles=[
+            role_factory(10010, WORKER, 9, 22, backPackCapability=100),
+            role_factory(10020, GATLING, sites[0].x, sites[0].y, attackRange=4),
+            role_factory(10030, RAILGUN, sites[1].x, sites[1].y, attackRange=6),
+        ],
+    )
+
+    # 默认计划: 金币够就直接开工第 3 座塔（火箭发射台）
+    commands, _ = decide(payload)
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": sites[2].x, "y": sites[2].y}],
+        "name": ROCKET,
+    }
+
+    # 计划只要求 2 座塔: 不再开工第 3 座
+    payload["llmResp"] = "PLAN: tower=2"
+    commands, _ = decide(payload)
+    assert "10010" not in commands
+
+
+def test_llm_plan_wall_quota_builds_walls_before_trading(
+    payload_factory, role_factory,
+):
+    """计划里 wall=2 时经济工人先铺围墙，而不是先把矿石卖掉"""
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[
+            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+            role_factory(
+                10012, WORKER, 13, 27, backPackCapability=100,
+                backpack=[WALL_MATERIAL] * SELL_BATCH,
+            ),
+        ],
+        zones=[(VENDOR, 13, 28)],
+    )
+
+    # 默认计划: 围墙没建完也先把矿石变现（金币滚动起来）
+    commands, _ = decide(payload)
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": WALL_MATERIAL,
+        "num": SELL_BATCH,
+    }
+
+    # 计划要求先铺 2 段围墙: 手里的石材先用于施工
+    payload["llmResp"] = "PLAN: wall=2"
+    commands, _ = decide(payload)
+    assert commands["10012"] == {
+        "action": "build",
+        "targetPos": [{"x": 13, "y": 26}],
+        "name": WALL,
+    }
+
+
+def test_llm_plan_upgrade_off_keeps_gold(payload_factory, role_factory):
+    """计划里 upgrade=off 时当天不买武器升级券，金币留作他用"""
+    payload = _payload_with_full_defense(
+        payload_factory, role_factory,
+        gold=UPGRADE_GOLD,
+        worker_pos=Pos(20, 17),
+        zones=[(WEAPON_SHOP, 20, 16)],
+    )
+
+    commands, _ = decide(payload)
+    assert commands["10010"] == {
+        "action": "buy",
+        "name": WEAPON_UPGRADE_VOUCHER,
+        "num": 1,
+    }
+
+    payload["llmResp"] = "PLAN: upgrade=off"
+    commands, _ = decide(payload)
+    assert "10010" not in commands
+
+
+def test_llm_plan_defend_side_builds_tower_on_that_side(
+    payload_factory, role_factory,
+):
+    """计划里的 defend 方位决定第一座塔建在哪一侧"""
+    payload = payload_factory(
+        round_no=1,
+        gold=WEAPON_BUILD_COST,
+        roles=[role_factory(10010, WORKER, 8, 23, backPackCapability=100)],
+    )
+    payload["llmResp"] = "PLAN: defend=left"
+    commands, _ = decide(payload)
+
+    # 工人站在左侧塔位旁，计划指定左侧布防时直接开工
+    assert commands["10010"] == {
+        "action": "build",
+        "targetPos": [{"x": 9, "y": 23}],
+        "name": GATLING,
+    }
 
 
 def test_decide_returns_commands_and_prompt(payload_factory):
