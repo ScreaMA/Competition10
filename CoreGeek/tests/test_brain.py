@@ -5577,6 +5577,95 @@ def test_executor_fetch_sends_the_headers_it_gets():
     assert seen["headers"] == headers
 
 
+def _executor_doc_search():
+    """从生成的沙盒脚本里取出"找接口文档"那一段（近处搜索 + 全盘兜底）"""
+    command = _task_executor("task_1_alpha.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(
+        r"\nfiles = task_files\(\)\n.*?\nurls = endpoints\(doc_text\)\n", script, re.S,
+    )
+    assert match
+    return match.group(0)
+
+
+def _doc_search_namespace(task_file, find_files, text_of, found_urls=()):
+    """跑一遍"找接口文档"那一段，返回它留下的命名空间（`doc_files`/`doc_text`）"""
+    namespace = {
+        "os": os,
+        "re": re,
+        "ROOTS": brain.TASK_ROOTS,
+        "SOLVE_MAX": brain.TASK_SOLVE_MAX,
+        "DOC_NAMES": brain.TASK_API_DOC_NAMES,
+        "WIDE_DOC_NAMES": brain.TASK_DOC_WIDE_NAMES,
+        "DOC_PRUNE": brain.TASK_DOC_PRUNE,
+        "read": text_of,
+        "find_files": find_files,
+        "task_files": lambda: [task_file],
+        "endpoints": lambda text: list(found_urls),
+    }
+    exec(_executor_doc_search(), namespace)  # noqa: S102
+    return namespace
+
+
+def test_executor_widens_the_doc_search_when_no_local_url_was_found():
+    """近处这几份"文档"里没有本地接口地址时，到全盘再找一遍接口文档（S1）
+
+    复盘 PK591809 的 `[SCAN] docs=2 urls=1 key=no`：任务根目录里的 `.md`
+    命中的首先是任务文件自己（任务书就是 `.md`），近处搜回来的两份"文档"
+    就是它们——接口地址与鉴权 Key 一个都没读到，`urls` 里只剩本地接口那
+    一条兜底，这一局的取数便一路 404 到止损（`api=0`、答案区永远为空）。
+    原来那条 `if not doc_files` 的全盘兜底永远触发不了：任务文件自己就把
+    `doc_files` 填满了，接口文档不在任务树里时一次都读不到。
+    """
+    task_file = f"{TASK_ROOTS[0]}/1-x/task_1_alpha.md"
+    api_doc = "/API_DOCS/heritage_api.md"
+    docs = {task_file: "请查询北京的文化遗产", api_doc: "接口地址：http://localhost:8899"}
+    calls: list[tuple] = []
+
+    def _find_files(patterns, limit, roots=(), prune=()):
+        calls.append((patterns, tuple(roots)))
+        if tuple(roots) == ("/",):
+            return [api_doc]
+        return [task_file]
+
+    def _read(path):
+        return docs.get(path, "")
+
+    namespace = _doc_search_namespace(task_file, _find_files, _read)
+
+    # 全盘那一趟用的是"名字里写着接口/文档"的窄特征，不是 `\.md$`
+    assert (brain.TASK_DOC_WIDE_NAMES, ("/",)) in calls
+    assert api_doc in namespace["doc_files"]
+    assert "接口地址" in namespace["doc_text"]
+
+
+def test_executor_keeps_the_near_doc_search_when_a_local_url_is_present():
+    """近处文档里已经有本地接口地址时不再全盘找（S1）
+
+    正常一局里接口文档的样例就写着 `http://localhost:8899/...`，那趟全盘
+    搜索不该跑：沙盒命令整条限时 15 秒，多扫一遍目录树是白烧时间。
+    """
+    task_file = f"{TASK_ROOTS[0]}/1-x/api_docs.md"
+    calls: list[tuple] = []
+
+    def _find_files(patterns, limit, roots=(), prune=()):
+        calls.append((patterns, tuple(roots)))
+        return [task_file]
+
+    namespace = _doc_search_namespace(
+        task_file,
+        _find_files,
+        lambda path: "调用样例：http://localhost:8899/heritage?city=beijing",
+        found_urls=[brain.TASK_API_DEFAULT],
+    )
+
+    assert calls == [(brain.TASK_API_DOC_NAMES, tuple(brain.TASK_ROOTS) + (
+        f"{TASK_ROOTS[0]}/1-x",
+    ))]
+    assert namespace["doc_files"] == [task_file]
+    assert namespace["urls"] == [brain.TASK_API_DEFAULT]
+
+
 def _executor_fetch_loop():
     """从生成的沙盒脚本里取出取数主循环（含“没有任务文件”时的那条兜底）"""
     command = _task_executor("task_1_alpha.md")
