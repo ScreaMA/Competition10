@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -61,6 +64,7 @@ from agent.brain import (
     _day_plan,
     _generate_strategy_prompt,
     _gold_left,
+    _is_api_error,
     _llm_plan,
     _mine_order,
     _pair_controllers_and_weapons,
@@ -3820,3 +3824,150 @@ def test_day_plan_makes_room_for_selling_when_backpack_full(
     assert len(_day_plan(loaded, stone_loaded).queue) <= len(
         _day_plan(empty, stone_empty).queue
     )
+
+
+# === issue #55：任务答案校验 / 卖矿经济 / 围墙可达性（PK590322/590326） ===
+
+
+def test_task_sandbox_drops_http_error_response(tmp_path):
+    """沙盒接口返回 404 时不能当数据取回：执行器不打印取数证据，答案区为空
+
+    回归：PK590322 的 R14 沙盒把 404 响应体当成"取到的数据"打进 `[SOLUTION]`
+    段，`_task_answer` 照单全收，交卷交的是 404 错误原文，任务分归零。
+    `urlopen` 对 4xx/5xx 不抛异常，所以执行器必须自己看状态码。
+    """
+    interpreter = None
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            interpreter = found
+            break
+    if interpreter is None:
+        pytest.skip("沙盒执行器需要 python3/python 解释器")
+
+    task_file = tmp_path / "task_1_beijing.md"
+    task_file.write_text("请查询北京文化遗产，接口见 API.md", encoding="utf-8")
+    fake = tmp_path / "fakelib"
+    fake.mkdir()
+    # 冒充 urllib.request：只提供 urlopen，返回一个 404 响应
+    (fake / "request.py").write_text(
+        "class Response:\n"
+        "    def __init__(self, body):\n"
+        "        self._body = body\n"
+        "    def getcode(self):\n"
+        "        return 404\n"
+        "    def read(self):\n"
+        "        return self._body\n"
+        "    def __enter__(self):\n"
+        "        return self\n"
+        "    def __exit__(self, *args):\n"
+        "        return False\n"
+        "\n"
+        "def urlopen(request, timeout=0):\n"
+        "    return Response(b'404 page not found')\n",
+        encoding="utf-8",
+    )
+    script = brain.TASK_EXECUTOR.replace("__TASK_PATH__", repr(str(task_file)))
+    result = subprocess.run(
+        [interpreter, "-c", script],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PYTHONPATH": str(fake)},
+    )
+
+    assert "page not found" not in result.stdout  # 错误原文没有落到答案里
+    assert TASK_DATA_MARKER not in result.stdout  # 没有"取数成功"的证据
+    assert TASK_SOLUTION_MARKER not in result.stdout  # 答案区整段为空
+
+
+def test_task_answer_rejects_http_error_body(payload_factory, role_factory):
+    """沙盒回显 404 错误原文时不交卷（任务分宁可空着，也不交错误答案）"""
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _sandbox_result(
+        phase_task,
+        f"{TASK_DATA_MARKER} http://localhost:8899/heritage?city=beijing => 19\n"
+        f"{TASK_SOLUTION_MARKER}task_1_beijing.md\n404 page not found\n"
+        f"{TASK_SOLUTION_END}\n{TASK_END_MARKER}\n",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+    assert _is_api_error("404 page not found") is True
+    assert _is_api_error('{"city": "北京", "count": 7}') is False
+
+
+def test_defender_keeps_building_wall_instead_of_hoarding_stone(
+    payload_factory, role_factory,
+):
+    """手里有石材时先砌墙：金币见底也不能把料压着（S2/S3 的交界）
+
+    回归：PK590322 的工人在 R6/R15 采了石、背包里恒有 stone:1，却只立起
+    1 段围墙（R15 的 (33,12)），金币从 R8 起一路冻结——采石与砌墙之间的
+    这一环不能断在"路走不通"上（见 `_reachable_sites`）。
+    """
+    payload = payload_factory(
+        round_no=1,
+        gold=0,  # 金币见底，正是最容易把料压成死循环的时候
+        team_type="defender",
+        roles=[
+            role_factory(10010, WORKER, 20, 20, backPackCapability=100,
+                         backpack=[WALL_MATERIAL]),
+        ],
+        zones=[(STONE_MINE, 21, 21)],  # 石矿就在手边，别把它当出路
+    )
+    commands, _ = decide(payload)
+
+    step = Pos(
+        commands["10010"]["targetPos"][0]["x"], commands["10010"]["targetPos"][0]["y"],
+    )
+    # 这一步是在走向防线首段（基地外圈），不是就地再采一铲石材
+    wall = _calc_wall_order(Turn.load(payload))[0]
+    assert commands["10010"]["action"] == "move"
+    assert distance(step, wall) < distance(Pos(20, 20), wall)
+    # 石矿就在旁边：这一步必须不是采石（旧行为会就地补石材）
+    assert commands["10010"]["action"] != "collect"
+
+
+def test_early_wall_skips_sealed_site_and_keeps_building(
+    payload_factory, role_factory,
+):
+    """防线首段被墙围死时不再反复撞那一段，改去下一个能施工的墙位
+
+    回归：PK590322 采石 5 次只立起 1 段围墙、金币从 R8 起恒 0——工人攥着
+    石材一直朝一个走不到的墙位走，每回合都走不通，围墙线整条停摆。
+    """
+    sealed = Pos(2, 30)
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        team_type="defender",
+        roles=[
+            role_factory(10010, WORKER, 20, 20, backPackCapability=100,
+                         backpack=[WALL_MATERIAL]),
+            # 把首段墙位围死：它的四邻居全是墙，谁也站不到它旁边
+            role_factory(40001, WALL, 1, 29),
+            role_factory(40002, WALL, 3, 29),
+            role_factory(40003, WALL, 1, 31),
+            role_factory(40004, WALL, 3, 31),
+        ],
+    )
+    turn = Turn.load(payload)
+    worker = turn.workers()[0]
+    # 走得到的墙位排在前面（探针按纯几何算），首段被围死
+    probe = [Pos(6, 6), Pos(12, 12), sealed]
+    assert brain._reachable_sites(turn, worker, probe, set()) == probe[:2]
+    # 手里有石材、站在墙位旁就能直接施工
+    assert brain._reachable_sites(turn, worker, [Pos(20, 21)], set()) == [Pos(20, 21)]
+
+    commands, _ = decide(payload)
+
+    assert commands["10010"] == {
+        "action": "move",
+        "targetPos": [{"x": 19, "y": 19}],
+    }

@@ -117,6 +117,9 @@ MINERAL_SELL_THRESHOLD = 1
 # 一段围墙只要石头*1（任务书4.5.1），所以手里有石头就该立刻变成墙，
 # 不必攒够 STONE_BATCH 那么多段再一起铺。
 WALL_STONE_COST = 1
+# 挑墙位时往后探测几段（见 `_reachable_sites`）：被堵住的永远是靠前那几段，
+# 探太远只是白算走位
+SITE_PROBE_LIMIT = 8
 
 # 金币见底线（经济回路）：低于这个值时不再等凑够一批矿石，手里有什么就卖什么。
 # 复盘里 R6 建完第三座塔后 gold=0 冻结 13 个回合，背包里 stone:6 既不卖也不
@@ -335,6 +338,7 @@ TASK_SOLUTION_MARKER = "[SOLUTION]"  # 答案段落开头，后跟任务文件�
 TASK_SOLUTION_END = "[/SOLUTION]"
 TASK_DATA_MARKER = "[API]"  # 真实取数的证据：只有请求成功才会打印
 TASK_API_FAIL_MARKER = "[APIFAIL]"  # 取数失败也留一行诊断（URL + 异常类型）
+TASK_API_STATUS_MARKER = "[HTTPSTATUS]"  # 状态码不在 2xx 时的诊断前缀
 TASK_SCAN_MARKER = "[SCAN]"  # 沙盒里找到多少任务文件/接口文档/可用地址
 TASK_ANSWER_MIN_LEN = 4  # 答案最短长度（任务原文动辄几千字，这条挡住空答）
 TASK_ECHO_RUN = r"[一-鿿]{6,}"  # 任务描述里的中文长句（复读判定用）
@@ -349,6 +353,24 @@ TASK_SOLVE_MAX = 4  # 一次最多解几份任务文件（当前这份排第一�
 TASK_API_PATH_SUFFIXES = ("/", "/api", "/docs")  # 文档没给样例时先试这几个
 TASK_API_DOC_NAMES = (r"api", r"doc", r"readme", r"\.md$")  # 接口文档的文件名特征
 TASK_EXEC_PRUNE = ("/proc", "/sys", "/dev", "/run")  # 全盘找文件时跳过的虚拟目录
+# 接口的失败判据：HTTP 状态码不在 2xx 就算取数失败（PK590322 的沙盒在
+# `r14` 那回合把 404 的响应体当成"取到的数据"打进了 `[SOLUTION]` 段，
+# `_task_answer` 照单全收，交上去的是 404 错误原文，任务分归零）。
+# `urlopen` 对 4xx/5xx 不抛异常，所以必须显式看状态码。
+TASK_HTTP_OK = "2"
+# 状态码是 2xx、正文却是一页 HTTP 错误说明时（沙盒把错误信息当正文返回），
+# 同样不算取数成功：只有"整条响应就是一句带状态码的错误话"才拒绝，正常答案里
+# 出现"404"这类数字不会被误伤（宁可这一回合不提交，也不拿错误原文去撞 Judge）
+TASK_API_ERROR_TEXTS = (
+    "400 bad request",
+    "401 unauthorized",
+    "403 forbidden",
+    "404 not found",
+    "500 internal server error",
+    "502 bad gateway",
+    "503 service unavailable",
+)
+TASK_API_ERROR_LIMIT = 200  # 错误正文的长度上限（错误页本来就只是一两行）
 
 # 任务止损（S1）：自进化任务的闭环是"下发沙盒命令 -> 取数 -> submitAnswer"，
 # 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
@@ -865,7 +887,7 @@ def _worker_day_logic(
     # 角色占住时继续往下走,别空转）
     if role != 2 and stones >= WALL_STONE_COST:
         sites = _retry_sites(
-            turn, worker, [site for site in walls_missing if site not in claimed],
+            turn, worker, _reachable_sites(turn, worker, walls_missing, claimed),
         )
         if sites and _build_or_walk(turn, worker, sites[0], WALL, claimed, commands):
             claimed.add(sites[0])
@@ -999,7 +1021,7 @@ def _early_wall(
     # 手里有石头: 一段围墙只要一块石头，直接开工
     if worker.backpack.count(WALL_MATERIAL) >= WALL_STONE_COST:
         sites = _retry_sites(
-            turn, worker, [site for site in walls_missing if site not in claimed],
+            turn, worker, _reachable_sites(turn, worker, walls_missing, claimed),
         )
         if sites and _build_or_walk(turn, worker, sites[0], WALL, claimed, commands):
             claimed.add(sites[0])
@@ -1008,6 +1030,49 @@ def _early_wall(
 
     # 手里还没有石材: 去石矿采一铲（背包满了时留给下面的卖矿分支腾地方）
     return _go_mine(turn, worker, STONE_MINE, claimed, commands)
+
+
+def _reachable_sites(
+    turn: Turn,
+    worker: Unit,
+    sites: list[Pos],
+    claimed: set[Pos],
+) -> list[Pos]:
+    """能从当前位置走过去的建造位（保留原有优先级顺序）
+
+    `_calc_wall_order` 生成的防线是按基地坐标现算的，来敌方向那一段可能落在
+    被地图边界或建筑堵死的角落里。工人手里攥着石材一直朝那一格走、每回合都
+    走不通，就成了"只采石不砌墙"的死循环——复盘里 PK590322 采石 5 次只立起
+    1 段围墙、金币从 R8 起恒 0，正是卡在这上面。这里把当前走不到的位置跳过，
+    让防线从第一个真能施工的墙位接着铺（一处被堵不再拖住整条防线）。
+
+    往后多看 `SITE_PROBE_LIMIT` 个候选就收：整圈围墙逐格试走位太贵，而真正
+    被堵住的永远是靠前那几段；全都不通时返回走到过的最远那段，让调用方照旧
+    给出指令（`_retry_sites` 下一回合会换下一段）。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        sites: 按优先级排好的候选建造位
+        claimed: 已被其他角色占用的目标集合
+
+    返回:
+        可达的候选列表；都在探测范围内走不到时返回能走到的最远那段
+    """
+    reachable = []
+    probe = sites[:SITE_PROBE_LIMIT]
+    for site in probe:
+        # 已经站在墙位旁边: 这一回合就能施工（`_build_or_walk` 的直接分支）
+        if worker.pos != site and distance(worker.pos, site) <= 1:
+            reachable.append(site)
+            continue
+        # 有落脚点就走得过去（最顺路那一步被队友认领时 `_step_toward` 会绕路，
+        # 所以这里只判"有没有落脚点"，与执行层同一套判据）
+        if _valid_stand_cells(turn, worker, site, claimed):
+            reachable.append(site)
+    if reachable:
+        return reachable
+    return probe or sites
 
 
 # === 每日任务规划（V4）===
@@ -3147,6 +3212,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
+    if _is_api_error(answer):
+        return None  # LLM 抄回的是一条 404 错误原文，同样不能交
     return answer
 
 
@@ -3163,6 +3230,8 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
         return None
     if any(bad in answer for bad in TASK_ERROR_MARKERS):
         return None
+    if _is_api_error(answer):
+        return None  # LLM 那条命令取数失败（404 等）时的输出同样不能当答案
     if _task_echo(answer, turn.phase_task):
         return None
     return answer
@@ -3254,6 +3323,10 @@ def _task_executor(task_path: str) -> str:
         .replace("__SOLUTION_END__", repr(TASK_SOLUTION_END))
         .replace("__DATA__", repr(TASK_DATA_MARKER))
         .replace("__FAIL__", repr(TASK_API_FAIL_MARKER))
+        .replace("__STATUS__", repr(TASK_API_STATUS_MARKER))
+        .replace("__OK_STATUS__", repr(TASK_HTTP_OK))
+        .replace("__ERROR_TEXTS__", repr(TASK_API_ERROR_TEXTS))
+        .replace("__ERROR_LIMIT__", str(TASK_API_ERROR_LIMIT))
         .replace("__SCAN__", repr(TASK_SCAN_MARKER))
     )
     # 沙盒的解释器叫 python3 或 python，挑一个能用的（挑不到时脚本不会执行，
@@ -3292,6 +3365,10 @@ SOLUTION = __SOLUTION__
 SOLUTION_END = __SOLUTION_END__
 DATA = __DATA__
 FAIL = __FAIL__
+STATUS = __STATUS__
+OK_STATUS = __OK_STATUS__
+ERROR_TEXTS = __ERROR_TEXTS__
+ERROR_LIMIT = __ERROR_LIMIT__
 SCAN = __SCAN__
 SKIP_WORDS = ("http", "https", "localhost", "task", "spec", "md", "txt", "json", "api")
 
@@ -3305,19 +3382,47 @@ def read(path):
         return ""
 
 
-def fetch(url):
-    """调用接口并把响应体截断返回（失败时打一行诊断，绝不抛异常打断整条命令）
+def check(response):
+    """HTTP 状态码不在 2xx 时抛错
 
-    失败诊断要留在输出里：复盘里沙盒"执行了但没答案"时，日志上看不到任何
-    原因（旧实现把异常吞掉、命令又带 `2>/dev/null`），只能靠猜。
+    `urlopen` 对 4xx/5xx 不抛异常，404 页面会被当成"取到的数据"原样打回来
+    ——PK590322 的 R14 就是这么把 404 错误原文交卷的，任务分归零。
+    """
+    code = response.getcode()
+    if not code or str(code)[:1] not in OK_STATUS:
+        raise OSError("%s %s" % (STATUS, code))
+    return response
+
+
+def is_error_body(body):
+    """响应体是不是一整条 HTTP 错误说明
+
+    状态码偶尔是 2xx、正文却是错误页；只有"短正文 + 含错误字样"才判为错误，
+    正常答案里恰好出现 404 这类数字不会被误伤。
+    """
+    text = body.strip().lower()
+    return len(text) <= ERROR_LIMIT and any(bad in text for bad in ERROR_TEXTS)
+
+
+def fetch(url):
+    """调用接口并把响应体截断返回
+
+    失败（HTTP 非 2xx、超时、连不上、正文是错误页）一律返回空串并留一行诊断：
+    取数失败的响应体绝不能进 `[SOLUTION]` 段，否则交卷交的就是错误原文。
+    诊断要留在输出里——复盘里沙盒"执行了但没答案"时，日志上看不到任何原因
+    （旧实现把异常吞掉、命令又带 `2>/dev/null`），只能靠猜。
     """
     try:
         request = urllib.request.Request(url, headers={"Accept": "*/*"})
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            return response.read().decode("utf-8", "replace").strip()[:BODY_LIMIT]
+            body = check(response).read().decode("utf-8", "replace").strip()
     except Exception as exc:
-        print(FAIL, url, type(exc).__name__)
+        print(FAIL, url, type(exc).__name__, str(exc)[:60])
         return ""
+    if is_error_body(body):
+        print(FAIL, url, STATUS, "error-body")
+        return ""
+    return body[:BODY_LIMIT]
 
 
 def find_files(patterns, limit):
@@ -3561,11 +3666,13 @@ def _task_answer(turn: Turn) -> str | None:
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
     答案取任务标识到 `TASK_END_MARKER` 之间、`[SOLUTION]` 段里的内容。
 
-    两道闸门保证交上去的不是任务原文（复盘里 4 次 submitAnswer 交的全是
-    任务描述，Judge 一次都没放行）：
+    三道闸门保证交上去的不是任务原文或错误信息（复盘里 4 次 submitAnswer 交的
+    全是任务描述，Judge 一次都没放行）：
         1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
            执行器取不到数据时答案区是空的，这一回合就不提交；
-        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
+        2. 答案里不能出现 HTTP 错误信息（`_is_api_error`）——PK590322 的 R14
+           把沙盒里 404 的响应体当答案交了上去，同样是不及格卷；
+        3. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
     命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
     又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
@@ -3593,13 +3700,41 @@ def _task_answer(turn: Turn) -> str | None:
         return None  # 没取到数据：沙盒里只有任务原文，不能当答案交上去
     if any(bad in region for bad in TASK_ERROR_MARKERS):
         return None
+    if _is_api_error(region):
+        return None  # 取数失败（404/401/超时）：错误原文不能当答案提交
 
     answer = _solution_answer(region, turn)
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
         return None
+    if _is_api_error(answer):
+        return None
     if _task_echo(answer, turn.phase_task):
         return None
     return answer
+
+
+def _is_api_error(text: str) -> bool:
+    """这段输出是不是一条 HTTP 取数错误（状态码诊断或整条错误说明）
+
+    执行器取数失败时会把状态码打进诊断行（见 `_task_executor` 的 `check`），
+    沙盒也可能把一整页错误说明当成响应体返回。两种形态都不能当答案交：
+    PK590322 的 R14 交的就是 404 错误原文，任务分归零。
+    """
+    if TASK_API_FAIL_MARKER in text or TASK_API_STATUS_MARKER in text:
+        return True
+    return _looks_like_api_error(text)
+
+
+def _looks_like_api_error(text: str) -> bool:
+    """短文本里出现"带状态码的 HTTP 错误话"时判为错误说明
+
+    判据是"整条就是一句错误话"（见 `TASK_API_ERROR_TEXTS`/`TASK_API_ERROR_LIMIT`）：
+    正常答案里恰好出现 404 这类数字不会被误伤，而错误页面本来就只是一两行。
+    """
+    body = text.strip().lower()
+    return len(body) <= TASK_API_ERROR_LIMIT and any(
+        bad in body for bad in TASK_API_ERROR_TEXTS
+    )
 
 
 def _solution_answer(region: str, turn: Turn) -> str | None:
@@ -3654,6 +3789,9 @@ def _remember_task_answers(result: str) -> None:
     时也会把任务文件打成 `[SOLUTION]` 段（沙盒里本来就有这份文件），
     把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
     ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
+    取数失败留下的错误原文（404 页面等，见 `_is_api_error`）同样不进缓存：
+    缓存的答案下一个任务点会**直接交卷**，混进一条错误信息就是把 0 分答案
+    写死下来（PK590322 的 R14 交的正是 404 错误原文）。
 
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
@@ -3664,7 +3802,13 @@ def _remember_task_answers(result: str) -> None:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and TASK_DATA_MARKER in evidence:
+        if (
+            name
+            and answer
+            and TASK_DATA_MARKER in evidence
+            and not _is_api_error(answer)
+            and not _looks_like_api_error(evidence)
+        ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
 
