@@ -3762,14 +3762,25 @@ def endpoints(doc_text):
 
 
 def queries(text, name):
-    """查询关键词：文件名里的英文词最可靠（task_1_beijing.md -> beijing）"""
+    """查询关键词：文件名里的英文词最可靠（task_1_beijing.md -> beijing）
+
+    文件名按非字母切成词干里的词再取：`task_1_beijing.md` 给的是 `beijing`
+    （文档问的正是城市名），而不是整段词干 `task_1_beijing`。整段文件名不是
+    一个查询值——它拼进样例地址只会 404（复盘 PK590884/PK590920 的
+    `[APIFAIL] http://localhost:8899/task_1_alpha` 就是这么来的），而
+    `QUERY_MAX` 只有两个名额，它先占掉一个就把文档里真正有用的词挤出去了。
+    """
+    stem = os.path.splitext(name or "")[0]
+    # 文件名与词干本身不算查询词：正文里再提到一次这个文件名时同样跳过
+    whole = {value.lower() for value in (name, stem) if value}
     values = []
-    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", name or ""):
-        if token.lower() not in SKIP_WORDS:
+    for token in re.split(r"[^A-Za-z]+", stem):
+        if len(token) > 1 and token.lower() not in SKIP_WORDS:
             values.append(token)
     for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", text):
-        if token.lower() not in SKIP_WORDS:
-            values.append(token)
+        if token.lower() in SKIP_WORDS or token.lower() in whole:
+            continue
+        values.append(token)
     picked = []
     for value in values:
         if value not in picked:
