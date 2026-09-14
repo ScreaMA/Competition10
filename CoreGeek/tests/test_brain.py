@@ -19,6 +19,7 @@ from agent.brain import (
     STONE_BATCH,
     TASK_END_MARKER,
     TASK_MARKER,
+    TASK_PROBE_MARKER,
     TOWER_LOADOUT,
     UPGRADE_GOLD,
     WEAPON_UPGRADE_VOUCHER,
@@ -160,6 +161,27 @@ def test_wall_order_within_map_bounds(payload_factory):
 def test_wall_order_without_station(payload_factory):
     turn = Turn.load(payload_factory(station=None))
     assert _calc_wall_order(turn) == ()
+
+
+def test_wall_order_follows_enemy_side(payload_factory, role_factory):
+    """围墙按敌方来路排序：先封来路，把进攻路线压进炮塔射程
+
+    回归：围墙顺序固定为"上->左->下->右"，敌人在哪一侧都先砌背面，正面一直
+    空着（复盘里"防守方 0 段围墙、正面无任何阻挡"，以及"用墙把来路压缩进
+    塔射程"）。
+    """
+    payload = payload_factory(
+        enemies=[role_factory(20010, WORKER, 3, 24)],  # 敌方单位在基地正左方
+    )
+    order = _calc_wall_order(Turn.load(payload))
+
+    # 来路在左侧：第一段围墙砌在基地左边（x = xmin-2 = 8）
+    assert order[0] == Pos(8, 25)
+    assert Pos(8, 22) in order  # 左边整条都在队列里
+    assert order.index(Pos(8, 25)) < order.index(Pos(13, 26))
+
+    # 看不到敌方单位时顺序不变（上边先砌），策略与改造前完全一致
+    assert _calc_wall_order(Turn.load(payload_factory()))[0] == Pos(13, 26)
 
 
 # === 白天决策 ===
@@ -1072,6 +1094,46 @@ def test_sandbox_command_gathers_clues_in_one_shot(
     assert command.index(TASK_END_MARKER) < command.index("ls -a")
 
 
+def test_sandbox_probes_task_dir_when_description_has_no_file(
+    payload_factory, role_factory,
+):
+    """描述里没有文件名时：先探测沙盒任务目录，认出文件再读它作答
+
+    回归：任务描述只写"按沙盒里的任务说明作答"这类话时，客户端不知道该读
+    哪个文件，开拓者会卡在任务点拿到一堆无关输出，整个任务周期（15 回合）
+    空转（复盘里的"接取任务后反复答非所问、最后放弃"）。
+    """
+    phase_task = "请按沙盒里的任务说明作答"
+    token = _task_token(phase_task)
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 20, 20, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+
+    # 第一回合：描述里没有文件名，下发探测命令列出沙盒里的任务文件
+    command = sandbox_command(payload)
+    assert TASK_PROBE_MARKER in command
+    assert 'find "/tmp/selfEvolutionTask"' in command
+    # 探测输出带的是探测标记，不会被 `_task_answer` 当成答案
+    assert TASK_MARKER not in command
+
+    # 探测结果里认出了任务文件：改用完整路径读它，并带上本任务标识
+    payload["lastCmdResult"] = (
+        f"[exitCode:0]\n{TASK_PROBE_MARKER}{token}\n"
+        "/tmp/selfEvolutionTask/task_1_alpha.md\n"
+    )
+    command = sandbox_command(payload)
+    assert 'cat -- "/tmp/selfEvolutionTask/task_1_alpha.md"' in command
+    assert TASK_MARKER in command
+
+    # 目录清单本身不是答案，不能被提交上去
+    commands, _ = decide(payload)
+    assert commands.get("10011", {}).get("action") != "submitAnswer"
+
+
 def test_sandbox_answer_ignores_diagnostics_after_end_marker(
     payload_factory, role_factory,
 ):
@@ -1553,6 +1615,62 @@ def test_gold_flush_keeps_plan_cap_below_threshold(
 
     commands, _ = decide(payload)
     assert "10010" not in commands
+
+
+# === 防守方围墙配额（issue #22） ===
+
+
+def test_defender_plan_keeps_wall_quota(payload_factory, role_factory):
+    """计划把围墙压到 0 段时，防守方仍按下限先铺墙
+
+    回归：防守方整天 0 段围墙、正面毫无阻挡，机器人直接贴脸打基地，
+    而同局的进攻方反倒把来路封得严严实实。
+    """
+
+    def _payload(team_type: str) -> dict:
+        payload = payload_factory(
+            round_no=1,
+            gold=0,
+            team_type=team_type,
+            roles=[
+                role_factory(10010, WORKER, 5, 23, backPackCapability=100),
+                role_factory(
+                    10012, WORKER, 13, 27, backPackCapability=100,
+                    backpack=[WALL_MATERIAL] * SELL_BATCH,
+                ),
+            ],
+            zones=[(VENDOR, 13, 28)],
+        )
+        payload["llmResp"] = "PLAN: wall=0"
+        return payload
+
+    # 防守方：手里的石材先砌成围墙，矿石不急着变现
+    commands, prompt = decide(_payload("defender"))
+    assert commands["10012"] == {
+        "action": "build",
+        "targetPos": [{"x": 13, "y": 26}],
+        "name": WALL,
+    }
+    # LLM 看到的配额也是执行层真正要铺的段数（建议与指令同源）
+    assert "优先铺围墙 1 段" in prompt
+
+    # 进攻方不受下限影响：仍按计划把矿石卖掉换金币
+    commands, _ = decide(_payload("challenger"))
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": WALL_MATERIAL,
+        "num": SELL_BATCH,
+    }
+
+    # 地图上没有石材来源时下限失效：矿石照卖，经济线不被"还差一段墙"扣住
+    no_stone = _payload("defender")
+    no_stone["teamOur"]["roles"][1]["backpack"] = [COPPER_MINE] * SELL_BATCH
+    commands, _ = decide(no_stone)
+    assert commands["10012"] == {
+        "action": "sell",
+        "name": COPPER_MINE,
+        "num": SELL_BATCH,
+    }
 
 
 # === 鲁棒性 ===
