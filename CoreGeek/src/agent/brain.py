@@ -4087,9 +4087,16 @@ def _task_executor(task_path: str, offset: int = 0) -> str:
     # 答案区为空 -> 这一回合不提交，下一回合重来）。
     # 片段以 heredoc 结束符收尾且不带换行：调用方必须换行后再接别的命令
     # （结束符要独占一行，直接接 `;` 会让后一条命令变成脚本的一部分）
+    # `-u` 让 stdout 无缓冲（S1）：`[SCAN]` / `[API]` / `[APIFAIL]` 这几行是
+    # "这一回合到底有没有去取数"的唯一凭据，而整条沙盒命令限时 15 秒、超时
+    # 会被判题器直接掐掉（管道里的 Python 默认按块缓冲，被 kill 时缓冲区里
+    # 的内容一起丢掉）。丢了凭证的回合在输出里"看不出执行器开过工"，看门狗
+    # 于是按读文件死循环计数，接上任务后的第 3 个回合就熔断——报告里
+    # "读题成功、api=0、watch r0→r3 后放弃"的形态正是这样漏掉了执行器其实
+    # 已经跑过、只是没跑完的那几行
     return (
         'for P in python3 python; do command -v "$P" >/dev/null 2>&1 && break;'
-        f" done; $P - <<'PYEOF' 2>/dev/null\n{script}\nPYEOF"
+        f" done; $P -u - <<'PYEOF' 2>/dev/null\n{script}\nPYEOF"
     )
 
 
@@ -4376,6 +4383,12 @@ def queries(text, name):
     一个查询值——它拼进样例地址只会 404（复盘 PK590884/PK590920 的
     `[APIFAIL] http://localhost:8899/task_1_alpha` 就是这么来的），而
     `QUERY_MAX` 只有两个名额，它先占掉一个就把文档里真正有用的词挤出去了。
+
+    词干里的中文词同样算数（S1）：任务文件写成 `task_1_北京.md` 这类中文名时，
+    按非字母切词的旧写法一个查询词都取不出来，只好退到文档正文里随手挑的英文
+    词（`GET`、`heritage` 这类模板里的路径名），拼进样例地址必然取不到数——
+    与整段文件名当查询词是同一个坑，只是换了种形态。中文词干排在英文词干
+    之后、文档正文之前：正文里的英文词是最后的选择，也是误伤面最大的一档。
     """
     stem = os.path.splitext(name or "")[0]
     # 文件名与词干本身不算查询词：正文里再提到一次这个文件名时同样跳过
@@ -4383,6 +4396,11 @@ def queries(text, name):
     values = []
     for token in re.split(r"[^A-Za-z]+", stem):
         if len(token) > 1 and token.lower() not in SKIP_WORDS:
+            values.append(token)
+    # 中文词干：连取最长的一段（`{2,8}` 顺带截断过长的名字），
+    # 它是这一段里唯一能当查询值的来源
+    for token in re.findall(r"[一-鿿]{2,8}", stem):
+        if token not in whole:
             values.append(token)
     for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", text):
         if token.lower() in SKIP_WORDS or token.lower() in whole:
@@ -4426,16 +4444,22 @@ def candidates(text, name, urls):
     "至少有一个字符"（`[^&/]+`），空值样例因此一个带查询词的候选都生不出来
     ——请求照原样发出去，问的是空查询词，接口只会回一行取数失败的诊断
     （复盘里"读题成功、却一个回合接一个回合取不到数"的又一种成因）。
+
+    查询词里的非 ASCII（`task_1_北京.md` -> `北京`，见 `queries`）先做百分号
+    编码再拼（S1）：`urlopen` 只吃 ASCII 地址，中文照原样拼进路径或查询串，
+    请求发不出去、只会换来一行 `[APIFAIL] ... UnicodeEncodeError`——取数名额
+    白烧一次，这一回合照旧 `api=0`。替换一律走 lambda 而不是替换串：`re.sub`
+    的替换串会把组引用（反斜杠加数字）当成语法，拼进去的查询词不该有这种副作用。
     """
     urls = urls or [BASE]
-    values = queries(text, name)
+    values = [urllib.parse.quote(value, safe="") for value in queries(text, name)]
     out = []
     for url in urls[:2]:
         if url not in out:
             out.append(url)
         for value in values:
             variant = (
-                re.sub(r"=([^&/]*)", "=" + value, url, count=1)
+                re.sub(r"=([^&/]*)", lambda _match: "=" + value, url, count=1)
                 if "=" in url
                 else url.rstrip("/") + "/" + value
             )
