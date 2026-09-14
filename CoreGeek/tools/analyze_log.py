@@ -18,8 +18,9 @@ DEFAULT_LOG = ROOT / "CoreGeek" / "debug.log"
 ROUND_RE = re.compile(r"request_decoded id=(\d+) round=(\d+)")
 DONE_RE = re.compile(
     r"strategy_done id=(\d+) round=(\d+) commands=(\d+) elapsed=([\d.]+)ms"
+    r" sandbox=(\S+)"
 )
-SENT_RE = re.compile(r"response_sent id=(\d+) status=(\d+) bytes=(\d+)")
+SANDBOX_RE = re.compile(r"sandbox_result id=(\d+) round=(\d+)")
 ERROR_RE = re.compile(r"\b(ERROR|CRITICAL)\b")
 SLOW_RE = re.compile(r"decision slow at round (\d+)")
 
@@ -33,15 +34,13 @@ def analyze(log_file: Path) -> int:
     rounds: dict[int, int] = {}      # request_id -> round
     processed: dict[int, int] = {}   # round -> commands
     elapsed: dict[int, float] = {}   # round -> 耗时ms
-    statuses: dict[int, int] = {}
+    sandbox: dict[int, str] = {}     # round -> 沙盒命令状态（下发/空闲）
     errors: list[str] = []
     slow_rounds: list[int] = []
-    truncated_bodies = 0
+    sandbox_results = 0
 
     with log_file.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if "truncated" in line and "request_raw" in line:
-                truncated_bodies += 1
             if ERROR_RE.search(line):
                 errors.append(line.strip()[:200])
 
@@ -55,11 +54,11 @@ def analyze(log_file: Path) -> int:
                 round_no = int(match.group(2))
                 processed[round_no] = int(match.group(3))
                 elapsed[round_no] = float(match.group(4))
+                sandbox[round_no] = match.group(5)
                 continue
 
-            match = SENT_RE.search(line)
-            if match:
-                statuses[int(match.group(1))] = int(match.group(2))
+            if SANDBOX_RE.search(line):
+                sandbox_results += 1
                 continue
 
             match = SLOW_RE.search(line)
@@ -90,14 +89,13 @@ def analyze(log_file: Path) -> int:
         if slow_rounds:
             print(f"超时预警回合(>{len(slow_rounds)}个): {slow_rounds[:10]}")
 
-    if statuses:
-        codes = {}
-        for status in statuses.values():
-            codes[status] = codes.get(status, 0) + 1
-        print(f"HTTP状态  : {codes}")
-
-    if truncated_bodies:
-        print(f"截断的请求日志条目: {truncated_bodies}（超过单条上限被截断）")
+    if sandbox:
+        counts = {}
+        for state in sandbox.values():
+            counts[state] = counts.get(state, 0) + 1
+        print(f"沙盒命令  : {counts}（下发=任务期间提交了 executeCmd）")
+    if sandbox_results:
+        print(f"沙盒输出  : {sandbox_results} 条（任务期间的 lastCmdResult 预览）")
 
     print(f"错误条数  : {len(errors)}")
     for line in errors[:10]:

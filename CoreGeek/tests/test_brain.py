@@ -1245,8 +1245,10 @@ def test_sandbox_command_gathers_clues_in_one_shot(
     """一条沙盒命令同时带上兜底搜索与目录诊断，减少逐次试错回合
 
     复盘里敌方"用错鉴权头→401、补参数又缺字段→400"逐次试错，白丢好几个
-    回合；这里把"读任务文件 + 路径不对时按文件名再找 + 列出沙盒目录"合成
-    一条命令，一次就能拿到更多线索。
+    回合；这里把"读任务文件 + 路径不对时按文件名全盘再找 + 列出沙盒工作
+    目录"合成一条命令，一次就能拿到更多线索。搜索必须覆盖整个沙盒：
+    实测沙盒的工作目录就是 `/`，而任务文件不在 `/` 的前三层里，
+    旧实现的 `find . -maxdepth 3` 一次都没命中过。
     """
     payload = payload_factory(
         round_no=1,
@@ -1259,16 +1261,20 @@ def test_sandbox_command_gathers_clues_in_one_shot(
 
     assert 'cat -- "tasks/task_1_beijing.md"' in command
     # 描述里的路径读不到时按文件名在沙盒里再找一次（只按文件名，不带目录）
-    assert 'find . -maxdepth 3 -type f -name "task_1_beijing.md"' in command
+    assert "find / " in command
+    assert '-name "task_1_beijing.md"' in command
+    assert "-maxdepth" not in command
     # 诊断信息排在答案结束标记之后，不会被当成答案提交
     assert command.index(TASK_MARKER) < command.index(TASK_END_MARKER)
     assert command.index(TASK_END_MARKER) < command.index("ls -a")
+    # 整条命令以 `:` 收尾，退出码为 0 才会被 `_task_answer` 采纳
+    assert command.rstrip().endswith(":")
 
 
 def test_sandbox_probes_task_dir_when_description_has_no_file(
     payload_factory, role_factory,
 ):
-    """描述里没有文件名时：先探测沙盒任务目录，认出文件再读它作答
+    """描述里没有文件名时：先全盘探测沙盒，认出文件再读它作答
 
     回归：任务描述只写"按沙盒里的任务说明作答"这类话时，客户端不知道该读
     哪个文件，开拓者会卡在任务点拿到一堆无关输出，整个任务周期（15 回合）
@@ -1287,7 +1293,8 @@ def test_sandbox_probes_task_dir_when_description_has_no_file(
     # 第一回合：描述里没有文件名，下发探测命令列出沙盒里的任务文件
     command = sandbox_command(payload)
     assert TASK_PROBE_MARKER in command
-    assert 'find "/tmp/selfEvolutionTask"' in command
+    assert "find / " in command
+    assert '-name "task*"' in command
     # 探测输出带的是探测标记，不会被 `_task_answer` 当成答案
     assert TASK_MARKER not in command
 
@@ -1373,9 +1380,39 @@ def test_sandbox_command_dumps_task_files_for_cache(
 
     assert TASK_FILE_MARKER in command
     assert TASK_FILE_END in command
-    assert 'find "/tmp/selfEvolutionTask"' in command
+    assert '-name "task*"' in command
+    assert '-name "spec*"' in command
     # 整段 dump 排在答案结束标记之后，不会被当成当前任务的答案提交
     assert command.index(TASK_END_MARKER) < command.index(TASK_FILE_MARKER)
+
+
+def test_task_dump_widens_search_after_empty_result(
+    payload_factory, role_factory,
+):
+    """上一回合什么任务文件都没回读到时，回读放宽到 *.md
+
+    沙盒里任务文件的实际命名未必和任务描述里写的一致（描述写
+    task_1_beijing.md、沙盒里却是别的名字），卡在一个文件名上反复空转
+    不如把候选文件都摊开——回读出来的文件名同样会被 `_task_file` 认出来，
+    下一回合就能直接读中意的那一份。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=2,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    # 上一回合的命令跑完了，但输出里一个任务文件分段都没有（全盘也没找到）
+    payload["lastCmdResult"] = (
+        f"[exitCode:0]\n{TASK_MARKER}{_task_token(phase_task)}\n"
+        "find: './etc/docker': Permission denied\n"
+        f"{TASK_END_MARKER}\n"
+    )
+    command = sandbox_command(payload)
+
+    assert '-name "*.md"' in command
 
 
 def test_task_cache_skips_failed_reads_and_keeps_first_answer():

@@ -120,9 +120,9 @@ package.bat
 
 **自进化任务** - v1.1新增完整闭环: 任务期间通过响应中的 `executeCmd` 在沙盒中读取任务文件，
 下一回合从请求的 `lastCmdResult` 中解析答案并通过 `submitAnswer` 提交（命令带任务标识，避免复用上一个任务的结果）。
-任务描述里没写文件名时，先用 `[TASK_PROBE]` 标记的探测命令列出沙盒任务目录（`TASK_PROBE_DIRS`），
-下一回合从探测结果里认出文件名再按上面的流程读取作答（目录清单永远不会被当成答案）。
-读文件时还会顺带把任务目录里的文件都读回来（`[TASK_FILE]`/`[TASK_EOF]` 分段），
+任务描述里没写文件名时，先用 `[TASK_PROBE]` 标记的探测命令列出沙盒里的任务文件（**全盘搜索**），
+下一回合从探测结果里认出文件名再按上面的流程读取作答（文件路径清单永远不会被当成答案）。
+读文件时还会顺带把沙盒里的任务文件都读回来（`[TASK_FILE]`/`[TASK_EOF]` 分段），
 按文件名存进 `_TASK_ANSWER_CACHE`：下一个任务点领到同一个任务时直接交卷，
 省掉一个来回的沙盒执行（积分随"完成回合 - 接取回合"倒扣，越早交分越高）。
 
@@ -295,6 +295,23 @@ package.bat
   压在没人来的那一侧（586440："替换写死的 defend=up"）；看不到敌方单位时
   `defend` 照旧优先，prompt 里报的方位也由 `_defend_brief` 按同一套判定给出
 
+**v1.13关键优化**（根据对战分析issue #32）:
+- ✅ **沙盒任务文件全盘搜索**（`_sandbox_find`）：任务文件一次都没被找到过——
+  实测沙盒的工作目录就是 `/`（`ls -a -- .` 只有 bin/dev/etc/home/lib/lib64/
+  proc/sbin/tmp/usr），而旧实现只在 `find . -maxdepth 3` 与两个猜出来的目录
+  （`/tmp/selfEvolutionTask`、`/tmp/selfEvolution`）里找，任务文件不在 `/` 的
+  前三层就永远读不到。现在改成从根目录起全盘按文件名找（只跳过 `/proc`、
+  `/sys`、`/dev` 三个虚拟目录），读文件、探测、回读三条链路共用同一套 find
+- ✅ **任务文件回读按需放宽**：上一回合一个任务文件都没回读到时（输出里没有
+  `[TASK_FILE]` 分段），回读放宽到 `*.md`——沙盒里任务文件的实际命名未必和
+  描述里写的一致，把候选文件都摊开比卡在一个文件名上反复空转强
+- ✅ **沙盒命令退出码兜底**：命令末尾补 `:`，保证 `[exitCode:0]`（全盘 find
+  遇到无权限目录时退出码非 0，而 `_task_answer` 只采纳执行成功的输出）
+- ✅ **stdout 日志瘦身**：不再打印全量请求/响应报文（改由 debug.log 留档），
+  每回合只留"资源与任务概览 + 关键动作 + 任务期间的沙盒输出预览"两三行，
+  格式对齐复盘里敌方日志（`gold/score/base/towers/walls/robots/mines` +
+  `phase=任务描述` + `角色:动作→目标`）
+
 
 ---
 
@@ -303,8 +320,9 @@ package.bat
 ### 1. 日志系统
 
 **双层日志设计**:
-- **stdout**: INFO级别，显示回合号、指令数量与决策耗时
-- **debug.log**: DEBUG级别，记录完整的请求和响应JSON
+- **stdout**: INFO级别，每个回合只留两三行——资源与任务概览、关键动作、
+  任务期间的沙盒输出预览；**不再打印全量请求/响应报文**
+- **debug.log**: DEBUG级别，记录完整的请求和响应JSON（全量报文只在这里留档）
 
 ```python
 # main3.py中配置：stdout 与 debug.log 各自独立设置级别
@@ -321,13 +339,11 @@ logging.basicConfig(level=logging.DEBUG, handlers=[stream_handler, file_handler]
 
 **日志输出示例**:
 
-stdout（单行，便于机器解析；超长请求体会被截断到5000字符）:
+stdout（每回合 2 行，任务期间多 1 行沙盒输出预览；超长文本截断）:
 ```
-2026-09-13 00:21:49,996 | INFO | agent.server | request_raw id=1 path=/ bytes=5307 body={"roundNo": 1, ...}
-2026-09-13 00:21:49,997 | INFO | agent.server | request_decoded id=1 round=1 team=6324 team_type=challenger roles=9
-2026-09-13 00:21:49,999 | INFO | agent.server | strategy_done id=1 round=1 commands=3 elapsed=2.22ms
-2026-09-13 00:21:49,999 | INFO | agent.server | response_raw id=1 body={"roleCommandMap": {...}}
-2026-09-13 00:21:49,999 | INFO | agent.server | response_sent id=1 status=200 bytes=725
+2026-09-14 06:34:12,229 | INFO | agent.server | request_decoded id=14 round=14 team=4334 team_type=defender roles=7 gold=0 score=0 base=(30,10) towers=3 walls=0 robots=0(s0 m0 l0 b0) mines=13 tasks=[自进化类2@(26,17)可接/15回合 自进化类1@(23,14)可接/15回合] phase="请阅读task_1_beijing.md，获取任务信息" fail=[]
+2026-09-14 06:34:12,226 | INFO | agent.server | sandbox_result id=14 round=14 text=[exitCode:0] | [TASK]请阅读task_1_beijin | ... | [TASK_END]
+2026-09-14 06:34:12,229 | INFO | agent.server | strategy_done id=14 round=14 commands=2 elapsed=2.65ms sandbox=下发 actions=20010:collect→(25,3) 20012:move→(30,7)
 ```
 
 debug.log（格式化，便于人工阅读）:
