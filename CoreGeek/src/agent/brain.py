@@ -26,9 +26,9 @@
 建议与指令出自同一套决策函数。
 任务看门狗（`_TASK_WATCH`）同样只保留最近一回合的观察值（任务标识 + 回合号
 + 沙盒输出），回合号不连续就从头计数，因此它描述的是"当前这一局这个任务"；
-沙盒反复回读同一份文件、任务超时交不上卷、或者同一份答案交满三次仍没被
-Judge 放行时由它止损（见 `_task_abandoned`），不再让开拓者被一个拿不到
-答案的任务永久占死。
+沙盒反复回读同一份文件、任务超时交不上卷、同一份答案交满三次仍没被
+Judge 放行、或者连续几个回合取数全失败（404 循环）时由它止损
+（见 `_task_abandoned`），不再让开拓者被一个拿不到答案的任务永久占死。
 """
 
 import os
@@ -383,11 +383,12 @@ TASK_DOC_PRUNE = TASK_EXEC_PRUNE + TASK_SYSTEM_PRUNE
 # 沙盒里读不到任务正文、或者每回合回读回来的都是同一份文件时，这个环永远
 # 合不上。复盘里 PK589649/589653 的沙盒从 R11 起连续 6~7 个回合返回逐字相同
 # 的输出（exitCode:0 但没有取数证据），开拓者被读文件死循环占死，任务分丢光、
-# 这名劳动力也一起白搭。这里给任务三条止损线，到线就放弃任务、把开拓者还给
+# 这名劳动力也一起白搭。这里给任务四条止损线，到线就放弃任务、把开拓者还给
 # 战斗调度（见 `_task_abandoned`）：
 #   - 同一份沙盒输出连续出现 TASK_LOOP_LIMIT 次（读文件循环）
 #   - 任务已经占用开拓者 TASK_TIMEOUT_ROUNDS 个回合（任务书：单个任务时限 15 回合）
 #   - 同一份答案交满 TASK_SUBMIT_LIMIT 次仍没被放行（见下面的"提交闸门"）
+#   - 连续 TASK_API_FAIL_LIMIT 个回合取数全失败（见 `TASK_API_FAIL_LIMIT`）
 # 超时线取 10 而不是任务书的 15：真能解出答案的任务在收到第二条沙盒输出的
 # 回合就交卷了（答案缓存命中时更快），拖到第 10 个回合还交不上卷的任务，
 # 剩下的 5 个回合同样交不上，不如早点把开拓者还给战斗调度。
@@ -395,6 +396,21 @@ TASK_LOOP_LIMIT = 3
 TASK_TIMEOUT_ROUNDS = 10
 # 兼容旧名：测试与外部脚本仍按 `TASK_TIMEOUT` 引用（改名时漏改调用方）
 TASK_TIMEOUT = TASK_TIMEOUT_ROUNDS
+
+# 取数连败止损（S1，复盘 PK590916/PK591014）：自进化任务的接口地址是靠
+# "读沙盒里的接口文档 -> 拼地址"猜出来的，猜不中时沙盒每回合都返回一串
+# `[APIFAIL] ... HTTPError 404`（一条命令 `TASK_API_MAX_CALLS` 次机会全打光，
+# 日志上的 `fail=8` 就是它）。这种"取数全失败"与读文件死循环不同：每回合的
+# 地址清单都在变（执行器与 LLM 给的 `CMD:` 交替下发），沙盒输出逐字相同这条
+# 判据（`repeats`）永远到不了线——复盘里开拓者 R10 接任务后 watch 一路
+# r0/t1→r2/t3→r1/t6，直到 `TASK_TIMEOUT_ROUNDS` 才兜底，整段任务窗都白等在
+# 任务点上（idle_man 涨到 3）。这里再给一条"连续取数失败"的止损线：连续
+# TASK_API_FAIL_LIMIT 个白天回合取数全失败、手里又攒不出一份答卷时就放弃
+# 任务，把开拓者还给战斗调度——继续试下去只是把同一批猜错的地址再试一遍。
+# 取 6 与 `TASK_LLM_MAX_PROMPTS` 对齐：LLM 兜底是文档写明的正解，得让它把
+# 6 次求助跑完再判死；又比 `TASK_TIMEOUT_ROUNDS`（10）早收手，把省下的几个
+# 回合还给战斗调度（`_task_abandoned` 里这两条线是或的关系）。
+TASK_API_FAIL_LIMIT = 6
 
 # 提交闸门（S1）：复盘 PK590252 的 R17 提交的是
 # "/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md"
@@ -447,6 +463,7 @@ class TaskWatch:
         repeats: 当前这份输出已经连续出现了几次
         probes: 到这个回合为止发出去的沙盒探测命令数（见 `TASK_PROBE_LIMIT`）
         submits: 到这个回合为止打算交上去的答卷数（见 `TASK_SUBMIT_LIMIT`）
+        fails: 到这个回合为止连续取数全失败的回合数（见 `TASK_API_FAIL_LIMIT`）
     """
 
     token: str
@@ -456,6 +473,7 @@ class TaskWatch:
     repeats: int
     probes: int
     submits: int
+    fails: int
 
 
 # 任务看门狗（模块级单例，只存最近一回合的观察值）：每回合由 `decide` 用当前
@@ -645,9 +663,9 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
     _, reason = _task_answer_with_reason(turn)
     token = _task_token(turn.phase_task)
     watch = _TASK_WATCH
-    repeats = rounds = 0
+    repeats = rounds = fails = 0
     if watch is not None and watch.token == token:
-        repeats, rounds = watch.repeats, watch.rounds
+        repeats, rounds, fails = watch.repeats, watch.rounds, watch.fails
     result = turn.last_cmd_result or ""
     llm_state = _TASK_LLM_STATE.get(token, {})
     phase = " ".join(str(turn.phase_task).split())[:60]
@@ -657,7 +675,7 @@ def task_brief(turn: Turn, sandbox_sent: bool = False) -> str:
     if llm_state.get("answer"):
         flags += "/answer"
     return (
-        f'phase="{phase}" state={reason} watch=r{repeats}/t{rounds} '
+        f'phase="{phase}" state={reason} watch=r{repeats}/t{rounds}/f{fails} '
         f"abandoned={'yes' if _task_abandoned(turn) else 'no'} "
         f"sandbox={'发送' if sandbox_sent else '空闲'} "
         f"api={result.count(TASK_DATA_MARKER)} "
@@ -3139,12 +3157,15 @@ def _watch_task(turn: Turn) -> None:
     最近一回合的观察值（`_TASK_WATCH`），并且只在回合号连续时往上累计：
     换任务、换局、回合号跳变都从这一回合重新计数，不会把别的一局的观察带进来。
 
-    两个计数（都从报文本身推出来，不额外存东西）:
+    三个计数（都从报文本身推出来，不额外存东西）:
         - `probes`：上一回合的输出是探测输出（带 `TASK_PROBE_MARKER`），
           说明那一次探测已经发出去过了（S2 的次数上限）。
         - `submits`：这一回合手里有能交的答案，且是白天（夜里不交卷），
           说明这一回合就会交一次卷（S1 的提交次数上限）。交完卷任务仍然
           留在 `phaseTask` 里，下一回合就会再数一次。
+        - `fails`：这一回合的沙盒输出里既没有取数证据（`TASK_DATA_MARKER`），
+          手里也攒不出一份答卷，说明这一趟取数又白跑了（S1 的取数连败上限）。
+          只数白天的回合：夜里开拓者本来就要回防，任务已经被强制结束。
 
     参数:
         turn: 当前回合信息
@@ -3160,6 +3181,11 @@ def _watch_task(turn: Turn) -> None:
     submits = 1 if turn.is_day and (
         _task_answer(turn) is not None or _cached_answer(turn) is not None
     ) else 0
+    # 取数失败：有本任务的沙盒输出、里面却没有取数证据，且这一回合交不出卷。
+    # 输出为空（命令刚下发、还没回结果）不算失败——那只是还没到看结果的时候。
+    failed = 1 if (
+        turn.is_day and output and TASK_DATA_MARKER not in output and not submits
+    ) else 0
     previous = _TASK_WATCH
     if (
         previous is None
@@ -3169,6 +3195,7 @@ def _watch_task(turn: Turn) -> None:
         # 新任务（或接不上上一回合的观察）：这一份输出算第 1 次出现
         _TASK_WATCH = TaskWatch(
             token, turn.round_no, output, 1, 1 if output else 0, probes, submits,
+            failed,
         )
         return
 
@@ -3179,22 +3206,27 @@ def _watch_task(turn: Turn) -> None:
         repeats = previous.repeats + 1
     else:
         repeats = 1
+    # 取数连败是"连续"计数：只要有一回合取到数（或有卷可交）就从头数
+    fails = previous.fails + 1 if failed else 0
     _TASK_WATCH = TaskWatch(
         token, turn.round_no, output, previous.rounds + 1, repeats,
-        previous.probes + probes, previous.submits + submits,
+        previous.probes + probes, previous.submits + submits, fails,
     )
 
 
 def _task_abandoned(turn: Turn) -> bool:
     """当前任务是不是已经被看门狗放弃（只读，不刷新观察值）
 
-    三条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT_ROUNDS` /
-    `TASK_SUBMIT_LIMIT`）：同一份沙盒输出连续出现了 `TASK_LOOP_LIMIT` 次、
-    任务已经占用了 `TASK_TIMEOUT_ROUNDS` 个回合，或者同一份答案已经交满
-    `TASK_SUBMIT_LIMIT` 次还没被 Judge 放行。复盘里开拓者就是被"每回合回读
+    四条止损线（见 `TASK_LOOP_LIMIT` / `TASK_TIMEOUT_ROUNDS` /
+    `TASK_SUBMIT_LIMIT` / `TASK_API_FAIL_LIMIT`）：同一份沙盒输出连续出现了
+    `TASK_LOOP_LIMIT` 次、任务已经占用了 `TASK_TIMEOUT_ROUNDS` 个回合、
+    同一份答案已经交满 `TASK_SUBMIT_LIMIT` 次还没被 Judge 放行，或者连续
+    `TASK_API_FAIL_LIMIT` 个回合取数全失败。复盘里开拓者就是被"每回合回读
     同一份任务文件"的死循环占死的（PK589649 的 R11–R17、PK589653 的 R12–R17），
     上交的答案还可能是错的（PK590252 的 R17 交的是文件路径），任务分拿不到，
-    这名劳动力也一起白搭。
+    这名劳动力也一起白搭；另一批复盘（PK590916/PK591014）里卡住的则不是
+    死循环而是取数连败——沙盒每回合都换一批 404 的地址，`repeats` 到不了线，
+    只能靠取数连败这条（或超时线）兜底。
 
     观察值必须是本回合或上一回合记下的（`sandbox_command` 排在 `decide` 之前
     调用时，看到的是上一回合那条），回合号对不上就当作没有观察，免得把别的
@@ -3213,6 +3245,9 @@ def _task_abandoned(turn: Turn) -> bool:
         # `submits` 把本回合这一次也算在内，所以第 TASK_SUBMIT_LIMIT+1 次
         # 才止损——也就是最多交满 TASK_SUBMIT_LIMIT 次
         or watch.submits > TASK_SUBMIT_LIMIT
+        # 取数连败：沙盒每回合都换一批猜错的地址，输出不重样，`repeats` 到不了
+        # 线，靠这条把开拓者要回来（见 `TASK_API_FAIL_LIMIT`）
+        or watch.fails >= TASK_API_FAIL_LIMIT
     )
 
 
