@@ -54,6 +54,7 @@ from agent.brain import (
     WEAPON_UPGRADE_VOUCHER,
     WEAPON_UPGRADE_VOUCHER2,
     LlmPlan,
+    _answer_bad,
     _base_layout,
     _calc_tower_sites,
     _calc_wall_order,
@@ -3820,3 +3821,152 @@ def test_day_plan_makes_room_for_selling_when_backpack_full(
     assert len(_day_plan(loaded, stone_loaded).queue) <= len(
         _day_plan(empty, stone_empty).queue
     )
+
+
+# === issue #53：提交前答案校验（PK590242/590274 的错误提交） ===
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # PK590242 R14：submitAnswer 交的是沙盒里的报错文本
+        "/bin/bash: jq: command not found",
+        # PK590242 R18：交的是任务文件路径
+        "/tmp/selfEvolutionTask/2024-09-14/task_1_beijing.md",
+        "./task_1_beijing.md",
+        # PK590274 R16/R18：交的是沙盒接口的 404 错误响应体
+        '{"status":"error","message":"Endpoint not found: /tasks/task_1_beijing.md",'
+        '"code":404}',
+        '{"code": 500, "message": "Internal Server Error"}',
+        "404 Not Found",
+        # 沙盒读文件 TIMEOUT / python 执行器回溯
+        "[TIMEOUT] 沙盒命令执行超时",
+        "Traceback (most recent call last):\n  File \"<stdin>\", line 1",
+        # 沙盒回显：答案以判题系统的输出标记开头
+        "[exitCode:0]\n",
+        "[TASK_END]",
+        "   ",
+    ],
+)
+def test_answer_rejects_sandbox_error_text(answer):
+    """沙盒报错、404 响应体、文件路径、输出标记一律不算答案"""
+    assert _answer_bad(answer) is True
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        '{"city": "北京", "count": 7}',
+        "beijing: 晴 26℃",
+        "26",
+        "task_1_beijing: 北京有 7 处世界文化遗产",  # 正文里出现 task 不算回显
+        "http://localhost:8899/heritage?city=beijing => 7",
+    ],
+)
+def test_answer_accepts_real_data(answer):
+    """正常取到的数据不能误伤：只有"整条答案就是路径/报错"才拦"""
+    assert _answer_bad(answer) is False
+
+
+def test_llm_direct_answer_drops_sandbox_error_text(payload_factory, role_factory):
+    """LLM 直答是沙盒报错文本时不提交（PK590242 的 R14 交的就是这句话）
+
+    回归：`_llm_direct_answer` 过去只查长度与复读，LLM 把沙盒里的报错/路径
+    原样回一句就成了 submitAnswer，Judge 必然判错。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京文化遗产"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "ANSWER: /bin/bash: jq: command not found"
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_llm_direct_answer_drops_task_file_path(payload_factory, role_factory):
+    """LLM 拿任务文件路径当答案时不提交（PK590242 的 R18）
+
+    回归：那一场第二次 submitAnswer 交的是
+    "/tmp/selfEvolutionTask/<...>/task_1_beijing.md"——路径不是答案。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京文化遗产"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = (
+        "ANSWER: /tmp/selfEvolutionTask/task_1_beijing.md"
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_llm_command_answer_drops_endpoint_error_body(payload_factory, role_factory):
+    """LLM 给的取数命令打回 404 响应体时不提交（PK590274 的 R16/R18）
+
+    回归：那一场两次 submitAnswer 交的都是
+    `{"status":"error","message":"Endpoint not found: /tasks/task_1_beijing.md","code":404}`。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md，查询北京文化遗产"
+
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "CMD: curl -s http://localhost:8899/tasks/task_1_beijing.md"
+    decide(payload)
+    sandbox_command(payload)  # 发出 LLM 给的那条命令
+
+    payload = _llm_task_payload(
+        payload_factory, role_factory, phase_task, 13,
+        evidence='{"status":"error","message":"Endpoint not found: '
+                 '/tasks/task_1_beijing.md","code":404}',
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_executor_error_body_is_not_cached_as_answer(payload_factory, role_factory):
+    """执行器取回来的是一份错误响应时不提交、也不进答案缓存
+
+    接口 404 也可能带着 HTTP 200 回来，执行器的 `fetch` 认不出来，会把它打进
+    `[SOLUTION]` 段（`[API]` 取数证据照样打印）。这种"答案"缓存下来会让之后
+    每个任务都交同一份错误内容。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    payload["lastCmdResult"] = _solution_result(
+        phase_task, "task_1_beijing.md",
+        '{"status":"error","message":"Endpoint not found: '
+        '/tasks/task_1_beijing.md","code":404}',
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+    assert brain._TASK_ANSWER_CACHE == {}
+
+
+def test_cached_answer_drops_error_text(payload_factory, role_factory):
+    """缓存里残留的报错文本不再被当成答案交出去"""
+    phase_task = "请阅读task_1_beijing.md"
+    brain._TASK_ANSWER_CACHE["task_1_beijing.md"] = "/bin/bash: jq: command not found"
+
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task=phase_task,
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"

@@ -464,8 +464,51 @@ class LlmPlan:
 
 LLM_PLAN_DEFAULT = LlmPlan()
 
-# 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
-TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
+# 沙盒输出中的错误特征：命中说明任务文件没读到、命令根本没跑起来，
+# 不能当作答案提交。后四条来自 PK590242/PK590274：R14 交上去的是
+# "/bin/bash: jq: command not found"、同一场的沙盒返回 TIMEOUT、
+# python 执行器自己炸掉时留下的回溯——这些都不是答案。
+TASK_ERROR_MARKERS = (
+    "No such file",
+    "Permission denied",
+    "Is a directory",
+    "command not found",
+    "/bin/bash:",
+    "TIMEOUT",
+    "Traceback (most recent call last)",
+)
+
+# 沙盒接口的错误响应：PK590274 的 R16/R18 两次 submitAnswer 交的都是
+# `{"status":"error","message":"Endpoint not found: /tasks/task_1_beijing.md","code":404}`。
+# 这类响应体可能带着 HTTP 200 回来（执行器的 `fetch` 认不出来，还会把它打进
+# `[SOLUTION]` 段），所以除了错误特征，还要按 JSON 的错误形态再挡一道。
+TASK_ERROR_PATTERNS = (
+    re.compile(r'"\s*(?:status|error)\s*"\s*:\s*"?(?:error|fail)', re.IGNORECASE),
+    re.compile(r'"\s*code\s*"\s*:\s*[45]\d\d\b'),
+    re.compile(
+        r"\b[45]\d\d\s+(?:Not Found|Bad Request|Forbidden"
+        r"|Internal Server Error|Service Unavailable)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"Endpoint not found", re.IGNORECASE),
+)
+
+# 答案不能是沙盒里的路径：PK590242 的 R18 交的是
+# "/tmp/selfEvolutionTask/<...>/task_1_beijing.md"。只有"整条答案就是一个路径"
+# 才算（以 / 或 ./ 开头、通篇没有空白与换行），`[SOLUTION]` 段里带数据的
+# 正常答案不会被误伤。
+TASK_PATH_ANSWER = re.compile(r"^\.?\.?/[^\s]*$")
+
+# 沙盒诊断前缀：判题系统的输出标记与执行器的段落标记（"[exitCode:0]"、
+# "[TASK_END]"…）只会出现在诊断里，答案以它们开头说明交上去的是沙盒回显，
+# 而不是取到的数据（PK590242 的 R14 就是这一类）。段落标记必须带方括号：
+# 答案正文里出现 "task"/"api" 这类词是正常的。
+TASK_DIAG_PREFIX = re.compile(
+    r"^(?:\[exitCode[^\]]*\]"
+    r"|\[(?:TASK|TASK_END|TASK_FILE|SOLUTION|API|APIFAIL|SCAN)\]"
+    r"|exitCode)",
+    re.IGNORECASE,
+)
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -3139,19 +3182,30 @@ def _llm_task_command(turn: Turn) -> str:
 
 
 def _llm_direct_answer(turn: Turn) -> str | None:
-    """LLM 直接给出的答案（不需要沙盒，幂等：一直保留到任务结束）"""
+    """LLM 直接给出的答案（不需要沙盒，幂等：一直保留到任务结束）
+
+    LLM 直答同样要过 `_answer_bad`：它给的可能根本不是答案，而是一句
+    沙盒报错或一个文件路径（PK590242 的 R18 交的正是任务文件路径）。
+    """
     if not turn.phase_task:
         return None
     answer = str(_task_llm_state(turn).get("answer") or "").strip()
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
+    if _answer_bad(answer):
+        return None  # 报错文本/文件路径/沙盒回显都不是答案
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
     return answer
 
 
 def _llm_command_answer(turn: Turn, region: str) -> str | None:
-    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）"""
+    """LLM 指定的取数命令跑完后的输出（只在紧接着的那一回合认）
+
+    LLM 那条命令也可能什么都没取到：`curl` 打回一份 404 JSON、命令本身
+    不存在（`command not found`）、路径不对（`ls` 打出一串路径）——这些
+    输出原样交上去就是 PK590274 里那两次必然失分的提交。
+    """
     if not turn.phase_task:
         return None
     state = _task_llm_state(turn)
@@ -3161,8 +3215,8 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
     answer = region.strip()
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
-    if any(bad in answer for bad in TASK_ERROR_MARKERS):
-        return None
+    if _answer_bad(answer):
+        return None  # 404/TIMEOUT/command not found/路径清单…都不提交
     if _task_echo(answer, turn.phase_task):
         return None
     return answer
@@ -3591,12 +3645,14 @@ def _task_answer(turn: Turn) -> str | None:
 
     if TASK_DATA_MARKER not in region:
         return None  # 没取到数据：沙盒里只有任务原文，不能当答案交上去
-    if any(bad in region for bad in TASK_ERROR_MARKERS):
+    if _sandbox_error(region):
         return None
 
     answer = _solution_answer(region, turn)
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
         return None
+    if _answer_bad(answer):
+        return None  # 取回来的是一份 404 错误响应之类的"非答案"
     if _task_echo(answer, turn.phase_task):
         return None
     return answer
@@ -3630,6 +3686,52 @@ def _solution_answer(region: str, turn: Turn) -> str | None:
     return next(iter(blocks.values()), None)
 
 
+def _sandbox_error(text: str) -> bool:
+    """文本里有没有沙盒"这一步没跑成"的痕迹（文件不存在、命令不存在、超时…）
+
+    只认 `TASK_ERROR_MARKERS` 这类一眼是报错的字符串，不认 `TASK_ERROR_PATTERNS`
+    的错误响应形态：这个判定会用在整段答案区上（`_task_answer` 里 `[TASK]` 与
+    `[TASK_END]` 之间的内容，含沙盒回读回来的任务原文），任务原文里出现
+    "404 Not Found" 这类字眼是正常的事，不能因此整段作废。错误响应形态只在
+    `_answer_bad` 里对着"真正要交上去的那条答案"判定。
+    """
+    return any(marker in text for marker in TASK_ERROR_MARKERS)
+
+
+def _answer_bad(answer: str) -> bool:
+    """答案里是不是带着沙盒/接口的报错痕迹（这类内容一律不提交）
+
+    提交前的最后一道闸门。答案只有三个来源——执行器的 `[SOLUTION]` 段、
+    LLM 指定命令的沙盒输出、LLM 直答——三条路都可能带出"根本不是答案"的内容：
+        - 命令没跑起来：`command not found`、`/bin/bash:`、`TIMEOUT`、python 回溯
+        - 接口返回的是错误响应：`404` / `Endpoint not found` / `"status":"error"`
+        - 整条答案就是个文件路径：PK590242 的 R18 交的是
+          `/tmp/selfEvolutionTask/<...>/task_1_beijing.md`
+        - 答案以判题系统的输出标记开头（`[exitCode:0]`、`[TASK_END]`…）
+
+    复盘里 PK590242/PK590274 两场四次 submitAnswer 交的全是上面这类内容
+    （R14 的 "jq: command not found"、R18 的任务文件路径、R16/R18 同一份 404
+    JSON），Judge 一次都没放行，两个任务点合计的任务分与任务金币全丢。
+    宁可这一回合不提交、等下一条沙盒输出，也不把错误文本当成答案送出去。
+
+    参数:
+        answer: 待提交的答案内容
+
+    返回:
+        True 表示这条答案不能提交
+    """
+    text = answer.strip()
+    if not text:
+        return True
+    if _sandbox_error(text):
+        return True
+    if any(pattern.search(text) for pattern in TASK_ERROR_PATTERNS):
+        return True
+    if TASK_PATH_ANSWER.match(text):
+        return True
+    return bool(TASK_DIAG_PREFIX.match(text))
+
+
 def _task_echo(answer: str, phase_task: str) -> bool:
     """答案是不是在复读任务原文
 
@@ -3655,6 +3757,10 @@ def _remember_task_answers(result: str) -> None:
     把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
     ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
 
+    报错痕迹（`_answer_bad`：404 错误响应、路径回显、命令报错文本…）同样不进
+    缓存：接口 404 时也可能带着 HTTP 200 回来，被 `fetch` 当成正常响应打进
+    `[SOLUTION]` 段，缓存下来会让之后的每个任务都交同一份错误答案。
+
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
     """
@@ -3664,7 +3770,10 @@ def _remember_task_answers(result: str) -> None:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and TASK_DATA_MARKER in evidence:
+        if (
+            name and answer and TASK_DATA_MARKER in evidence
+            and not _answer_bad(answer)
+        ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
 
@@ -3679,11 +3788,17 @@ def _cached_answer(turn: Turn) -> str | None:
 
     任务描述里没点名文件时返回 None：探测出来的文件名与任务描述的对应关系
     不确定，宁可多花一个来回执行一次，也不拿别的任务的答案去作答。
+
+    缓存里的答案同样过一遍 `_answer_bad`：缓存是跨回合留下的（不是本回合从
+    `Turn` 重新解析出来的），早先写进去的错误响应/路径回显不该再被交上去。
     """
     target = _task_file(turn.phase_task)
     if target is None:
         return None
-    return _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
+    answer = _TASK_ANSWER_CACHE.get(target.replace("\\", "/").rsplit("/", 1)[-1])
+    if not answer or _answer_bad(answer):
+        return None
+    return answer
 
 
 def _go_mine(
