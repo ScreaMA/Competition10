@@ -965,13 +965,16 @@ def test_economy_worker_skips_vendor_trip_close_to_night(
 # === 空转兜底与首夜防线（issue #13） ===
 
 
-def test_pioneer_without_task_gathers_instead_of_idling(
+def test_pioneer_without_task_never_gets_worker_only_collect(
     payload_factory, role_factory,
 ):
-    """既没有任务也没有武器时，开拓者就近采矿，而不是原地待着
+    """既没有任务也没有武器时，开拓者不会被派去采矿（collect 只有工人能用）
 
-    回归：复盘里"三个单位原地小步挪动、金币连续多回合冻结"——决策的每条
-    分支都没目标时角色会整回合没有任何指令。
+    回归：PK590881 的 R11–R15 连续 5 个回合
+    `[COMMAND_ERROR] role 20011 (pioneer) wants collect, but only worker can
+    do this action`——任务书 4.4 的指令表里 collect 的可用角色只有工人，
+    旧实现把"就近采一铲"当成空转兜底发给了开拓者，矿一块没采到（那条指令
+    整条被驳回），这个回合也一起白搭。
     """
     payload = payload_factory(
         round_no=1,
@@ -981,10 +984,35 @@ def test_pioneer_without_task_gathers_instead_of_idling(
     )
     commands, _ = decide(payload)
 
-    assert commands["10011"] == {
-        "action": "collect",
-        "targetPos": [{"x": 4, "y": 24}],
-    }
+    command = commands.get("10011")
+    assert command is None or command["action"] != "collect"
+
+
+def test_task_pioneer_does_not_mine_beside_task_point(
+    payload_factory, role_factory,
+):
+    """任务点旁的开拓者不会被派去采石（PK590881 的 R11–R15 就是这个形态）
+
+    任务点 (23,14) 旁边正好压着一座石矿 (24,14)，旧实现认为"采集不移动、
+    任务照旧有效"，于是每回合都发一条 collect→(24,14)：判题系统整条驳回，
+    开拓者白等 5 个回合，任务窗口被耗尽、答案始终没交上去。
+    """
+    payload = payload_factory(
+        round_no=11,
+        gold=0,
+        roles=[role_factory(20011, PIONEER, 23, 14, backPackCapability=40)],
+        tasks=[(23, 14)],
+        zones=[(STONE_MINE, 24, 14)],
+        phase_task="请阅读task_1_beijing.md，获取任务信息",
+    )
+    commands, _ = decide(payload)
+
+    command = commands.get("20011")
+    assert command is None or command["action"] != "collect"
+    if command is not None:
+        # 等答案期间只能留在任务点周围一格内（离开会强制结束任务）
+        step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
+        assert distance(step, Pos(23, 14)) <= 1
 
 
 def test_idle_gather_keeps_pioneer_on_running_task(
@@ -1001,9 +1029,10 @@ def test_idle_gather_keeps_pioneer_on_running_task(
     )
     commands, _ = decide(payload)
 
-    # 任务期间可以在任务点周围一格内采一铲矿（S1），但绝不能被支走
+    # 任务期间可以在任务点周围一格内挪步（S1），但既不能被支走、也不能采矿
+    # （collect 是工人专属动作，见 `_go_mine`）
     command = commands.get("10011")
-    assert command is None or command["action"] in ("move", "collect")
+    assert command is None or command["action"] == "move"
     if command is not None:
         step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
         assert distance(step, Pos(14, 14)) <= 1
@@ -3110,8 +3139,8 @@ def test_task_loop_breaker_releases_pioneer_after_repeated_sandbox_output(
     # 还没到止损线时继续守在任务点上等答案：不提交任务原文，也不放弃任务
     for commands, payload in waiting:
         command = commands.get("10011")
-        # 等待期间不能交卷（沙盒没取到数）；但可以在任务圈内挪步或采一铲（S1）
-        assert command is None or command["action"] in ("move", "collect")
+        # 等待期间不能交卷（沙盒没取到数）；但可以在任务圈内挪步（S1）
+        assert command is None or command["action"] == "move"
         if command is not None and command["action"] == "move":
             step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
             assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
@@ -3159,9 +3188,9 @@ def test_task_timeout_releases_pioneer_when_sandbox_never_answers(
             )
             assert distance(step, weapon) < distance(Pos(14, 14), weapon)
         else:
-            # 时限内继续守在任务点旁等答案（可以在圈内挪步/采集，但不能交卷）
+            # 时限内继续守在任务点旁等答案（可以在圈内挪步，但不能交卷）
             command = commands.get("10011")
-            assert command is None or command["action"] in ("move", "collect")
+            assert command is None or command["action"] == "move"
             if command is not None and command["action"] == "move":
                 step = Pos(
                     command["targetPos"][0]["x"], command["targetPos"][0]["y"],
@@ -3183,9 +3212,9 @@ def test_task_watchdog_starts_over_for_another_task(payload_factory, role_factor
     )
     commands, _ = decide(payload)
 
-    # 仍在任务点旁等答案，没有被上一个任务的计数带走
+    # 仍在任务点旁等答案（圈内挪步），没有被上一个任务的计数带走
     command = commands.get("10011")
-    assert command is None or command["action"] in ("move", "collect")
+    assert command is None or command["action"] == "move"
     if command is not None and command["action"] == "move":
         step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
         assert distance(step, Pos(14, 14)) <= 1  # 不能离开任务点周围一格
@@ -3391,6 +3420,40 @@ def test_llm_command_is_run_in_sandbox(payload_factory, role_factory):
     command = sandbox_command(payload)
     assert "curl -s http://localhost:8899/weather?city=beijing" in command
     assert brain.TASK_MARKER in command  # 包装过，答案区能对上当前任务
+
+
+def test_shell_command_check_rejects_unbalanced_quotes_only():
+    """命令体检：引号成对且单行才算合格（不合格的命令不拼进沙盒）"""
+    assert brain._shell_command_ok('curl -s "http://localhost:8899/weather"')
+    assert brain._shell_command_ok("grep -o 'x' task.md")
+    assert not brain._shell_command_ok('curl -s "http://localhost:8899/weather')
+    assert not brain._shell_command_ok("grep -o 'x task.md")
+    assert not brain._shell_command_ok("echo a\necho b")
+    assert not brain._shell_command_ok("")
+
+
+def test_llm_command_with_unbalanced_quote_falls_back_to_executor(
+    payload_factory, role_factory,
+):
+    """LLM 给的命令引号不配对时丢弃，改由执行器自己取数（PK590881 的 R14）
+
+    少一个配对引号的整条命令会被 bash 判
+    `unexpected EOF while looking for matching '"'`：沙盒输出里连任务标识都
+    没有，`_task_answer` 只能判 `no_marker`，这一个回合的沙盒执行与提交机会
+    一起白费。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = 'CMD: curl -s "http://localhost:8899/weather?city=beijing'
+    decide(payload)
+
+    command = sandbox_command(payload)
+    assert "curl" not in command  # 坏命令没有下发
+    assert "PYEOF" in command  # 改走执行器：读任务文件 + 按文档地址取数
+    assert brain.TASK_MARKER in command
 
 
 def test_task_answer_from_llm_command_output(payload_factory, role_factory):
