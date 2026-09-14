@@ -5,7 +5,8 @@
 策略概览：
     白天：工人优先建造武器工事（火箭发射台/电磁狙击炮/加特林，射程优先），
           再采集石头建造围墙（先封敌方来路那一侧）；
-          围墙建完后用富余资源换取金币和武器升级。
+          围墙建完后用富余资源换取金币和武器升级（金币阶梯：
+          武器升级券 > 围墙升级券，不让金币在手里睡着）。
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
           描述里没给文件名时先探测沙盒任务目录，顺带把任务文件读回来
           缓存备用，下一个任务点就能即时交卷），
@@ -102,7 +103,31 @@ MIN_WALLS_BEFORE_NIGHT = 2
 # LLM 计划把墙压到 0 时防守方仍按下限留出石材（见 `_wall_target`）。
 DEFENDER_WALL_QUOTA = 1
 WEAPON_UPGRADE_VOUCHER = "WeaponUpgradeVoucher1"  # 武器升级券（level1->level2）
+WEAPON_UPGRADE_VOUCHER2 = "WeaponUpgradeVoucher2"  # 武器升级券2（level2->level3）
+WALL_UPGRADE_VOUCHER = "WallUpgradeVoucher1"  # 围墙升级券（level1->level2）
+WALL_UPGRADE_VOUCHER2 = "WallUpgradeVoucher2"  # 围墙升级券2（level2->level3）
 UPGRADE_GOLD = 100  # 购买一张武器升级券所需金币
+UPGRADE_GOLD2 = 150  # 武器升级券2 的金币（任务书4.6.3）
+WALL_UPGRADE_GOLD = 20  # 围墙升级券的金币（任务书4.6.3）
+WALL_UPGRADE_GOLD2 = 30  # 围墙升级券2 的金币（任务书4.6.3）
+
+# 建筑升级券：当前等级 -> (券名, 兜底价格)。任务书4.6.3的售价是 武器券1=100、
+# 武器券2=150、围墙券1=20、围墙券2=30，满级（level3）没有对应条目。
+# 表格同时决定"升哪座、用哪张券"，塔型那套"说的与做的对不上"在这里同样不成立。
+WEAPON_UPGRADE_VOUCHERS = {
+    1: (WEAPON_UPGRADE_VOUCHER, UPGRADE_GOLD),
+    2: (WEAPON_UPGRADE_VOUCHER2, UPGRADE_GOLD2),
+}
+WALL_UPGRADE_VOUCHERS = {
+    1: (WALL_UPGRADE_VOUCHER, WALL_UPGRADE_GOLD),
+    2: (WALL_UPGRADE_VOUCHER2, WALL_UPGRADE_GOLD2),
+}
+# 报文没给武器商店价格表时的商品兜底价（正式售价见任务书4.6.3）
+ITEM_FALLBACK_PRICE = {
+    name: price
+    for vouchers in (WEAPON_UPGRADE_VOUCHERS, WALL_UPGRADE_VOUCHERS)
+    for name, price in vouchers.values()
+}
 # 金币闲置熔断线：手里攥着够再建两座塔的金币时，不允许再把塔数配额压到满编
 # 以下（复盘里"金币连续多回合冻结在 50，无塔无墙无升级"就是这么来的）。
 # 一座塔 25 金换 10 点火力和一段射程，比攒到 100 金升一级划算得多，
@@ -358,26 +383,58 @@ def _idle_gather(
 
 
 def _gold_left(turn: Turn, commands: dict[int, dict[str, Any]]) -> int:
-    """本回合还能支配的金币（扣掉已经发出去、回合结算时才扣款的建造指令）
+    """本回合还能支配的金币（扣掉已经发出去、回合结算时才扣款的指令）
 
     同一回合里我们会依次给每个角色下指令，但金币要等回合结算才真正减少，
     `turn.gold` 从头到尾都是回合开始时的余额。手里只够一座塔的钱时，
     两名工人会各自下发一条 build，后一条注定失败——复盘里的"下了建造指令、
-    下回合金币没扣、塔也没出现"就是这么来的。
+    下回合金币没扣、塔也没出现"就是这么来的。买券同理：同一回合里两名工人
+    各买一张券同样会超支，所以购买指令的金额（按报文里的商店售价算）
+    也一并扣掉。
 
     参数:
         turn: 当前回合信息
         commands: 本回合已经发出的指令
 
     返回:
-        扣掉已发建造指令后的余额
+        扣掉已发建造/购买指令后的余额
     """
-    spent = sum(
-        WEAPON_BUILD_COST
-        for command in commands.values()
-        if command.get("action") == "build" and command.get("name") in TOWER_TYPES
-    )
+    spent = 0
+    for command in commands.values():
+        if command.get("action") == "build" and command.get("name") in TOWER_TYPES:
+            spent += WEAPON_BUILD_COST
+        elif command.get("action") == "buy":
+            spent += _item_price(
+                turn,
+                str(command.get("name") or ""),
+                int(command.get("num") or 1),
+            )
     return turn.gold - spent
+
+
+def _item_price(turn: Turn, name: str, num: int = 1) -> int:
+    """商品的总价（优先用报文里的武器商店售价，查不到时用任务书兜底价）
+
+    "买不买得起"要按判题系统当前给的售价算：接口文档的 `weaponShopList`
+    就是 `{name, price}` 清单，判题系统调价后不会再用老价格下单。
+    清单里没有这件商品（报文没给价格表、或商店当天不卖）时退回任务书4.6.3
+    的正式售价，兜底也为空时按 0 算——宁可高估余额，也不凭空扣钱。
+
+    参数:
+        turn: 当前回合信息
+        name: 商品名称（如 WeaponUpgradeVoucher1）
+        num: 数量
+
+    返回:
+        总价（金币）
+    """
+    for item in turn.weapon_shop:
+        if str(item.get("name") or "") != name:
+            continue
+        price = item.get("price")
+        if isinstance(price, (int, float)) and price >= 0:
+            return int(price) * num
+    return ITEM_FALLBACK_PRICE.get(name, 0) * num
 
 
 def _worker_day_logic(
@@ -392,8 +449,9 @@ def _worker_day_logic(
 ) -> None:
     """工人白天逻辑
 
-    优先级: 建造武器工事 > 换金币/升级武器(经济分工) > 采集石头 > 建造围墙
-            > 围墙建完后: 武器升级 > 卖矿换金币 > 采集任意矿石
+    优先级: 建造武器工事 > 换金币/升级武器/升级围墙(经济分工) > 采集石头
+            > 建造围墙 > 围墙建完后: 武器升级 > 围墙升级 > 卖矿换金币
+            > 采集任意矿石
 
     任何分支最后都会落到"采集/交易"上，保证工人每回合都有产出，
     不会出现整回合没有任何指令的空转。
@@ -451,12 +509,18 @@ def _worker_day_logic(
             # 而是继续往下走：有石头就建围墙，否则去采集。复盘里工人连续多回合
             # 只下 move、金币零增长，就是这里直接返回造成的。
 
-    # 把富余资源换成战力（武器升级 > 卖矿换金币）：
+    # 把富余资源换成战力（武器升级 > 围墙升级 > 卖矿换金币）：
     # 围墙建完时人人有责；围墙没建完时由分工里的"经济工人"负责，
     # 否则要等近二十段围墙全部铺完才会花钱，金币会闲置一整天
     # （围墙配额还没铺满时先铺墙，金币留到围墙立起来再花）
     if (not walls_missing or economy) and not wall_quota:
         if _upgrade_weapon_with_gold(
+            turn, worker, claimed, commands, allow=plan.upgrade,
+        ):
+            return
+        # 武器线花剩下的钱换成围墙升级券：复盘里三座武器与武器券都齐了以后
+        # 金币再没有任何出口（"金币连续多回合冻结"），围墙是防守方唯一的正面屏障
+        if _upgrade_wall_with_gold(
             turn, worker, claimed, commands, allow=plan.upgrade,
         ):
             return
@@ -803,10 +867,12 @@ def _upgrade_weapon_with_gold(
     *,
     allow: bool = True,
 ) -> bool:
-    """把富余金币换成武器升级券并用于武器（level1 -> level2）
+    """把富余金币换成武器升级券并用于武器（level1 -> level2 -> level3）
 
     任务书4.6.3节：升级券在武器商店购买，需在目标武器周围一格内使用，
-    升级后武器恢复到满血，攻击力与射程同时提升。
+    升级后武器恢复到满血，攻击力与射程同时提升。level2 的武器还能用
+    升级券2 再升一级（level3 的火箭发射台是全图射程），金币因此总有下一级
+    可升，不会卡在"三座都到 level2 之后钱没处花"。
 
     因为升级券先买后用、跨回合存在背包里，这里按背包内容分两步走：
     背包里已有券就直接去武器旁使用，否则到武器商店购买。
@@ -822,34 +888,156 @@ def _upgrade_weapon_with_gold(
     返回:
         True 表示本回合已下达指令（购买/使用/移动），调用方应直接返回
     """
-    # 1. 身上有券: 去武器旁使用
-    if WEAPON_UPGRADE_VOUCHER in worker.backpack:
-        upgradable = [
-            weapon for weapon in turn.weapons()
-            if weapon.level < 2 and weapon.pos not in claimed
-        ]
-        if not upgradable:
-            return False
-        weapon = min(
-            upgradable,
-            key=lambda w: (distance(worker.pos, w.pos), w.pos.x, w.pos.y),
-        )
-        if distance(worker.pos, weapon.pos) <= 1:
-            commands[worker.unit_id] = use_command(
-                WEAPON_UPGRADE_VOUCHER, weapon.pos,
-            )
-            claimed.add(weapon.pos)
-            return True
-        if not _can_return_before_dusk(turn, worker, weapon.pos):
-            return False
-        step = _step_toward(turn, worker, weapon.pos, claimed)
-        if step is not None:
-            commands[worker.unit_id] = move_command(step)
-            return True
+    options = _upgrade_options(
+        worker, turn.weapons(), WEAPON_UPGRADE_VOUCHERS, claimed,
+    )
+    # 武器线是金币的第一去处：不留储备，够一张券的钱就买
+    return _spend_on_upgrade(
+        turn, worker, claimed, commands, options, allow=allow, reserve=0,
+    )
+
+
+def _upgrade_wall_with_gold(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    *,
+    allow: bool = True,
+) -> bool:
+    """把武器线花剩下的金币换成围墙升级券并用于围墙（level1 -> level2 -> level3）
+
+    复盘里三场都出现"金币连续多回合冻结在 50 甚至更久、无建造无购买"：
+    三座武器建完、武器券也买过之后，金币再没有任何出口（586322/586323/586377）。
+    围墙是防守方唯一的正面屏障，升级券只要 20 金（任务书4.6.3），
+    升级后围墙还会回满血，正好接住这笔闲钱。
+
+    金币要先扣掉武器线的储备（`_gold_reserve`）：一张武器券 100~150 金
+    换 10 点攻击力与一段射程，比一面围墙多 500 血划算得多，不能把攒着
+    买武器券的钱花在围墙上。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        allow: 是否允许花金币买券（LLM计划里"今天不买"时为 False，
+               已经买好的券仍然照用不误）
+
+    返回:
+        True 表示本回合已下达指令（购买/使用/移动），调用方应直接返回
+    """
+    options = _upgrade_options(
+        worker, turn.walls(), WALL_UPGRADE_VOUCHERS, claimed,
+    )
+    return _spend_on_upgrade(
+        turn, worker, claimed, commands, options,
+        allow=allow, reserve=_gold_reserve(turn, worker, claimed),
+    )
+
+
+def _upgrade_options(
+    worker: Unit,
+    buildings: tuple[Unit, ...],
+    vouchers: dict[int, tuple[str, int]],
+    claimed: set[Pos],
+) -> list[tuple[int, str, Unit]]:
+    """把"还能升级的建筑"排成候选表（最便宜的升级优先，其次离工人最近）
+
+    满级的建筑、以及已经被其他角色认领的建筑都不在候选里（`claimed` 同一
+    回合内共享，两个工人不会挤到同一座建筑旁边）。价格用任务书4.6.3 的
+    售价：报文里没有券的价格表，只有武器的 `weaponShopList` 才有。
+
+    参数:
+        worker: 当前决策的工人（用于按距离排序）
+        buildings: 待筛选的建筑（武器或围墙）
+        vouchers: 升级券表（当前等级 -> (券名, 价格)）
+        claimed: 已被其他角色占用的目标集合
+
+    返回:
+        (券价, 券名, 建筑) 三元组列表，价格升序；没有可升级的建筑时为空
+    """
+    options: list[tuple[int, str, Unit]] = []
+    for building in buildings:
+        entry = vouchers.get(building.level)
+        if entry is None or building.pos in claimed:
+            continue
+        voucher, price = entry
+        options.append((price, voucher, building))
+    options.sort(key=lambda option: (
+        option[0],
+        distance(worker.pos, option[2].pos),
+        option[2].pos.x,
+        option[2].pos.y,
+    ))
+    return options
+
+
+def _gold_reserve(turn: Turn, worker: Unit, claimed: set[Pos]) -> int:
+    """买围墙券之前要留出的金币储备（武器线还没花完的钱）
+
+    复盘建议的"金币优先转化战力"在这里落成顺序：还差武器塔（每座 25 金）
+    时先留一座塔的钱，塔齐了就留"下一张武器券"的钱，武器满编满级之后
+    储备为 0——此时金币可以放心换成围墙券，不会再有金币躺在手里。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+
+    返回:
+        买围墙券前至少要留下的金币
+    """
+    if len(turn.weapons()) < LLM_MAX_TOWERS:
+        return WEAPON_BUILD_COST
+    options = _upgrade_options(
+        worker, turn.weapons(), WEAPON_UPGRADE_VOUCHERS, claimed,
+    )
+    return options[0][0] if options else 0
+
+
+def _spend_on_upgrade(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    options: list[tuple[int, str, Unit]],
+    *,
+    allow: bool,
+    reserve: int,
+) -> bool:
+    """把券用在对应的建筑上，没有券时（金币够、计划允许）去武器商店买一张
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        options: `_upgrade_options` 给出的候选表（价格升序）
+        allow: 是否允许今天买券（False 时已经买好的券仍然照用不误）
+        reserve: 买券前要留下的金币储备（围墙券不能把武器券的钱花掉）
+
+    返回:
+        True 表示本回合已下达指令（使用、购买或移动）
+    """
+    # 没有可升级的建筑（武器还没建、围墙还没铺、或者都已经满级）时无从下手
+    if not options:
         return False
 
-    # 2. 金币足够且计划允许: 去武器商店购买
-    if not allow or _gold_left(turn, commands) < UPGRADE_GOLD or worker.backpack_full:
+    # 1. 身上有券: 去对应建筑旁使用（背包里可能同时躺着两张券，级别不同）
+    for _, voucher, building in options:
+        if voucher in worker.backpack:
+            return _use_voucher_at(
+                turn, worker, claimed, commands, voucher, building.pos,
+            )
+
+    # 2. 金币足够且计划允许: 去武器商店买最便宜的那张券
+    #    （背包满了买不了，券进不来，先卖矿腾地方）
+    if not allow or worker.backpack_full:
+        return False
+
+    _, voucher, _ = options[0]
+    if _gold_left(turn, commands) < reserve + _item_price(turn, voucher):
         return False
 
     shop = _nearest_zone(turn, WEAPON_SHOP, worker.pos)
@@ -857,12 +1045,51 @@ def _upgrade_weapon_with_gold(
         return False
 
     if distance(worker.pos, shop) <= 1:
-        commands[worker.unit_id] = buy_command(WEAPON_UPGRADE_VOUCHER)
+        commands[worker.unit_id] = buy_command(voucher)
         return True
 
     if not _can_return_before_dusk(turn, worker, shop):
         return False
     step = _step_toward(turn, worker, shop, claimed)
+    if step is not None:
+        commands[worker.unit_id] = move_command(step)
+        return True
+    return False
+
+
+def _use_voucher_at(
+    turn: Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    voucher: str,
+    target: Pos,
+) -> bool:
+    """在 target 上使用背包里的券：已经在旁边就直接用，否则走过去
+
+    券先买后用、跨回合存在背包里（任务书4.6.3节：只有站在目标建筑周围
+    一格内使用才会生效），所以"走过去"这一步本身就是本回合的指令。
+    路太远、跑一趟赶不回天黑前时不出门，免得夜晚的武器没人操控。
+
+    参数:
+        turn: 当前回合信息
+        worker: 当前决策的工人
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        voucher: 要使用的券
+        target: 券的目标建筑坐标
+
+    返回:
+        True 表示本回合已下达指令（使用或移动）
+    """
+    if distance(worker.pos, target) <= 1:
+        commands[worker.unit_id] = use_command(voucher, target)
+        claimed.add(target)
+        return True
+
+    if not _can_return_before_dusk(turn, worker, target):
+        return False
+    step = _step_toward(turn, worker, target, claimed)
     if step is not None:
         commands[worker.unit_id] = move_command(step)
         return True
@@ -1856,8 +2083,25 @@ def _plan_summary(turn: Turn, plan: LlmPlan) -> str:
         f"武器目标 {_tower_target(turn, plan)} 座（现有 {len(turn.weapons())} 座）；"
         f"塔位 {_tower_site_brief(turn, plan)}；"
         f"优先铺围墙 {_wall_target(turn, plan)} 段（现有 {len(turn.walls())} 段）；"
-        f"升级券 {'可买' if plan.upgrade else '今天不买'}；"
+        f"富余金币 {_gold_brief(plan)}；"
         f"布防方位 {plan.defend or _enemy_brief(turn)}"
+    )
+
+
+def _gold_brief(plan: LlmPlan) -> str:
+    """富余金币的去处（写进 prompt 的金币计划，与执行层同一套优先级）
+
+    复盘建议"提示词显式加'前期不存金币'规则"：金币优先变成武器升级券
+    （100~150 金，攻击力与射程一起涨），武器满编满级之后买围墙升级券
+    （20~30 金，围墙上限与血量一起涨，升级还会回满血）。
+    这里把执行层真正会走的顺序摊给 LLM，"金币留着手不用"因而不再是一种建议。
+    """
+    if not plan.upgrade:
+        return "今天不买券，金币留作他用"
+    return (
+        f"先武器升级券（{UPGRADE_GOLD}~{UPGRADE_GOLD2}金），"
+        f"武器满级后围墙升级券（{WALL_UPGRADE_GOLD}~{WALL_UPGRADE_GOLD2}金），"
+        "不存金币"
     )
 
 
@@ -1901,16 +2145,33 @@ def _enemy_brief(turn: Turn) -> str:
 
 
 def _task_brief(turn: Turn) -> str:
-    """可接任务点的坐标/奖励/剩余回合，供LLM判断值不值得去做任务"""
+    """可接任务点的坐标/奖励/剩余回合/距离，供LLM判断值不值得去做任务
+
+    距离按"开拓者（没有开拓者时按基地）到任务点的棋盘距离"算：复盘里 LLM
+    两次以"任务点距离远、风险未知"为由建议放弃任务，而两个任务点离我方基地
+    只有 11~13 格（586377），把距离直接写进 prompt 就不会再凭感觉放弃
+    两个任务点合计的 160 分+160 金币。
+    """
     valid = [task for task in turn.player_tasks if task.is_valid]
     if not valid:
         return ""
+    origin = _task_origin(turn)
     items = [
         f"({task.task_position.x},{task.task_position.y}){task.score_reward}分"
         + (f"/剩{task.timeout_rounds}回合" if task.timeout_rounds > 0 else "")
+        + (f"/距我{distance(origin, task.task_position)}格" if origin else "")
         for task in valid[:2]
     ]
     return "：" + "；".join(items)
+
+
+def _task_origin(turn: Turn) -> Pos | None:
+    """算任务点距离的起点：开拓者（去领任务的就是它），没有开拓者时退回基地"""
+    pioneers = turn.pioneers()
+    if pioneers:
+        return pioneers[0].pos
+    station = turn.station()
+    return station.pos if station else None
 
 
 def _generate_strategy_prompt(
@@ -1959,8 +2220,14 @@ def _generate_strategy_prompt(
         f"可领取任务点: {sum(1 for t in turn.player_tasks if t.is_valid)} 个"
         f"{_task_brief(turn)}",
         f"本回合既定计划: {_plan_summary(turn, plan)}",
-        "请用不超过5行中文说明：优先建造或升级什么、角色如何站位、是否值得去做任务。",
-        "最后一行必须输出作战计划，客户端会照它调整指令（值越界会被忽略）："
+        "请用不超过5行中文说明：优先建造或升级什么、角色如何站位、富余金币怎么花。",
+        # 任务不在可拨动的旋钮里：开拓者按"临期优先"自动去任务点领取并作答
+        # （`_pioneer_day_logic`），prompt 因此不再问"是否值得做任务"——
+        # 复盘里 LLM 反复建议"放弃任务"，客户端却照旧去领，建议与执行对不上
+        # （586322/586377）。把权责讲清楚，建议才和指令对得上。
+        "开拓者会自动前往任务点领取任务并作答，不需要建议放弃任务；",
+        "只有最后一行 PLAN 的字段会改变客户端指令，其余文字建议仅供参考。",
+        "最后一行必须输出作战计划（值越界会被忽略）："
         f"{LLM_PLAN_TEMPLATE}",
     ]
     if previous:
