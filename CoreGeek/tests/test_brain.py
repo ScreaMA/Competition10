@@ -5391,7 +5391,13 @@ def test_executor_template_has_no_placeholders():
 
 
 def _executor_refine_url():
-    """从生成的沙盒脚本里取出 URL 净化部分（`HOST_SAFE` + `cut_host` + `refine_url`）"""
+    """从生成的沙盒脚本里取出 URL 净化部分（`HOST_SAFE` + `cut_host` + `refine_url`）
+
+    这一段顺带把只给路径的接口样例那套定义（`PATH_SAMPLE` + `sample_paths`，
+    见 `_executor_endpoints`）也带了进来：它们全是字面量与函数定义，不需要
+    `re` 就能 exec；新增的东西若在这里引入对别的全局名的求值，这个命名空间
+    就得跟着补。
+    """
     command = _task_executor("task_1_beijing.md")
     script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
     match = re.search(r"HOST_SAFE = \(.*?(?=\ndef endpoints\()", script, re.S)
@@ -5617,6 +5623,79 @@ def test_executor_candidates_fill_an_empty_query_sample():
     )
     assert "http://localhost:8899/heritage?city=beijing" in out
     assert "http://localhost:8899/heritage?city=alpha" in out
+
+
+def _executor_endpoints():
+    """从生成的沙盒脚本里取出接口样例地址那一段（`HOST_SAFE` … `endpoints`）"""
+    command = _task_executor("task_1_beijing.md")
+    script = command.split("\n", 1)[1]  # 去掉挑解释器那半句
+    match = re.search(r"HOST_SAFE = \(.*?(?=\ndef queries\()", script, re.S)
+    assert match
+    namespace: dict = {"re": re, "BASE": brain.TASK_API_DEFAULT}
+    exec("import urllib.parse\n" + match.group(0), namespace)  # noqa: S102
+    return namespace["endpoints"], namespace["sample_paths"]
+
+
+def test_executor_reads_path_only_api_samples():
+    """接口文档只给路径时，把它拼回本地接口再试一次（S1）
+
+    复盘 PK591854 的 R12–R16：`[SCAN] docs=2 urls=1 key=no`——两份文档都读到了，
+    可里面一条带 scheme 的地址都没有，取数清单里只剩本地接口那几个通用路径，
+    一回合 8 次请求全部落空（`api=0`、`fail=8` 连续五个回合），任务分与任务金币
+    一起丢。接口文档把 host 交代一次、后面只写路径是常态
+    （`GET /api/heritage?city=北京`），这类样例原来一条都进不了取数清单。
+    """
+    endpoints, _ = _executor_endpoints()
+
+    sample = f"{brain.TASK_API_DEFAULT}/api/heritage?city=%E5%8C%97%E4%BA%AC"
+    # 文档只写了 host（没有路径）时：整条地址照旧排最前，路径式样例紧随其后，
+    # 两条都在取数清单的前两个名额里
+    host_only = (
+        "本地接口在 http://localhost:8899\n"
+        "调用样例：`GET /api/heritage?city=北京`\n"
+    )
+    assert endpoints(host_only)[:2] == [brain.TASK_API_DEFAULT, sample]
+
+    # 连一条带 scheme 的地址都没有时：路径式样例是唯一线索，排在本地接口兜底之前
+    path_only = "调用样例：`GET /api/heritage?city=北京`\n"
+    assert endpoints(path_only)[:2] == [sample, brain.TASK_API_DEFAULT]
+
+    # 与整条地址走同一套净化：发得出去的地址全是可打印 ASCII
+    for url in endpoints(path_only) + endpoints(host_only):
+        assert url == url.encode("ascii", "ignore").decode("ascii")
+
+
+def test_executor_path_samples_skip_system_files_and_placeholders():
+    """路径式样例只认接口：系统目录里的文件路径与占位符段都不试（S1）
+
+    全盘捞回来的文档里到处都是 `/usr/share/doc/...` 这类文件路径，把它们当接口
+    试一遍只是白烧取数名额（一条命令只有 `TASK_API_MAX_CALLS` 次机会）；路径段里
+    的占位符（`/api/{city}`）同样填不出来，一并丢掉。
+    """
+    _, sample_paths = _executor_endpoints()
+
+    assert sample_paths("见 /usr/share/doc/uom-se/README.md 与 /etc/hosts") == []
+    assert sample_paths("本地接口 http://localhost:8899/api/x") == []  # 整条地址归地址正则
+    assert sample_paths("GET /api/{city}") == []
+    assert sample_paths("GET `/api/heritage?city=北京`") == ["/api/heritage?city=北京"]
+    assert sample_paths("/a/b /a/b /c/d") == ["/a/b", "/c/d"]  # 去重且保持出现顺序
+
+
+def test_executor_path_sample_reaches_the_fetch_list():
+    """路径式样例要真排进取数清单的前两个名额（`candidates` 只展开前两条）
+
+    沙盒一回合只发一条命令、`TASK_API_MAX_CALLS` 次请求，只有候选清单的前两条
+    会被展开成带查询词的变体；路径式样例排在后面等于没加。
+    """
+    endpoints, _ = _executor_endpoints()
+    _, candidates = _executor_queries()
+
+    doc = "本地接口在 http://localhost:8899\n调用样例：`GET /api/heritage?city=北京`\n"
+    urls = endpoints(doc)
+    out = candidates(doc, "task_1_beijing.md", urls)
+
+    assert out[0] == urls[0]
+    assert f"{brain.TASK_API_DEFAULT}/api/heritage?city=beijing" in out
 
 
 def test_executor_api_fail_reports_status_and_body(capsys):

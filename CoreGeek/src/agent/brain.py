@@ -4581,6 +4581,56 @@ def refine_url(raw):
     return url
 
 
+# 接口文档里"只给路径"的调用样例（S1）：文档常把 host 在开头交代一次
+# （"本地接口在 http://localhost:8899"），后面的接口就只写路径——
+# `GET /api/heritage?city=北京`、`| /api/task/1 | 按序号查询 |`。
+# 地址正则只认带 scheme 的整条地址，这类样例一条都抓不到：`urls` 里于是只剩
+# 本地接口那一行兜底，一回合 8 次请求全打在 `http://localhost:8899` 的那几个
+# 通用路径上。复盘 PK591854 的 R12–R16 就是这个形态（`[SCAN] docs=2 urls=1
+# key=no`、`api=0`、`fail=8` 连续五个回合），任务分与任务金币一起丢。
+# 这里把路径抓出来，`endpoints` 拼回 BASE 再交给 `refine_url` 净化。
+#
+# 前一个字符不能是单词字符/冒号/斜杠/点（负向断言）：`http://localhost:8899/api/x`
+# 里的 `/api/x` 由地址正则负责，这里不再抓一遍。
+PATH_SAMPLE = (
+    r"(?<![\\w:/.])"
+    r"(/[A-Za-z0-9_%{][A-Za-z0-9_./%{}-]*"
+    r"(?:\\?[^\\s\\x22`<>)\\]}|]*)?)"
+)
+# 系统目录：文档（尤其是库自带的说明）里到处都是这些文件路径，它们不是接口，
+# 第一段命中就整条丢掉（与接口文档的搜索剪枝 `DOC_PRUNE` 是同一个口径）
+PATH_SKIP = (
+    "usr", "proc", "sys", "dev", "etc", "bin", "sbin", "lib", "lib64",
+    "var", "run", "boot", "opt", "root", "home", "media", "mnt", "srv",
+    "tmp", "lost+found",
+)
+PATH_MAX = 60  # 单条路径的长度上限：再长多半是文档里的一整句话，不是地址
+PATH_KEEP = 4  # 最多带回几条路径：取数名额有限（`MAX_CALLS`），排在整条地址之后
+
+
+def sample_paths(text):
+    """文档里"只给路径"的接口样例（见 `PATH_SAMPLE`）
+
+    按文档里的出现顺序返回，去重后最多 `PATH_KEEP` 条；句子末尾的标点与系统
+    目录里的文件路径都在这里丢掉。
+    """
+    found = []
+    for raw in re.findall(PATH_SAMPLE, text):
+        path = raw.rstrip(".,;:，。；：、")
+        head = path[1:].split("/", 1)[0].split("?", 1)[0].lower()
+        if len(path) < 2 or len(path) > PATH_MAX:
+            continue
+        if not head or head in PATH_SKIP:
+            continue
+        if "{" in path.split("?", 1)[0]:
+            continue  # 路径段里的占位符（`/api/{city}`）填不出来，不试
+        if path not in found:
+            found.append(path)
+        if len(found) >= PATH_KEEP:
+            break
+    return found
+
+
 def endpoints(doc_text):
     """接口文档里的调用样例：本地接口优先，其次才是文档里抓到的其他地址
 
@@ -4589,6 +4639,11 @@ def endpoints(doc_text):
     MAX_CALLS 被这些在无网沙盒里调不通的地址耗光，真正能取数的本地接口
     一次都没被请求到，答案区永远是空的——三场复盘里"沙盒执行了（exitCode:0）
     却拿不到答案"就是这么来的。
+
+    只给路径的样例（`sample_paths`）拼回 BASE 之后接在整条地址后面（S1）：
+    文档里一条带 scheme 的地址都没有时，它是这一局唯一的取数线索，必须排进
+    取数清单的前两个名额（`candidates` 只展开候选清单的前两条），排在本地
+    接口兜底之前。
     """
     urls = []
     for raw in re.findall(r"https?://[^\\s<>)\\]}]+", doc_text):
@@ -4597,7 +4652,17 @@ def endpoints(doc_text):
             urls.append(raw)
     local = [url for url in urls if "localhost" in url or "127.0.0.1" in url]
     picked = local or [BASE] + [url for url in urls if url != BASE]
-    return picked
+    paths = []
+    for path in sample_paths(doc_text):
+        url = refine_url(BASE.rstrip("/") + path)
+        if url and url not in picked and url not in paths:
+            paths.append(url)
+    if not paths:
+        return picked
+    if local:
+        # 文档给了整条本地地址：照旧排最前，只给路径的样例接在它们后面
+        return local + paths
+    return paths + picked
 
 
 def queries(text, name):
