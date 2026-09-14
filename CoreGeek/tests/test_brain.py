@@ -2841,6 +2841,39 @@ def test_task_executor_prefers_local_api_over_doc_links():
     assert "picked = local or [BASE] + " in brain.TASK_EXECUTOR
 
 
+def test_task_executor_bounds_file_search_by_deadline(
+    payload_factory, role_factory,
+):
+    """执行器给"全盘找文件"单独设时间闸门：沙盒整条命令只限时 15 秒
+
+    回归：PK590327 的 R12 沙盒整条命令 [TIMEOUT]（该回合耗时 15s），任务因此
+    白丢一个回合。执行器里最慢的一步是两次全盘 walk（找任务文件、找接口文档），
+    现在它们与取数分开计时，walk 到 `TASK_EXEC_FIND_BUDGET` 就停，把剩下的
+    时间留给真正取数的那一段。
+    """
+    # 模板本身必须是合法 Python：语法错会被 `2>/dev/null` 吞掉，答案区永远空
+    compile(brain.TASK_EXECUTOR, "<task-executor>", "exec")
+
+    assert "def find_files(patterns, limit, deadline=None):" in brain.TASK_EXECUTOR
+    assert "def task_files(deadline=None):" in brain.TASK_EXECUTOR
+    assert "search_deadline = time.time() + FIND_BUDGET" in brain.TASK_EXECUTOR
+    assert "files = task_files(search_deadline)" in brain.TASK_EXECUTOR
+    assert "doc_files = find_files(DOC_NAMES, 6, search_deadline)" in brain.TASK_EXECUTOR
+
+    payload = payload_factory(
+        round_no=1,
+        gold=0,
+        roles=[role_factory(10011, PIONEER, 14, 14, backPackCapability=40)],
+        tasks=[(14, 14)],
+        phase_task="请阅读task_1_beijing.md，获取任务信息",
+    )
+    command = sandbox_command(payload)
+
+    # 占位符被换成实际预算值（漏换会让执行器一跑就 NameError）
+    assert f"FIND_BUDGET = {brain.TASK_EXEC_FIND_BUDGET}" in command
+    assert "__FIND_BUDGET__" not in command
+
+
 def test_defender_cashes_out_income_ore_while_wall_quota_open(
     payload_factory, role_factory,
 ):
@@ -3290,6 +3323,64 @@ def test_task_answer_ignores_task_echo_from_llm(payload_factory, role_factory):
     commands, _ = decide(payload)
 
     assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_task_answer_ignores_error_text_from_llm(payload_factory, role_factory):
+    """LLM 把沙盒的错误回显当答案返回时不能交
+
+    回归：PK590300 的 R16 提交的答案就是沙盒回的 "not found"，Judge 必然不通过
+    ——交错误答案既拿不到分，又白费一次任务冷却，不如这一回合不交卷。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_alpha.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = "ANSWER: not found"
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_task_answer_ignores_task_file_path_from_llm(payload_factory, role_factory):
+    """LLM 把任务文件的路径当答案返回时不能交
+
+    回归：PK590327 的 R16 提交的答案是任务文件的完整路径
+    （/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md），
+    答案应当是"读任务文件 -> 取数 -> 生成"的实质内容，路径本身不是答案。
+    """
+    brain._TASK_LLM_STATE.clear()
+    phase_task = "请阅读task_1_beijing.md"
+    decide(_llm_task_payload(payload_factory, role_factory, phase_task, 11))
+
+    payload = _llm_task_payload(payload_factory, role_factory, phase_task, 12)
+    payload["llmResp"] = (
+        "ANSWER: /tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md"
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+
+
+def test_task_answer_rejects_file_path_solution(payload_factory, role_factory):
+    """执行器的答案段里只有任务文件路径时，既不提交也不进答案缓存
+
+    缓存是给"下一个任务点接取后立刻交卷"用的，把路径这类 0 分答案存进去，
+    等于把它一路带到后面的任务上。
+    """
+    phase_task = "请阅读task_1_beijing.md"
+    payload = _stuck_task_payload(
+        payload_factory, role_factory, phase_task, 1,
+    )
+    payload["lastCmdResult"] = _solution_result(
+        phase_task,
+        "task_1_beijing.md",
+        "/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md",
+    )
+    commands, _ = decide(payload)
+
+    assert "10011" not in commands or commands["10011"]["action"] != "submitAnswer"
+    assert brain._TASK_ANSWER_CACHE == {}
 
 
 # === issue #45：V4 日计划（布局 / 目标队列 / 夜战救急） ===

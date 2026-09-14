@@ -19,7 +19,10 @@
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
 不依赖任何跨回合的战场状态，可自动适应矿区刷新、单位移动与视野变化。
 任务答案同理，只认执行器按任务描述在沙盒里取到的数据（`[SOLUTION]` 段，
-见 `_task_answer`），取不到数据就不提交；解析不到时再退到纯缓存
+见 `_task_answer`），取不到数据就不提交；沙盒的错误回显（`not found`、
+`[TIMEOUT]`）与任务文件路径同样不算答案（`_answer_rejected`），既不提交也
+不进答案缓存——复盘里 R16 交的正是这两样，Judge 一次都没放行；
+解析不到时再退到纯缓存
 `_TASK_ANSWER_CACHE`（内容全部来自执行器的产出），未命中就走原来的
 执行流程；LLM 建议也从请求里的 `llmResp` 现解析成有界计划（`_llm_plan`），
 建议与指令出自同一套决策函数。
@@ -342,6 +345,11 @@ TASK_API_DEFAULT = "http://localhost:8899"  # 沙盒内的本地接口
 TASK_API_TIMEOUT = 1  # 单次取数超时（秒），整条沙盒命令限时 15 秒
 TASK_API_MAX_CALLS = 8  # 一条命令里最多请求几次（本地接口，失败也是立刻返回）
 TASK_API_TIME_BUDGET = 8  # 取数阶段的时间上限（秒），留出找文件与回读的余量
+# 找任务文件/接口文档的时间上限（秒）：全盘 walk 是执行器里最慢的一步，而沙盒
+# 整条命令只有 15 秒——复盘里 PK590327 的 R12 就是这一步把整个回合卡成
+# [TIMEOUT]（该回合耗时 15s），任务因此白丢一个回合。找文件与取数分开计时，
+# walk 到了预算就停，剩下的时间留给真正取数的那段。
+TASK_EXEC_FIND_BUDGET = 4
 TASK_EXEC_DIR_BUDGET = 4000  # 全盘找文件时最多进几个目录（防止 walk 慢过 15 秒）
 TASK_API_QUERY_MAX = 2  # 每个接口地址最多试几个查询词
 TASK_API_BODY_LIMIT = 400  # 单个响应体最多带回的字符数
@@ -464,8 +472,19 @@ class LlmPlan:
 
 LLM_PLAN_DEFAULT = LlmPlan()
 
-# 沙盒输出中的错误特征：命中说明任务文件没读到，不能当作答案提交
-TASK_ERROR_MARKERS = ("No such file", "Permission denied", "Is a directory")
+# 沙盒输出中的错误特征：命中说明任务文件没读到、命令没跑起来，不能当作答案提交。
+# 复盘里 R16 把沙盒回的 "not found" 原文当成答案 submitAnswer 交了上去
+# （PK590300），PK590327 的 R12 沙盒整条命令 [TIMEOUT]。这两类回显都不是答案，
+# 命中就不提交、等下一条沙盒输出——交错误答案既拿不到分，又白费一次任务冷却。
+# `TIMEOUT` 只认大写：执行器里取数失败打的异常名是 `TimeoutError`，那是"这个
+# 地址没取到数"，与"整条命令被沙盒掐断"不是一回事，别把它一起拦掉。
+TASK_ERROR_MARKERS = (
+    "No such file",
+    "Permission denied",
+    "Is a directory",
+    "not found",  # 覆盖 `command not found` 与接口的 not found 回显
+    "TIMEOUT",
+)
 
 # 各阵营的任务点类型
 _TASK_POINTS_BY_TEAM = {
@@ -3139,7 +3158,13 @@ def _llm_task_command(turn: Turn) -> str:
 
 
 def _llm_direct_answer(turn: Turn) -> str | None:
-    """LLM 直接给出的答案（不需要沙盒，幂等：一直保留到任务结束）"""
+    """LLM 直接给出的答案（不需要沙盒，幂等：一直保留到任务结束）
+
+    同样要过三道闸门（`_task_echo` 复读任务原文、`_answer_rejected` 错误回显与
+    文件路径）：LLM 拿不准时会照抄沙盒回显，`ANSWER: not found`（PK590300 的
+    R16 交的就是这一串）与 `ANSWER: /tmp/.../task_1_beijing.md`（PK590327 的
+    R16）交上去都是 0 分，不如这一回合不交、把任务留给执行器再取一次数。
+    """
     if not turn.phase_task:
         return None
     answer = str(_task_llm_state(turn).get("answer") or "").strip()
@@ -3147,6 +3172,8 @@ def _llm_direct_answer(turn: Turn) -> str | None:
         return None
     if _task_echo(answer, turn.phase_task):
         return None  # 把任务原文当答案交上去 = 又一次 0 分
+    if _answer_rejected(answer):
+        return None
     return answer
 
 
@@ -3161,7 +3188,7 @@ def _llm_command_answer(turn: Turn, region: str) -> str | None:
     answer = region.strip()
     if len(answer) < TASK_LLM_ANSWER_MIN_LEN:
         return None
-    if any(bad in answer for bad in TASK_ERROR_MARKERS):
+    if _answer_rejected(answer):
         return None
     if _task_echo(answer, turn.phase_task):
         return None
@@ -3243,6 +3270,7 @@ def _task_executor(task_path: str) -> str:
         .replace("__TIMEOUT__", str(TASK_API_TIMEOUT))
         .replace("__MAX_CALLS__", str(TASK_API_MAX_CALLS))
         .replace("__TIME_BUDGET__", str(TASK_API_TIME_BUDGET))
+        .replace("__FIND_BUDGET__", str(TASK_EXEC_FIND_BUDGET))
         .replace("__DIR_BUDGET__", str(TASK_EXEC_DIR_BUDGET))
         .replace("__QUERY_MAX__", str(TASK_API_QUERY_MAX))
         .replace("__BODY_LIMIT__", str(TASK_API_BODY_LIMIT))
@@ -3281,6 +3309,7 @@ BASE = __BASE__
 TIMEOUT = __TIMEOUT__
 MAX_CALLS = __MAX_CALLS__
 TIME_BUDGET = __TIME_BUDGET__
+FIND_BUDGET = __FIND_BUDGET__
 DIR_BUDGET = __DIR_BUDGET__
 QUERY_MAX = __QUERY_MAX__
 BODY_LIMIT = __BODY_LIMIT__
@@ -3320,11 +3349,12 @@ def fetch(url):
         return ""
 
 
-def find_files(patterns, limit):
+def find_files(patterns, limit, deadline=None):
     """按文件名特征在沙盒里找文件（任务文件与接口文档都在沙盒深处）
 
-    全盘 walk 是这里最慢的一步，所以两个上限都要兜住：找到够数就停，
-    进的目录太多也停（沙盒命令整体限时 15 秒，宁可少找几个也不能超时）。
+    全盘 walk 是这里最慢的一步，所以三个上限都要兜住：找到够数就停，
+    进的目录太多也停，到了 `deadline`（FIND_BUDGET 秒）同样停——沙盒命令
+    整体限时 15 秒，走不完就少找几个，绝不能把整条命令拖成 [TIMEOUT]。
     """
     found = []
     seen = set()
@@ -3332,6 +3362,8 @@ def find_files(patterns, limit):
     for root, dirs, files in os.walk("/"):
         visited += 1
         if visited > DIR_BUDGET:
+            break
+        if deadline is not None and time.time() > deadline:
             break
         dirs[:] = [d for d in dirs if os.path.join(root, d) not in PRUNE]
         for name in files:
@@ -3347,12 +3379,12 @@ def find_files(patterns, limit):
     return found
 
 
-def task_files():
+def task_files(deadline=None):
     """待解的任务文件：描述里点名的那份排第一（答案只认它）"""
     wanted = os.path.basename(TASK_PATH) if TASK_PATH else ""
     named = []
     others = []
-    for path in find_files((r"^(task|spec).*\\.(md|txt|json)$",), 24):
+    for path in find_files((r"^(task|spec).*\\.(md|txt|json)$",), 24, deadline):
         if wanted and os.path.basename(path) == wanted:
             named.append(path)
         else:
@@ -3419,8 +3451,9 @@ def candidates(text, name, urls):
     return out
 
 
-files = task_files()
-doc_files = find_files(DOC_NAMES, 6)
+search_deadline = time.time() + FIND_BUDGET
+files = task_files(search_deadline)
+doc_files = find_files(DOC_NAMES, 6, search_deadline)
 doc_text = "\\n".join(read(path) for path in doc_files)
 urls = endpoints(doc_text)
 print(SCAN, "tasks=%d docs=%d urls=%d" % (len(files), len(doc_files), len(urls)))
@@ -3561,13 +3594,15 @@ def _task_answer(turn: Turn) -> str | None:
     且带有本任务标识的输出才会被当作答案，避免答非所问或复用上一个任务的结果。
     答案取任务标识到 `TASK_END_MARKER` 之间、`[SOLUTION]` 段里的内容。
 
-    两道闸门保证交上去的不是任务原文（复盘里 4 次 submitAnswer 交的全是
-    任务描述，Judge 一次都没放行）：
+    三道闸门保证交上去的既不是任务原文、也不是沙盒的错误回显（复盘里 4 次
+    submitAnswer 交的全是任务描述、PK590327 的 R16 交的是任务文件路径，
+    Judge 一次都没放行）：
         1. 答案区里必须出现过真实取数的证据（`TASK_DATA_MARKER`）——
            执行器取不到数据时答案区是空的，这一回合就不提交；
-        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）。
-    命中错误特征的输出（文件不存在等）同样不能提交：错误答案既拿不到分，
-    又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
+        2. 答案里不能出现任务描述里的中文长句（`_task_echo`）；
+        3. 答案不能是错误回显或文件路径（`_answer_rejected`）。
+    命中错误特征的输出（文件不存在、命令超时等）同样不能提交：错误答案既
+    拿不到分，又白白消耗任务冷却，所以宁可这一回合不提交，等下一条沙盒输出。
     """
     if not turn.phase_task:
         return None
@@ -3598,6 +3633,8 @@ def _task_answer(turn: Turn) -> str | None:
     if answer is None or len(answer) < TASK_ANSWER_MIN_LEN:
         return None
     if _task_echo(answer, turn.phase_task):
+        return None
+    if _answer_rejected(answer):
         return None
     return answer
 
@@ -3640,6 +3677,38 @@ def _task_echo(answer: str, phase_task: str) -> bool:
     return any(run in answer for run in re.findall(TASK_ECHO_RUN, phase_task))
 
 
+def _task_path_echo(answer: str) -> bool:
+    """答案是不是沙盒里的文件路径（或任务文件名本身）
+
+    答案应当是"读任务文件 -> 取数 -> 生成"的实质内容，整条答案长得像路径的
+    一律不是答案：复盘里 PK590327 的 R16 提交的正是任务文件的完整路径
+    （`/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md`），
+    Judge 必然不通过。
+
+    只拦"整个答案就是一条路径"这一种形态：答案里带空白或换行说明它是一段
+    文本，不动它；`2024/07/01` 这类含斜杠但不是文档名的答案同样放行。
+    """
+    text = answer.strip()
+    if not text or any(char.isspace() for char in text):
+        return False
+    if TASK_FILE_PATTERN.fullmatch(text):
+        return True
+    # `TASK_FILE_PATTERN` 只认小写扩展名，这里补上大写写法
+    return ("/" in text or "\\" in text) and text.lower().endswith(TASK_FILE_EXTS)
+
+
+def _answer_rejected(answer: str) -> bool:
+    """答案是不是沙盒的错误回显或文件路径（既不能提交，也不能进答案缓存）
+
+    错答与路径答都是一次 0 分提交：既不提交、也不缓存，等执行器下一次取数
+    （见 `_task_answer` / `_llm_direct_answer` / `_remember_task_answers`）。
+    """
+    return (
+        any(bad in answer for bad in TASK_ERROR_MARKERS)
+        or _task_path_echo(answer)
+    )
+
+
 def _remember_task_answers(result: str) -> None:
     """把执行器解出来的答案按任务文件名记进答案缓存
 
@@ -3654,6 +3723,8 @@ def _remember_task_answers(result: str) -> None:
     时也会把任务文件打成 `[SOLUTION]` 段（沙盒里本来就有这份文件），
     把它缓存下来等于把任务原文背下来，下一个任务一到手就被当成答案交上去
     ——这正是复盘里"四次 submitAnswer 交的全是任务描述"的成因之一。
+    答案本身还要过 `_answer_rejected`（错误回显 / 文件路径）：缓存是给"下一个
+    任务点直接交卷"用的，把这类 0 分答案存进去等于把它一路带到后面的任务。
 
     参数:
         result: 报文的 `lastCmdResult`（上回合沙盒命令的输出）
@@ -3664,7 +3735,12 @@ def _remember_task_answers(result: str) -> None:
         path, _, body = chunk.partition("\n")
         answer = body.split(TASK_SOLUTION_END, 1)[0].strip()
         name = path.strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if name and answer and TASK_DATA_MARKER in evidence:
+        if (
+            name
+            and answer
+            and TASK_DATA_MARKER in evidence
+            and not _answer_rejected(answer)
+        ):
             _TASK_ANSWER_CACHE.setdefault(name, answer)
         evidence += TASK_SOLUTION_MARKER + chunk
 
