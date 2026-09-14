@@ -15,7 +15,9 @@
           任务点旁等它开放（省掉"回基地再折返"的来回），天黑前再回防；
           天黑前工人回防到武器旁，但火力/围墙不达标时先抢建，
           角色不会整回合空转。
-    夜晚：每个角色操控一座武器攻击机器人，优先攻击威胁最高的目标。
+    夜晚：每个角色操控一座武器攻击机器人，优先攻击威胁最高的目标；
+          射程内没有目标、或者这一回合没摊上武器的角色去堵围墙缺口
+          （石头砌不起墙时用身体堵，见 `_plug_wall_gap`）。
 
 本模块为无状态决策：每回合从 `Turn` 重新解析地图与单位状态，
 不依赖任何跨回合的战场状态，可自动适应矿区刷新、单位移动与视野变化。
@@ -2848,6 +2850,74 @@ def _fall_back_to_weapons(
         commands[unit.unit_id] = move_command(step)
 
 
+def _plug_wall_gap(
+    turn: Turn,
+    unit: Unit,
+    holes: tuple[Pos, ...],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    weapon: Unit | None = None,
+) -> bool:
+    """用身体堵住围墙缺口（T6 人肉城墙）
+
+    石材不够、或者墙夜里被拆掉时，`_wall_holes` 里的每一格都是机器人直通
+    基地的门——墙砌不起来，人站上去也一样：角色占住的格子不可通行，机器人
+    要么先把这个肉盾打掉，要么绕开（见战术参考的 `人肉城墙堵缺口.png`）。
+    缺口按 `_calc_wall_order` 的顺序给，先堵的就是敌方来路那一段；规划好的
+    入口不在里面（那是自己人进出的通道，堵上会把队友关在外头）。
+
+    站位要站到缺口那一格**本身**，所以这里不用 `_step_toward`（它落在目标
+    的邻格上），直接按 A* 往那一格走（`next_step`）。
+
+    `weapon` 不是 None 时只挑"那一格还挨着这座武器"的缺口：这类角色手里有
+    武器要操控（八方向距离 1 才算操控得到），站远了武器就没人管了，所以只有
+    "站在缺口上照样够得着武器"的格子才轮得到它——塔位与外墙本来就贴在一起
+    （`_side_corridor` 的墙角位与 `_wall_ring` 的外圈只差一格），这种格子通常
+    就在武器旁边。
+
+    已经在缺口上时返回 True 但不下指令：不动就是堵着，而调用方拿到 True
+    就不会再把它支使到别处去。
+
+    只在夜里用（调用方是 `_decide_night`）：白天那几个缺口既是工人进出取矿的
+    路，也是当天要砌墙的施工位，站上去只会把自家人堵在里面、让墙更晚立起来。
+
+    参数:
+        turn: 当前回合信息
+        unit: 待调度的角色
+        holes: 本回合的围墙缺口（`_wall_holes`，按建造顺序）
+        claimed: 已被其他角色占用的目标集合
+        commands: 指令输出字典（角色ID -> 指令）
+        weapon: 该角色负责的武器；没有武器时传 None（全按优先级挑）
+
+    返回:
+        True 表示这一回合的站位已经定了（正走向某个缺口，或已经堵在上面）
+    """
+    if not holes:
+        return False
+
+    if weapon is None:
+        cells: list[Pos] = list(holes)
+    else:
+        hole_set = set(holes)
+        cells = [pos for pos in get_neighbors(weapon.pos) if pos in hole_set]
+
+    # 已经在缺口上就别再挪窝：站着不动就是堵着，再挑一格反而会把门让开
+    if unit.pos in cells:
+        claimed.add(unit.pos)
+        return True
+
+    for pos in cells:
+        if pos in claimed:
+            continue
+        step = next_step(turn, unit, pos)
+        if step is None or step in claimed:
+            continue
+        claimed.add(step)
+        commands[unit.unit_id] = move_command(step)
+        return True
+    return False
+
+
 def _use_item_if_held(
     unit: Unit,
     item: str,
@@ -2999,11 +3069,21 @@ def _night_support(
 
 
 def _decide_night(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
-    """夜晚策略: 操控武器攻击"""
+    """夜晚策略: 操控武器攻击
+
+    除了操控武器，夜里还有一件闲事：**人肉城墙**（T6）——围墙被拆掉、或
+    石材不够还没砌起来时，`_wall_holes` 给出的那几格就是机器人直通基地的
+    门，与其空着，不如让这一回合腾得出手的角色站上去（见 `_plug_wall_gap`）。
+    """
     claimed: set[Pos] = set()
+    # 围墙缺口整场夜只算一次：`_wall_holes` 按 `_calc_wall_order` 的顺序给，
+    # 先敌方来路那一段，与白天"先砌哪一段"是同一套判断
+    holes = _wall_holes(turn)
 
     # 为每个武器配对一个操控角色
+    paired: set[int] = set()
     for controller, weapon in _pair_controllers_and_weapons(turn):
+        paired.add(controller.unit_id)
         # 救急优先（V4）：喝药 / 基地升级券 / 补墙只在真危急时触发，
         # 触发后条件立刻消失，武器不会因此整夜没人操控
         if _night_support(turn, controller, claimed, commands):
@@ -3019,12 +3099,26 @@ def _decide_night(turn: Turn, commands: dict[int, dict[str, Any]]) -> None:
             target = _find_attack_target(turn, weapon)
             if target is not None:
                 commands[weapon.unit_id] = attack_command(controller.unit_id, [target])
+                continue
+
+            # 射程内还没有目标（机器人多半在路上）：趁机挪到武器旁那格缺口上
+            # ——站在缺口上照样操控得到武器，却把门堵上了（T6）
+            _plug_wall_gap(turn, controller, holes, claimed, commands, weapon)
             continue
 
-        # 操控角色不在武器旁边,向武器移动
+        # 操控角色不在武器旁边,向武器移动（顺路能堵缺口时优先站缺口）
+        if _plug_wall_gap(turn, controller, holes, claimed, commands, weapon):
+            continue
         step = _step_toward(turn, controller, weapon.pos, claimed)
         if step is not None:
             commands[controller.unit_id] = move_command(step)
+
+    # 人肉城墙（T6）：这一回合没摊上武器的角色（塔被拆了、或者本来就没塔）
+    # 去堵优先级最高的那个缺口，而不是原地空转（复盘里 idle_man 一路涨到 3）
+    for unit in turn.controllable():
+        if unit.unit_id in paired or unit.unit_id in commands:
+            continue
+        _plug_wall_gap(turn, unit, holes, claimed, commands)
 
 
 def _pair_controllers_and_weapons(turn: Turn) -> list[tuple[Unit, Unit]]:
