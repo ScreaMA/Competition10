@@ -8,7 +8,7 @@
           围墙建完后用富余资源换取金币和武器升级（金币阶梯：
           武器升级券 > 围墙升级券，不让金币在手里睡着）。
           开拓者优先完成自进化类任务（任务点领取 + 沙盒作答，
-          描述里没给文件名时先探测沙盒任务目录，顺带把任务文件读回来
+          描述里没给文件名时先全盘探测沙盒，顺带把任务文件读回来
           缓存备用，下一个任务点就能即时交卷），
           有任务在身时不退回基地，任务点冷却期间白天也守在下一个会开放的
           任务点旁等它开放（省掉"回基地再折返"的来回），天黑前再回防；
@@ -162,17 +162,28 @@ TASK_FILE_PATTERN = re.compile(r"[A-Za-z0-9_./\\-]+\.(?:md|txt|json|csv|log)")
 TASK_MARKER = "[TASK]"
 # 沙盒输出中的答案结束标记：它之后的诊断信息（目录列表等）永远不会被当成答案
 TASK_END_MARKER = "[TASK_END]"
-# 沙盒探测标记：任务描述里没给文件名时先探一次任务目录，这个标记下的输出
-# 只是目录/文件名清单，`_task_answer` 永远不会把它当成答案提交（见 `_sandbox_probe`）
+# 沙盒探测标记：任务描述里没给文件名时先探一次沙盒，这个标记下的输出
+# 只是文件路径清单，`_task_answer` 永远不会把它当成答案提交（见 `_sandbox_probe`）
 TASK_PROBE_MARKER = "[TASK_PROBE]"
-# 沙盒里自进化任务的目录约定：描述没给文件名时到这些目录里找任务文件
-TASK_PROBE_DIRS = ("/tmp/selfEvolutionTask", "/tmp/selfEvolution")
-# 任务文件分段标记：读任务文件时顺带把任务目录里的文件都读回来，
+# 沙盒里搜任务文件时跳过的虚拟目录：进程/内核/设备文件系统里不会有任务文件，
+# 却会让全盘 find 变慢并刷出一堆 Permission denied
+TASK_FIND_PRUNE = ("/proc", "/sys", "/dev")
+# 任务文件的文件名特征：描述里点名的那一份，以及任务目录里的同构任务
+# （任务书5.3节的例子是 task_1_beijing / task_2_shanghai 这一套）
+TASK_FILE_NAMES = ("task*", "spec*")
+# 探测沙盒时放宽一档：描述里连文件名都没有时，任何文档都可能是任务说明
+TASK_PROBE_NAMES = ("task*", "spec*", "*.md")
+# find 命中后执行的动作：直接打印内容（读任务文件）/ 只列出路径（探测与回读）
+TASK_FIND_CAT = "-exec cat -- {} +"
+TASK_FIND_PRINT = "-print"
+# 任务文件分段标记：读任务文件时顺带把沙盒里的任务文件都读回来，
 # 每份用这两个标记包起来，`_remember_task_files` 据此按文件名缓存内容
 TASK_FILE_MARKER = "[TASK_FILE]"
 TASK_FILE_END = "[TASK_EOF]"
-# 单份任务文件最多读回的行数，避免一条命令的输出把响应体撑大
+# 单份任务文件最多读回的行数、一次最多回读的份数，
+# 避免一条命令的输出把响应体撑大
 TASK_FILE_LIMIT = 60
+TASK_FILE_MAX = 12
 
 # 任务答案缓存：文件名 -> 沙盒里读回来的内容
 # 任务书5.3节要求"根据任务1探索的内容形成固定SOP或者SKILL，实现Agent自进化"，
@@ -1413,15 +1424,16 @@ def _sandbox_command(turn: Turn) -> str:
     属于当前任务；已经拿到本任务的输出后就不再重复执行。
 
     一条命令里尽量多拿信息（复盘里敌方逐次试错 401→400，白丢好几个回合）：
-    描述里的路径读不到时，按文件名在沙盒里再找一次；末尾附上目录列表作为
-    诊断线索。答案由 `TASK_END_MARKER` 界定，诊断信息不会被当成答案提交。
+    描述里的路径读不到时，按文件名在沙盒里全盘再找一次；再把沙盒的
+    工作目录与根目录列表一并带回来作诊断线索。答案由 `TASK_END_MARKER`
+    界定，诊断信息不会被当成答案提交。
 
     描述里连文件名都没有时（"请按沙盒里的任务说明作答"这类），先按
-    `_sandbox_probe` 探一次沙盒任务目录，下一回合从探测结果里认出文件名
+    `_sandbox_probe` 探一次沙盒，下一回合从探测结果里认出文件名
     再走上面的读文件流程——复盘里"任务卡在任务点反复答非所问、整个任务
     周期空转"就是从"不知道该读哪个文件"开始的。
 
-    答案取完之后再顺带把任务目录里的文件都读回来（`[TASK_FILE]` 分段），
+    答案取完之后再把沙盒里的任务文件都读回来（`[TASK_FILE]` 分段），
     交给 `_remember_task_files` 按文件名缓存：下一个任务点领到同一个任务时
     开拓者不必再等一个来回的沙盒输出，接取后下一回合就能直接作答。
     这一段排在 `TASK_END_MARKER` 之后，永远不会被当成当前任务的答案。
@@ -1443,42 +1455,78 @@ def _sandbox_command(turn: Turn) -> str:
     base = target.replace("\\", "/").rsplit("/", 1)[-1]
     read = (
         f'cat -- "{target}" 2>/dev/null'
-        f' || find . -maxdepth 3 -type f -name "{base}" -exec cat -- {{}} + 2>&1'
+        f' || {_sandbox_find((base,), TASK_FIND_CAT)}'
     )
-    scan = "ls -a -- . 2>&1 | head -40"
+    scan = "pwd; ls -a -- . 2>&1 | head -40"
+    # 末尾的 `:` 保证整条命令的退出码为 0：输出带 `[exitCode:0]` 才会被
+    # `_task_answer` 采纳，而链路里的 find/cat 读不到文件时退出码是非 0 的
     return (
-        f'echo "{marker}"; {read}; echo "{TASK_END_MARKER}"; {scan}; {_task_dump()}'
+        f'echo "{marker}"; {read}; echo "{TASK_END_MARKER}"; {scan};'
+        f' {_task_dump(turn)}; :'
     )
 
 
-def _task_dump() -> str:
-    """读回任务目录里全部任务文件的沙盒命令（排在答案结束标记之后）
+def _sandbox_find(names: tuple[str, ...], action: str) -> str:
+    """沙盒里按文件名全盘查找的 find 片段
+
+    复盘里沙盒的工作目录就是 `/`，`ls -a -- .` 只有 bin/dev/etc/home/lib/
+    lib64/proc/sbin/tmp/usr，而任务文件并不在 `/` 的前三层里：旧实现把搜索
+    限定在 `find . -maxdepth 3` 加两个猜出来的目录（`/tmp/selfEvolutionTask`、
+    `/tmp/selfEvolution`），任务文件一次都没被找到，开拓者整个任务周期
+    卡在任务点。这里改成从根目录起全盘按文件名找，只跳过 `TASK_FIND_PRUNE`
+    里的虚拟目录，读不到文件的目录由 `2>/dev/null` 静音。
+
+    参数:
+        names: 文件名通配（如 `task*`），多个通配之间是"或"关系
+        action: 命中后执行的动作（`TASK_FIND_CAT` 打印内容 / `TASK_FIND_PRINT` 列路径）
+
+    返回:
+        可直接拼进沙盒命令的 find 片段
+    """
+    prune = " -o ".join(f'-path "{path}"' for path in TASK_FIND_PRUNE)
+    wanted = " -o ".join(f'-name "{name}"' for name in names)
+    return (
+        f'find / \\( {prune} \\) -prune -o -type f \\( {wanted} \\)'
+        f" {action} 2>/dev/null"
+    )
+
+
+def _task_dump(turn: Turn) -> str:
+    """读回沙盒里全部任务文件的沙盒命令（排在答案结束标记之后）
 
     自进化类任务是一整套同构任务（任务书的例子是"查询北京/上海/广州天气"），
-    一次把任务目录里的文件都读回来，下一个任务点就不用再花一个来回等输出
+    一次把沙盒里的任务文件都读回来，下一个任务点就不用再花一个来回等输出
     （见 `_TASK_ANSWER_CACHE`）。只读文件名像任务文件的那几个，
     免得把沙盒里的无关文档一起吃回来占用输出行数。
+
+    上一回合什么任务文件都没回读到时（输出里没有 `TASK_FILE_MARKER`）放宽一档，
+    连 `*.md` 一起扫：沙盒里任务文件的实际命名未必和任务描述里写的一致，
+    卡在一个文件名上反复空转不如把候选都摊开（探测输出里的文件名同样会
+    被 `_task_file` 认出来，下一回合就能直接读中意的那份）。
+
+    参数:
+        turn: 当前回合信息（用上一回合的沙盒输出判断要不要放宽）
     """
-    return "; ".join(
-        f'for f in $(find "{path}" -maxdepth 2 -type f'
-        ' \\( -name "task*" -o -name "spec*" \\) 2>/dev/null);'
+    names = TASK_FILE_NAMES
+    if turn.last_cmd_result and TASK_FILE_MARKER not in turn.last_cmd_result:
+        names = TASK_PROBE_NAMES
+    return (
+        f'for f in $({_sandbox_find(names, TASK_FIND_PRINT)}'
+        f" | head -{TASK_FILE_MAX});"
         f' do echo "{TASK_FILE_MARKER}$f";'
-        f' cat -- "$f" 2>&1 | head -{TASK_FILE_LIMIT};'
+        f' cat -- "$f" 2>/dev/null | head -{TASK_FILE_LIMIT};'
         f' echo "{TASK_FILE_END}"; done'
-        for path in TASK_PROBE_DIRS
     )
 
 
 def _sandbox_probe(turn: Turn) -> str:
     """任务描述里找不到文件名时，探测沙盒里的任务文件
 
-    列出沙盒里存放任务说明的目录（`TASK_PROBE_DIRS`），并把目录下
-    文件名像任务文件的那些连同完整路径一起打印出来，下一回合
-    `_sandbox_command` 就能从输出里认出该读哪个文件。
-
-    探测输出带 `TASK_PROBE_MARKER`：`_task_answer` 只认 `TASK_MARKER`，
-    所以目录列表永远不会被当成答案提交；`find` 排在 `ls` 前面是为了先拿到
-    完整路径（`cat` 才找得到文件），`ls` 只作诊断线索。
+    把沙盒里文件名像任务文件的那些连同完整路径一起打印出来，下一回合
+    `_sandbox_command` 就能从输出里认出该读哪个文件。探测输出带
+    `TASK_PROBE_MARKER`：`_task_answer` 只认 `TASK_MARKER`，
+    所以文件路径清单永远不会被当成答案提交；工作目录与目录列表排在
+    路径清单之后，只作诊断线索。
 
     参数:
         turn: 当前回合信息
@@ -1487,20 +1535,13 @@ def _sandbox_probe(turn: Turn) -> str:
         需要提交给沙盒执行的探测命令
     """
     token = _task_token(turn.phase_task)
-    dirs = " ".join(f'"{path}"' for path in TASK_PROBE_DIRS)
-    # 先找任务文件本身（task*），再退到 spec/说明文档：只按文件名找，
-    # 免得把沙盒里的其他文档当成任务文件读回来
-    found = "; ".join(
-        f'find "{path}" -maxdepth 2 -type f -name "task*" 2>/dev/null;'
-        f' find "{path}" -maxdepth 2 -type f'
-        ' \\( -name "spec*" -o -name "*.md" \\) 2>/dev/null'
-        for path in TASK_PROBE_DIRS
-    )
+    # 只按文件名找（task*/spec*，再退到 *.md）：描述里连文件名都没给，
+    # 任何文档都可能是任务说明，但沙盒里的其他内容不该被当成任务文件读回来
     return (
         f'echo "{TASK_PROBE_MARKER}{token}"; '
-        f"( {found} ) | head -40; "
-        f"ls -a -- {dirs} 2>&1 | head -40; "
-        f'echo "{TASK_END_MARKER}"'
+        f"{_sandbox_find(TASK_PROBE_NAMES, TASK_FIND_PRINT)} | head -40; "
+        f"pwd; ls -a -- . 2>&1 | head -40; "
+        f'echo "{TASK_END_MARKER}"; :'
     )
 
 
