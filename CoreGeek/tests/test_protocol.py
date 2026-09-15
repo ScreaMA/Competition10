@@ -1,282 +1,261 @@
-"""协议模块测试（设计文档 3.3 节）"""
+"""协议层用例：报文解析与指令构造。
+
+对应设计文档V2 §10.1。
+
+这一层是**异常预算**（任务书 §8：累计 5 次异常即整场停调度）的唯一防线，
+所以用例集中在两件事上：
+
+1. 报文里每个字段都真的被解析了（V1 漏了 `errors`/`llmResp`/
+   `lastSummonTreasureResult`，导致"答案错误"这类关键信号读不到）。
+2. 构造器在参数不合法时**返回 None**，而不是发一条字段不全的指令。
+"""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from agent import protocol
 from agent.protocol import (
-    DAY_ROUNDS,
-    GATLING,
-    ROCKET,
-    STONE_MINE,
-    VENDOR,
-    WALL,
-    WORKER,
     Pos,
     Turn,
     Unit,
-    accept_task_command,
     attack_command,
     build_command,
-    buy_command,
-    collect_command,
     distance,
-    drop_command,
-    manhattan_distance,
-    move_command,
-    remove_command,
-    sell_command,
+    neighbours,
     station_footprint,
-    submit_answer_command,
-    summon_treasure_command,
     use_command,
 )
 
 
-# === 基础几何 ===
+# ==========================================================================
+# 报文解析
+# ==========================================================================
 
 
-def test_pos_distance():
-    """切比雪夫距离"""
-    assert distance(Pos(0, 0), Pos(3, 4)) == 4
-    assert distance(Pos(0, 0), Pos(3, 3)) == 3
+def test_load_full_payload(payload_factory, role_factory, task_factory, robot_factory,
+                           zone_factory):
+    payload = payload_factory(
+        round_no=85,
+        gold=20,
+        roles=[role_factory(10013, "station", 10, 24)],
+        zones=[zone_factory("stone", 4, 24), zone_factory("vendor", 20, 16)],
+        player_tasks=[task_factory("自进化类1", 14, 14)],
+        robots=[robot_factory(30001, 4, 4)],
+        enemies=[role_factory(20013, "station", 30, 10)],
+        phase_task="请阅读task_1_beijing.md，获取任务信息",
+        llm_resp="ANSWER: 42",
+        errors=[{"errorCode": 2, "description": "答案错误"}],
+    )
+    turn = Turn.load(payload)
+
+    assert turn.round_no == 85
+    assert turn.gold == 20
+    assert turn.station() is not None
+    assert turn.player_tasks[0].pos == Pos(14, 14)
+    assert turn.player_tasks[0].timeout_rounds == 15
+    assert turn.mines("stone") == (Pos(4, 24),)
+    assert turn.enemies[0].kind == "station"
+    assert turn.phase_task.startswith("请阅读")
+    # V1 漏解析的三个字段
+    assert turn.llm_resp == "ANSWER: 42"
+    assert turn.errors[0].code == 2
+    assert turn.answer_wrong is True
+    assert turn.last_summon_result == 0
+
+
+def test_day_night_boundary(payload_factory):
+    """白天 70 回合、夜晚 60 回合（任务书 §4.2）"""
+    def is_day(round_no):
+        return Turn.load(payload_factory(round_no=round_no)).is_day
+
+    assert is_day(1) is True
+    assert is_day(70) is True
+    assert is_day(71) is False
+    assert is_day(130) is False
+    assert is_day(131) is True  # 第 2 天
+    # 第 10 天 = R1171..R1300，其中 R1171..R1240 是白天、R1241..R1300 是夜晚
+    assert is_day(1171) is True
+    assert is_day(1240) is True
+    assert is_day(1241) is False
+    assert is_day(1300) is False  # 最后 60 回合是夜战
+
+
+def test_missing_optional_fields_do_not_crash():
+    """只给必需字段也要能解析（判题器早期回合可能省略可选字段）"""
+    turn = Turn.load({
+        "roundNo": 1,
+        "mapInfo": {"width": 41, "height": 32},
+        "teamOur": {"type": "challenger", "roles": []},
+    })
+    assert turn.round_no == 1
+    assert turn.robots == ()
+    assert turn.player_tasks == ()
+    assert turn.last_action_results == {}
+
+
+def test_task_without_timeout_rounds(payload_factory, task_factory):
+    """任务点缺 `timeoutRounds` 时要走兜底值，而不是让整回合决策崩掉
+
+    报文里的可选字段随时可能缺席，而 `decide` 的兜底是"返回空指令"——
+    这种情况在日志里只表现为"这一回合什么都没做"，很难查。所以这里直接
+    对着 `PlayerTask.load` 断言。
+    """
+    task = task_factory("自进化类1", 14, 14)
+    task.pop("timeoutRounds")
+    turn = Turn.load(payload_factory(player_tasks=[task]))
+    assert turn.player_tasks[0].timeout_rounds == protocol.TASK_DEFAULT_TIMEOUT
+
+
+def test_station_footprint_is_2x2():
+    """基地 pos 是左上角，占 2×2（接口文档 §1.3.1 注）"""
+    cells = station_footprint(Pos(10, 24))
+    assert set(cells) == {Pos(10, 24), Pos(11, 24), Pos(10, 23), Pos(11, 23)}
+    assert protocol.footprint_origin(cells) == Pos(10, 23)
+
+
+def test_distance_is_chebyshev():
+    """切比雪夫距离（任务书 §4.5.4）"""
+    assert distance(Pos(0, 0), Pos(3, 1)) == 3
+    assert distance(Pos(0, 0), Pos(2, 2)) == 2
     assert distance(Pos(5, 5), Pos(5, 5)) == 0
 
 
-def test_manhattan_distance():
-    """曼哈顿距离"""
-    assert manhattan_distance(Pos(0, 0), Pos(3, 4)) == 7
-    assert manhattan_distance(Pos(0, 0), Pos(3, 3)) == 6
+def test_blocked_includes_all_obstacles(payload_factory, role_factory, zone_factory,
+                                        robot_factory):
+    """任务书 §4.1：建筑、角色、机器人、中立单位、任务点、矿区**全部**阻挡移动"""
+    worker = role_factory(10010, "worker", 5, 5)
+    turn = Turn.load(payload_factory(
+        roles=[worker, role_factory(10013, "station", 20, 10)],
+        zones=[zone_factory("stone", 4, 4), zone_factory("vendor", 20, 16)],
+        robots=[robot_factory(30001, 6, 6)],
+    ))
+    blocked = turn.blocked_for(Unit.load(worker))
+    assert Pos(4, 4) in blocked       # 矿区
+    assert Pos(20, 16) in blocked     # 小贩
+    assert Pos(20, 10) in blocked     # 己方基地
+    assert Pos(6, 6) in blocked       # 机器人
+    assert Pos(5, 5) not in blocked   # 自己所在格不算阻挡
+    assert turn.is_land(Pos(7, 7)) is True
 
 
-def test_pos_add_and_dump():
-    """坐标加法与序列化"""
-    assert Pos(5, 10) + (2, -3) == Pos(7, 7)
-    assert Pos(5, 10).dump() == {"x": 5, "y": 10}
-    assert Pos.load({"x": "5", "y": 10}) == Pos(5, 10)
+# ==========================================================================
+# 指令构造（异常预算防线）
+# ==========================================================================
 
 
-def test_station_footprint():
-    """基地占2x2，pos为左上角"""
-    footprint = station_footprint(Pos(10, 24))
-    assert len(footprint) == 4
-    assert Pos(10, 24) in footprint
-    assert Pos(11, 24) in footprint
-    assert Pos(10, 23) in footprint
-    assert Pos(11, 23) in footprint
+def test_attack_target_count_must_equal_level():
+    """加特林/火箭的 `targetPos` 个数必须等于武器等级（接口文档 §2.2）
+
+    个数不对会让**整次攻击非法**，直接吃掉一次异常预算。
+    """
+    for level, expected in ((1, 1), (2, 2), (3, 3)):
+        gatling = Unit.load({
+            "id": 10020, "pos": {"x": 10, "y": 10}, "roleType": "gatling",
+            "health": 1000, "attackPower": 10, "attackRange": 3, "level": level,
+        })
+        command = attack_command(10010, gatling, [Pos(12, 12)])
+        assert command is not None
+        assert len(command["targetPos"]) == expected
+        # 落点不够时用最后一个补齐（重复落点 = 指令执行失败，不是异常）
+        assert all(pos == {"x": 12, "y": 12} for pos in command["targetPos"])
 
 
-# === 单位解析 ===
+def test_railgun_always_single_target():
+    """电磁狙击炮只能攻击一个目标（任务书 §4.5.4）"""
+    railgun = Unit.load({
+        "id": 10030, "pos": {"x": 10, "y": 10}, "roleType": "railgun",
+        "health": 1000, "attackPower": 10, "attackRange": 6, "level": 3,
+    })
+    command = attack_command(10010, railgun, [Pos(12, 12), Pos(13, 13)])
+    assert command is not None
+    assert len(command["targetPos"]) == 1
 
 
-def test_unit_load_defaults(role_factory):
-    """角色缺少可选字段时应使用默认值"""
-    unit = Unit.load(role_factory(10010, WORKER, 5, 23))
-    assert unit.unit_id == 10010
-    assert unit.kind == WORKER
-    assert unit.pos == Pos(5, 23)
-    assert unit.level == 1
-    assert unit.cooldown == 0
-    assert unit.backpack == ()
-    assert unit.is_alive
+def test_attack_requires_target():
+    gatling = Unit.load({
+        "id": 10020, "pos": {"x": 10, "y": 10}, "roleType": "gatling",
+        "health": 1000, "attackPower": 10, "attackRange": 3, "level": 1,
+    })
+    assert attack_command(10010, gatling, []) is None
 
 
-def test_unit_backpack_full(role_factory):
-    """背包容量判断"""
-    raw = role_factory(10010, WORKER, 5, 23, backPackCapability=2,
-                       backpack=["stone", "iron"])
-    assert Unit.load(raw).backpack_full
-
-    raw["backpack"] = ["stone"]
-    assert not Unit.load(raw).backpack_full
-
-    # 报文未给出背包容量的单位（capacity 为 None）不视为“已满”
-    raw = role_factory(10013, "station", 10, 24)
-    del raw["backPackCapability"]
-    assert not Unit.load(raw).backpack_full
-
-    # 容量为0的建筑无法携带物品，视为已满（不会派去采矿）
-    assert Unit.load(role_factory(10013, "station", 10, 24)).backpack_full
+def test_use_with_position_required_for_bomb():
+    """眩晕法宝/范围炸弹必须带 `targetPos`（接口文档 §2.2 的指令错误口径）"""
+    assert use_command("Bomb") is None
+    assert use_command("DizzyWeapon") is None
+    assert use_command("Bomb", Pos(3, 3)) is not None
+    # 生命药剂不需要坐标
+    assert use_command("Medicine") is not None
 
 
-def test_unit_dead_is_not_alive(role_factory):
-    """血量归零即阵亡"""
-    unit = Unit.load(role_factory(10010, WORKER, 5, 23, health=0))
-    assert not unit.is_alive
+def test_submit_answer_rejects_empty():
+    assert protocol.submit_answer_command("") is None
+    assert protocol.submit_answer_command("   ") is None
+    assert protocol.submit_answer_command('{"a":1}') is not None
 
 
-def test_range_of_attack_prefers_payload_value(role_factory):
-    """攻击距离优先取报文中的实际值（火箭 level1 即为全图）"""
-    rocket = Unit.load(role_factory(10040, ROCKET, 9, 25, attackRange=2147483647))
-    assert rocket.range_of_attack() == 2147483647
+def test_sell_buy_reject_bad_num():
+    assert protocol.sell_command("stone", 0) is None
+    assert protocol.sell_command("stone", -1) is None
+    assert protocol.buy_command("Medicine", 0) is None
+    assert protocol.sell_command("stone") == {
+        "action": "sell", "name": "stone", "num": 1
+    }
 
-    # 报文未给出时回退到等级表
-    gatling = Unit.load(role_factory(10020, GATLING, 9, 24, attackRange=0, level=2))
+
+def test_build_command_shape():
+    assert build_command(Pos(3, 4), "wall") == {
+        "action": "build",
+        "targetPos": [{"x": 3, "y": 4}],
+        "name": "wall",
+    }
+
+
+def test_response_keys_are_strings():
+    """`roleCommandMap` 的 key 必须是字符串（接口文档 §2.1 是 Map<int,…>）"""
+    response = protocol.build_response({10010: protocol.move_command(Pos(1, 1))})
+    assert set(response["roleCommandMap"]) == {"10010"}
+    assert set(response) == {"roleCommandMap", "prompt", "executeCmd"}
+    assert json.loads(protocol.dumps(response))["roleCommandMap"]["10010"]["action"] == "move"
+
+
+def test_use_needs_pos_covers_all_vouchers():
+    """所有"需要目标位置"的道具白名单要完整（漏一个就会产生一次异常）"""
+    for name in ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2",
+                 "WallUpgradeVoucher1", "StationUpgradeVoucher1",
+                 "WallFixer", "Bomb", "DizzyWeapon"):
+        assert name in protocol.USE_NEEDS_POS
+
+
+def test_weapon_range_by_level():
+    """武器射程表（任务书 §4.5.1）"""
+    rocket = Unit.load({
+        "id": 10040, "pos": {"x": 1, "y": 1}, "roleType": "rocket",
+        "health": 1000, "attackPower": 20, "attackRange": 0, "level": 3,
+    })
+    assert rocket.range_of_attack() == 10**9  # level3 全图
+    gatling = Unit.load({
+        "id": 10020, "pos": {"x": 1, "y": 1}, "roleType": "gatling",
+        "health": 1000, "attackPower": 0, "attackRange": 0, "level": 2,
+    })
     assert gatling.range_of_attack() == 5
 
-    # 非武器单位无攻击距离
-    assert Unit.load(role_factory(10010, WORKER, 5, 23)).range_of_attack() == 0
 
-
-# === 回合解析 ===
-
-
-def test_player_task_load_without_timeout_rounds(task_factory):
-    """回归：真实请求的 playerTasks 可能缺少 timeoutRounds，不能抛异常"""
-    raw = task_factory(14, 14)
-    del raw["timeoutRounds"]
-
-    turn = Turn.load({
-        "roundNo": 1,
-        "mapInfo": {"width": 41, "height": 32, "zones": []},
-        "teamOur": {"type": "challenger", "roles": [], "playerTasks": [raw]},
+def test_max_health_table():
+    """满血表（任务书 §4.5.1）"""
+    wall = Unit.load({
+        "id": 40000, "pos": {"x": 1, "y": 1}, "roleType": "wall",
+        "health": 500, "level": 2,
     })
-    assert turn.player_tasks[0].timeout_rounds == 0
-    assert turn.player_tasks[0].is_valid
+    assert wall.max_health() == 1500
+    assert wall.health_ratio() == pytest.approx(500 / 1500)
 
 
-@pytest.mark.parametrize(
-    "round_no,expected_day",
-    [
-        (1, True),          # 第1天白天
-        (DAY_ROUNDS, True),  # 第1天最后一个白天回合
-        (DAY_ROUNDS + 1, False),  # 第1天第一个夜晚回合
-        (130, False),       # 第1天最后一个夜晚回合
-        (131, True),        # 第2天白天
-    ],
-)
-def test_turn_day_night(payload_factory, round_no, expected_day):
-    """昼夜判定：白天70回合，夜晚60回合"""
-    turn = Turn.load(payload_factory(round_no=round_no))
-    assert turn.is_day is expected_day
-
-
-def test_turn_queries(payload_factory, role_factory, robot_factory):
-    """单位与地图查询"""
-    payload = payload_factory(
-        roles=[
-            role_factory(10010, WORKER, 5, 23, backPackCapability=100),
-            role_factory(10011, "pioneer", 10, 12, backPackCapability=40),
-            role_factory(10020, GATLING, 9, 24, level=1),
-            role_factory(40000, WALL, 5, 20),
-        ],
-        zones=[(STONE_MINE, 4, 24), (VENDOR, 20, 16)],
-        robots=[robot_factory(30001, 4, 4)],
-    )
-    turn = Turn.load(payload)
-
-    assert turn.station() is not None
-    assert [unit.unit_id for unit in turn.workers()] == [10010]
-    assert [unit.unit_id for unit in turn.pioneers()] == [10011]
-    assert [unit.unit_id for unit in turn.weapons()] == [10020]
-    assert len(turn.walls()) == 1
-    assert turn.controllable() == (turn.workers()[0], turn.pioneers()[0])
-
-    assert turn.stone_mines() == (Pos(4, 24),)
-    assert turn.iron_mines() == ()
-    assert turn.copper_mines() == ()
-
-    # 可通行判断：越界/矿区/中立单位都不可通行
-    assert turn.land(Pos(0, 0))
-    assert not turn.land(Pos(-1, 0))
-    assert not turn.land(Pos(41, 0))
-    assert not turn.land(Pos(4, 24))
-
-
-def test_turn_occupied_and_blocked(payload_factory, role_factory, robot_factory):
-    """阻挡格计算：含己方单位、矿区、机器人与敌方单位"""
-    payload = payload_factory(
-        roles=[role_factory(10010, WORKER, 5, 23, backPackCapability=100)],
-        zones=[(STONE_MINE, 4, 24)],
-        robots=[robot_factory(30001, 4, 4)],
-        enemies=[role_factory(20013, "station", 30, 10)],
-    )
-    turn = Turn.load(payload)
-    worker = turn.workers()[0]
-
-    # 基地2x2 + 工人1格
-    assert len(turn.occupied_cells()) == 5
-    assert Pos(10, 23) in turn.occupied_cells()
-
-    blocked = turn.blocked(worker)
-    assert Pos(10, 24) in blocked  # 己方基地
-    assert Pos(4, 24) in blocked  # 矿区
-    assert Pos(4, 4) in blocked  # 机器人
-    assert Pos(30, 10) in blocked  # 敌方基地（2x2）
-    assert worker.pos not in blocked  # 自身位置不算阻挡
-
-
-def test_alive_robots_targeting_me(payload_factory, robot_factory):
-    """只统计攻击我方且存活的机器人"""
-    payload = payload_factory(
-        robots=[
-            robot_factory(30001, 4, 4, targetTeam="challenger"),
-            robot_factory(30002, 5, 4, targetTeam="defender"),
-            robot_factory(30003, 6, 4, targetTeam="challenger", health=0),
-        ],
-    )
-    turn = Turn.load(payload)
-    assert [robot.robot_id for robot in turn.alive_robots_targeting_me()] == [30001]
-
-
-# === 指令构建 ===
-
-
-def test_move_and_collect_commands():
-    assert move_command(Pos(1, 2)) == {
-        "action": "move", "targetPos": [{"x": 1, "y": 2}],
-    }
-    assert collect_command(Pos(6, 13)) == {
-        "action": "collect", "targetPos": [{"x": 6, "y": 13}],
-    }
-
-
-def test_build_and_remove_commands():
-    assert build_command(Pos(9, 24), WALL) == {
-        "action": "build", "targetPos": [{"x": 9, "y": 24}], "name": "wall",
-    }
-    assert remove_command(Pos(9, 24)) == {
-        "action": "remove", "targetPos": [{"x": 9, "y": 24}],
-    }
-
-
-def test_attack_command_multi_target():
-    """加特林/火箭可多目标，controllerId 必须是字符串"""
-    command = attack_command(10010, [Pos(29, 7), Pos(29, 8)])
-    assert command["action"] == "attack"
-    assert command["controllerId"] == "10010"
-    assert command["targetPos"] == [{"x": 29, "y": 7}, {"x": 29, "y": 8}]
-
-
-def test_sell_and_buy_commands():
-    assert sell_command("stone") == {"action": "sell", "name": "stone", "num": 1}
-    assert sell_command("stone", 10) == {
-        "action": "sell", "name": "stone", "num": 10,
-    }
-    assert buy_command("Medicine", 2) == {
-        "action": "buy", "name": "Medicine", "num": 2,
-    }
-
-
-def test_use_command_with_and_without_target():
-    assert use_command("Medicine") == {"action": "use", "name": "Medicine"}
-    assert use_command("WallFixer", Pos(9, 24)) == {
-        "action": "use", "name": "WallFixer", "targetPos": [{"x": 9, "y": 24}],
-    }
-
-
-def test_drop_and_task_commands():
-    assert drop_command("stone") == {"action": "drop", "name": "stone"}
-    assert accept_task_command() == {"action": "acceptTask"}
-    assert submit_answer_command("xxx") == {
-        "action": "submitAnswer", "taskAnswer": "xxx",
-    }
-
-
-def test_summon_treasure_command():
-    command = summon_treasure_command(Pos(29, 7), ["AcientTablet", "StarSand"])
-    assert command == {
-        "action": "summonTreasure",
-        "targetPos": [{"x": 29, "y": 7}],
-        "item": ["AcientTablet", "StarSand"],
-    }
+def test_neighbours_are_eight_directions():
+    """八方向邻居（任务书 §4.5.4 第 2 条）"""
+    assert len(neighbours(Pos(5, 5))) == 8
+    assert Pos(4, 4) in neighbours(Pos(5, 5))
+    assert Pos(6, 6) in neighbours(Pos(5, 5))

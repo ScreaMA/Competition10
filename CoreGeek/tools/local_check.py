@@ -64,11 +64,13 @@ def stats(commands: dict) -> str:
 def case_direct() -> None:
     """1. 直接调用决策函数"""
     payload = load_sample()
-    commands, prompt = decide(payload)
+    response = decide(payload)
+    commands = response["roleCommandMap"]
     check_format(commands)
     print(f"[1] 直接调用 decide(): round={payload['roundNo']} -> {stats(commands)}")
     print(f"    {json.dumps(commands, ensure_ascii=False)}")
-    print(f"    每日LLM prompt长度: {len(prompt)} 字符")
+    print(f"    executeCmd: {len(response['executeCmd'])} 字符, "
+          f"prompt: {len(response['prompt'])} 字符")
 
 
 def case_http(port: int) -> None:
@@ -180,9 +182,9 @@ def case_robustness() -> None:
     scenarios["任务点缺少timeoutRounds"] = payload
 
     for name, payload in scenarios.items():
-        commands, _ = decide(payload)
-        check_format(commands)
-        print(f"[3] {name} -> {stats(commands)}")
+        response = decide(payload)
+        check_format(response["roleCommandMap"])
+        print(f"[3] {name} -> {stats(response['roleCommandMap'])}")
 
 
 def case_soak(rounds: int = 1300) -> None:
@@ -193,11 +195,11 @@ def case_soak(rounds: int = 1300) -> None:
     for round_no in range(1, rounds + 1):
         payload["roundNo"] = round_no
         started = time.perf_counter()
-        commands, _ = decide(payload)
+        response = decide(payload)
         elapsed = time.perf_counter() - started
         total += elapsed
         slowest = max(slowest, elapsed)
-        check_format(commands)
+        check_format(response["roleCommandMap"])
     print(
         f"[4] 连续{rounds}回合决策: 总耗时{total:.2f}s, "
         f"单回合最慢{slowest * 1000:.1f}ms, 平均{total / rounds * 1000:.2f}ms"

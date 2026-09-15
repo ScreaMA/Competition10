@@ -1,121 +1,124 @@
-"""地图模块测试（设计文档 3.4 节）"""
+"""几何与寻路用例。
+
+对应设计文档V2 §5.3。
+"""
 
 from __future__ import annotations
 
-from agent.grid import cells_in_range, get_neighbors, next_step
-from agent.protocol import STONE_MINE, WORKER, Pos, Turn, distance
+import pytest
+
+from agent import grid
+from agent.protocol import Pos, Turn, Unit
 
 
-def test_get_neighbors():
-    """八方向相邻格子"""
-    neighbors = get_neighbors(Pos(5, 5))
-    assert len(neighbors) == 8
-    assert Pos(4, 4) in neighbors
-    assert Pos(6, 6) in neighbors
-    assert Pos(5, 5) not in neighbors
+def _turn(payload_factory, role_factory, zones=None, robots=None):
+    worker = role_factory(10010, "worker", 5, 5)
+    return Turn.load(payload_factory(
+        roles=[worker, role_factory(10013, "station", 20, 10)],
+        zones=zones or [],
+        robots=robots or [],
+    )), Unit.load(worker)
 
 
-def test_cells_in_range():
-    """范围内格子（切比雪夫距离）"""
-    cells = cells_in_range(Pos(5, 5), 2)
-    assert Pos(5, 5) in cells
-    assert Pos(3, 3) in cells
-    assert Pos(7, 7) in cells
-    assert Pos(2, 2) not in cells  # 超出范围
-    assert Pos(5, 8) not in cells
-    assert len(cells) == 5 * 5  # (2r+1)^2
+def test_step_toward_straight_line(payload_factory, role_factory):
+    turn, worker = _turn(payload_factory, role_factory)
+    step = grid.next_step(turn, worker, Pos(9, 5))
+    assert step == Pos(6, 5)
 
 
-def _worker_turn(payload_factory, role_factory, **kwargs) -> Turn:
-    """构造一个只含基地与一个工人的回合，供寻路测试使用"""
-    payload = payload_factory(
-        station=(20, 20),
-        roles=[role_factory(10010, WORKER, 0, 0, backPackCapability=100)],
-        **kwargs,
-    )
-    return Turn.load(payload)
+def test_step_toward_diagonal(payload_factory, role_factory):
+    """八方向移动：对角线走一步两个坐标同时变（任务书 §4.5.4 第 2 条）"""
+    turn, worker = _turn(payload_factory, role_factory)
+    step = grid.next_step(turn, worker, Pos(9, 9))
+    assert step == Pos(6, 6)
 
 
-def test_next_step_moves_closer(payload_factory, role_factory):
-    """寻路返回的下一步必须靠近目标且与当前位置相邻"""
-    turn = _worker_turn(payload_factory, role_factory)
-    worker = turn.workers()[0]
-    goal = Pos(5, 0)
+def test_step_toward_returns_none_when_arrived(payload_factory, role_factory):
+    turn, worker = _turn(payload_factory, role_factory)
+    assert grid.next_step(turn, worker, worker.pos) is None
 
-    step = next_step(turn, worker, goal)
+
+def test_path_goes_around_obstacles(payload_factory, role_factory, zone_factory):
+    """障碍物要绕开（任务书 §4.1：矿区/中立单位/建筑都阻挡移动）"""
+    # 在 (6,5) 与 (6,6) 之间竖一堵矿区墙，逼它绕行
+    zones = [zone_factory("stone", 6, y) for y in range(0, 32) if y != 0]
+    turn, worker = _turn(payload_factory, role_factory, zones=zones)
+    step = grid.next_step(turn, worker, Pos(9, 5))
     assert step is not None
-    assert distance(step, worker.pos) == 1  # 每回合只能移动一格
-    assert distance(step, goal) < distance(worker.pos, goal)
+    # 不能直接往右撞进矿区
+    assert step != Pos(6, 5)
 
 
-def test_next_step_same_position(payload_factory, role_factory):
-    """起点即终点时直接返回该点（不应崩溃）"""
-    turn = _worker_turn(payload_factory, role_factory)
-    worker = turn.workers()[0]
-    assert next_step(turn, worker, worker.pos) == worker.pos
+def test_unreachable_returns_none(payload_factory, role_factory, zone_factory):
+    """完全被围死时返回 None（而不是给一个撞墙的步）"""
+    ring = [
+        zone_factory("stone", 5 + dx, 5 + dy)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        if (dx, dy) != (0, 0)
+    ]
+    turn, worker = _turn(payload_factory, role_factory, zones=ring)
+    assert grid.next_step(turn, worker, Pos(20, 20)) is None
 
 
-def test_next_step_avoids_blocked_cells(payload_factory, role_factory):
-    """阻挡格（矿区/基地）不会作为落点"""
-    turn = _worker_turn(
-        payload_factory, role_factory, zones=[(STONE_MINE, 1, 0), (STONE_MINE, 1, 1)],
-    )
-    worker = turn.workers()[0]
-
-    step = next_step(turn, worker, Pos(5, 0))
-    assert step is not None
-    assert step not in turn.blocked(worker)
-    assert turn.land(step)
+def test_reserved_cells_are_avoided(payload_factory, role_factory):
+    """本回合被别人认领的格子不能再走（避免"目标点争夺"碰撞）"""
+    turn, worker = _turn(payload_factory, role_factory)
+    step = grid.next_step(turn, worker, Pos(9, 5), reserved={Pos(6, 5)})
+    assert step != Pos(6, 5)
 
 
-def test_next_step_unreachable(payload_factory, role_factory):
-    """被围死时返回 None"""
-    turn = _worker_turn(
-        payload_factory,
-        role_factory,
-        zones=[
-            (STONE_MINE, 1, 0),
-            (STONE_MINE, 0, 1),
-            (STONE_MINE, 1, 1),
-        ],
-    )
-    worker = turn.workers()[0]
-    assert next_step(turn, worker, Pos(5, 0)) is None
+def test_reachable_and_reachable_any(payload_factory, role_factory):
+    turn, worker = _turn(payload_factory, role_factory)
+    assert grid.reachable(turn, Pos(5, 5), Pos(9, 9)) is True
+    assert grid.reachable(turn, Pos(5, 5), Pos(5, 5)) is True
+    assert grid.reachable_any(turn, Pos(5, 5), (Pos(9, 9), Pos(8, 8))) is True
 
 
-def test_next_step_reaches_goal_around_obstacle(payload_factory, role_factory):
-    """绕开障碍后仍能到达目标（多步模拟）"""
-    turn = _worker_turn(
-        payload_factory, role_factory, zones=[(STONE_MINE, 1, 0)],
-    )
-    goal = Pos(3, 0)
-
-    # 模拟移动，最多 20 步
-    for _ in range(20):
-        worker = turn.workers()[0]
-        if worker.pos == goal:
-            break
-        step = next_step(turn, worker, goal)
-        assert step is not None
-        # 手动把工人挪到下一步（重建 Turn）
-        turn = Turn.load(_payload_with_worker(payload_factory, step))
-
-    assert turn.workers()[0].pos == goal
+def test_reachable_respects_extra_blocked(payload_factory, role_factory):
+    """`extra_blocked` 就是"建成预演"的基础：假设某些格被建筑占掉"""
+    turn, worker = _turn(payload_factory, role_factory)
+    wall = {Pos(x, 5) for x in range(0, 41) if x != 5}
+    assert grid.reachable(turn, Pos(5, 5), Pos(20, 5), wall) is False
 
 
-def _payload_with_worker(payload_factory, pos: Pos) -> dict:
-    """构造工人位于指定坐标的 payload（配合多步寻路测试使用）"""
-    return payload_factory(
-        station=(20, 20),
-        roles=[{
-            "id": 10010,
-            "pos": {"x": pos.x, "y": pos.y},
-            "roleType": WORKER,
-            "health": 220,
-            "attackPower": 0,
-            "attackRange": 0,
-            "backPackCapability": 100,
-            "backpack": [],
-        }],
-        zones=[(STONE_MINE, 1, 0)],
-    )
+def test_stand_cells_are_adjacent_and_land(payload_factory, role_factory, zone_factory):
+    """落脚点必须在目标周围一格内、是空地、且当前空闲"""
+    turn, worker = _turn(payload_factory, role_factory)
+    cells = grid.stand_cells(turn, Pos(10, 10))
+    assert len(cells) == 8
+    for cell in cells:
+        assert max(abs(cell.x - 10), abs(cell.y - 10)) == 1
+        assert turn.is_land(cell)
+
+
+def test_stand_cells_filters_busy(payload_factory, role_factory):
+    turn, worker = _turn(payload_factory, role_factory)
+    busy = {Pos(9, 9), Pos(11, 11)}
+    cells = grid.stand_cells(turn, Pos(10, 10), busy=busy)
+    assert Pos(9, 9) not in cells
+    assert Pos(11, 11) not in cells
+
+
+def test_cells_in_radius_clips_to_map():
+    cells = grid.cells_in_radius(Pos(0, 0), 1, width=41, height=32)
+    assert Pos(-1, -1) not in cells
+    assert Pos(0, 1) in cells
+    assert len(cells) == 3
+
+
+def test_within_cone_matches_gatling_rule():
+    """加特林多目标必须在同一 90° 锥内（任务书 §4.5.4）"""
+    origin = Pos(10, 10)
+    anchor = Pos(13, 10)          # 正东
+    inside = Pos(13, 11)          # 东北 ~45°
+    outside = Pos(6, 13)          # 西北，与正东夹角 ~143° > 90°
+    assert grid.within_cone(origin, anchor, inside, 90) is True
+    assert grid.within_cone(origin, anchor, outside, 90) is False
+    assert grid.within_cone(origin, anchor, anchor, 90) is True
+
+
+def test_step_toward_any_picks_closest_goal(payload_factory, role_factory):
+    turn, worker = _turn(payload_factory, role_factory)
+    step = grid.step_toward_any(turn, worker, (Pos(20, 5), Pos(7, 5)))
+    assert step == Pos(6, 5)  # 朝更近的 (7,5) 走
