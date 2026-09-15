@@ -252,6 +252,7 @@ def test_learn_from_output_records_field_mapping():
 
 
 def test_learn_from_output_ignores_empty():
+    """什么都学不到的输出不许往事实区里塞东西"""
     from agent.strategy.task.solver import learn_from_output
 
     memory = Memory()

@@ -32,10 +32,33 @@ F_PARAM = "api.param"               # 查询参数名（location / city / …）
 F_FIELD_ALIAS = "api.field_alias"   # 中文字段说明 -> 记录字段名（JSON 串）
 F_ERA_ORDER = "api.era_order"       # 年代排序（JSON 串）
 F_TARGET = "task.target"            # 任务的目标参数（如"北京"）
+# 阶梯走完（`ladder_exhausted`）之后，到这个回合为止不再接任务点。
+# 它记的是**客户端自己**的故障，不是某个任务点的性质——换个任务点大概率
+# 同样走不通，继续扑上去只是再烧一遍路费（任务书 §5.3 的"任务点总要有人做"
+# 因此让位给"别把三个角色都搭进去"）。
+F_SUPPRESS_UNTIL = "task.suppress_until"
 F_ROOT = "sandbox.root"            # 任务根目录（侦察回来的）
 F_WS_ROOT = "sandbox.ws"            # 工程修复族的工作区路径
 F_SPEC_PATH = "sandbox.spec"        # 工程修复族的规格文件路径
 F_CHECK_CMD = "sandbox.check"       # 工程修复族的检查命令
+
+#: 设计文档V2 §6.2 那张"从对战日志中已经确证"的接口档案，**只作为文档保留**。
+#:
+#: 早先的实现把它内置成种子事实（`SEED_FACTS`），第一轮就带着
+#: `Authorization: Bearer …` / `location` 去打——那样确实能过实测那道题，
+#: 但**过题靠的是"我们事先知道答案"**，换一套接口、换一个字段名就废了。
+#:
+#: 现在的做法是把它降级成 `scripts._QUERY` 的**验证样例**：客户端不预置任何
+#: 接口知识，而是把服务端自己的报错当成线索——试 → 读 401/400 的响应体 →
+#: 补上新候选 → 再试。表里这些值应当能从沙盒回包里被**重新发现**出来，
+#: 这才是那一族题真正的解法（见 `task/scripts.py` 的 `learn_from_error`）。
+CONFIRMED_API_PROFILE: dict[str, str] = {
+    "endpoint": "/api/v1/heritage/search",
+    "auth": "Authorization: Bearer heritage-api-key-2024",
+    "param": "location",
+    "record_field": "protected_level",
+    "response": '{"code":200,"data":{"records":[…],"pagination":{"total_count":N}}}',
+}
 
 
 class RunState(str, Enum):

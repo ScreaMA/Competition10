@@ -191,7 +191,9 @@ def _run_body(command: str, cwd) -> str:
     那是**测试脚手架**的问题，不是脚本的问题（判题器跑在 Linux 上）。
     """
     script = cwd / "_generated_script.py"
-    script.write_text(_body(command), encoding="utf-8")
+    # newline=""：Windows 上默认会把 \n 翻成 \r\n，那样脚本自己就成了一个
+    # "带 CRLF 的文件"，会被 normalize 步顺手改掉，把 crlf 计数搅浑
+    script.write_text(_body(command), encoding="utf-8", newline="")
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     proc = subprocess.run(
         [sys.executable, "-u", str(script)],
@@ -253,21 +255,50 @@ STUB_RECORDS = [
 ]
 
 
+class StubApi:
+    """模拟沙盒里那个接口；`accepts` 决定服务端实际认哪个头
+
+    `accepts` 与文档里写的是**两回事**——这正是实测报文里的坑：文档写
+    `X-API-Key: <key>`，服务端只认 `Authorization: Bearer <key>`，于是
+    "抄对了密钥"照样 401（任务原文自己就提示"文档中的部分字段内容已经发生
+    变化，描述不再准确"）。
+    """
+
+    def __init__(self, base: str):
+        self.base = base
+        self.accepts = "X-API-Key"
+        self.hits: list[str] = []
+
+    def authorized(self, headers) -> bool:
+        if self.accepts == "X-API-Key":
+            return headers.get("X-API-Key") == STUB_KEY
+        if self.accepts == "Bearer":
+            return headers.get("Authorization") == "Bearer " + STUB_KEY
+        return False
+
+    def missing_message(self) -> str:
+        return ("Missing 'X-API-Key' header"
+                if self.accepts == "X-API-Key"
+                else "Missing 'Authorization' header")
+
+
 @pytest.fixture
 def stub_api():
     """模拟沙盒里那个"端点存在、但不带鉴权就 401"的接口
 
     复刻实测报文里的三个特征：
-      1. 端点要 `X-API-Key`，不带就 401；
+      1. 端点要鉴权头，不带就 401（默认认 `X-API-Key`，可用 `.accepts` 改成
+         `Bearer` 来复刻"文档过时"）；
       2. 任务文档里给的"接口地址"是**带查询串的示例**；
       3. 查询参数是中文，需要转义。
     """
+    api = StubApi("http://127.0.0.1:0")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 —— BaseHTTPRequestHandler 的接口
             parsed = urlsplit(self.path)
-            if self.headers.get("X-API-Key") != STUB_KEY:
-                self._reply(401, {"error": "Missing 'X-API-Key' header"})
+            if not api.authorized(self.headers):
+                self._reply(401, {"error": api.missing_message()})
                 return
             if parsed.path != "/api/v1/heritage/search":
                 self._reply(404, {"error": "no such endpoint"})
@@ -275,6 +306,7 @@ def stub_api():
             if parse_qs(parsed.query).get("city") != ["北京"]:
                 self._reply(200, {"total": 0, "records": []})
                 return
+            api.hits.append(self.path)
             self._reply(200, {"total": len(STUB_RECORDS), "records": STUB_RECORDS})
 
         def _reply(self, status: int, payload: dict) -> None:
@@ -292,8 +324,9 @@ def stub_api():
     httpd.daemon_threads = True
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
+    api.base = "http://127.0.0.1:%d" % httpd.server_address[1]
     try:
-        yield "http://127.0.0.1:%d" % httpd.server_address[1]
+        yield api
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -352,7 +385,7 @@ def test_query_script_end_to_end_against_stub_api(stub_api, tmp_path):
     修好之前这条用例必然失败：记录取不到，答案里每个聚合字段都是空/零。
     """
     (tmp_path / "task_1_alpha.md").write_text(
-        _query_task_doc(stub_api), encoding="utf-8"
+        _query_task_doc(stub_api.base), encoding="utf-8"
     )
     step = StepSpec("query").with_params(ws=str(tmp_path))
     out = _run_body(
@@ -373,4 +406,74 @@ def test_query_script_end_to_end_against_stub_api(stub_api, tmp_path):
     assert answer["world_heritage_count"] == 2
     assert answer["types"] == ["古建筑", "古遗址"]
     assert answer["oldest_era"] == "周口店遗址"
+
+
+def test_query_survives_stale_header_name(stub_api, tmp_path):
+    """文档写的头名过时了，也要能连上（每个值再派生 Bearer 形态）
+
+    实测报文里就是这个形态：从 `API_DOCS.md` 抄到的 `X-API-Key: <key>` 四次
+    全 401，而同一次请求在历史记录里留下的真实报错是
+    `Missing 'Authorization' header` —— **值是对的，头名过时了**。
+    任务原文自己就提示"文档中的部分字段内容已经发生变化，描述不再准确"。
+
+    修好之前这条必然失败：候选里只有 `X-API-Key`，服务端只认 Bearer，
+    取数 0 条，交上去一份 `total_count: 0` 的废卷。
+    """
+    stub_api.accepts = "Bearer"          # 服务端只认 Authorization
+    (tmp_path / "task_1_alpha.md").write_text(
+        _query_task_doc(stub_api.base), encoding="utf-8"   # 文档只写了 X-API-Key
+    )
+    step = StepSpec("query").with_params(ws=str(tmp_path))
+    out = _run_body(
+        scripts.build(step, phase_task="请阅读task_1_alpha.md，获取任务信息", facts={}),
+        tmp_path,
+    )
+
+    assert "[API]" in out and "status=200" in out, out
+    answer = json.loads(re.search(r"^\[ANSWER\] (\{.*\})$", out, re.M).group(1))
+    assert answer["total_count"] == 3
+    assert answer["world_heritage_count"] == 2
+
+
+def test_apifail_carries_response_body(stub_api, tmp_path):
+    """401 必须把**响应体**打出来——只报"鉴权没过"说明不了服务端要什么头"""
+    stub_api.accepts = "never"           # 怎么试都不认
+    (tmp_path / "task_1_alpha.md").write_text(
+        _query_task_doc(stub_api.base), encoding="utf-8"
+    )
+    step = StepSpec("query").with_params(ws=str(tmp_path))
+    out = _run_body(
+        scripts.build(step, phase_task="请阅读task_1_alpha.md，获取任务信息", facts={}),
+        tmp_path,
+    )
+
+    assert "reason=missing_auth" in out, out
+    assert "body=" in out, out
+    assert "Missing" in out and "header" in out, out
+
+
+def test_normalize_actually_fixes_crlf(tmp_path):
+    """normalize 步必须真的把 CRLF 修掉
+
+    故障：`read()` 是文本模式，universal newlines 在**读的时候**就把 `\\r\\n`
+    变成了 `\\n`，于是 `if "\\r" not in body` 恒真 —— `[FIX] crlf=0` 修了个寂寞。
+    而工程修复族的 `check` 脚本 shebang 上带着 `\\r`，内核直接拒执行
+    （`/bin/sh^M: bad interpreter`，code=126），verify 永远拿不到 TOKEN，
+    整条链路必 0 分（实测报文两轮都是 `[FIX] crlf=0` + `code=126`）。
+    """
+    ws = tmp_path / "ws_1"
+    (ws / "bin").mkdir(parents=True)
+    spec = ws / "spec.md"
+    spec.write_text("## 目录要求\n- logs/alpha/ 必须存在\n", encoding="utf-8")
+    check = ws / "check"
+    check.write_bytes(b"#!/bin/sh\r\nexit 0\r\n")
+    start = ws / "bin" / "start.sh"
+    start.write_bytes(b"#!/bin/sh\r\necho hi\r\n")
+
+    step = StepSpec("normalize").with_params(ws=str(ws), spec=str(spec), check=str(check))
+    out = _run_body(scripts.build(step, phase_task="", facts={}), ws)
+
+    assert "crlf=2" in out, out
+    assert b"\r" not in check.read_bytes()
+    assert b"\r" not in start.read_bytes()
 

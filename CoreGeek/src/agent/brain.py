@@ -307,12 +307,19 @@ def _fill_idle(
 
     白天只在**天快黑且路不够走**时才回防（`dusk_recall`），其余时候角色该
     干活干活——不然一整天都在塔旁边站着，经济和防线都没了。
+
+    但**开拓者是例外**：它既不能采集也不能建造（任务书 §4.4），任务没在身时
+    白天空转是纯粹的浪费。所以给它挂上"提前站到武器旁边"——天黑那一下不用
+    再跑一趟，直接就能开火。这条恰好也是"任务失败之后"该有的姿态：
+    `ladder_exhausted` 会让任务链路主动空一段时间（见 `solver._abandon`），
+    空出来的开拓者就该去补防线，而不是原地站着。
     """
+    pioneer_ids = {unit.unit_id for unit in world.turn.pioneers()}
     for unit in world.turn.characters():
         if unit.unit_id in used:
             continue
         command = defense.dusk_recall(world, unit, claimed)
-        if command is None and world.turn.is_day:
+        if command is None and world.turn.is_day and unit.unit_id not in pioneer_ids:
             continue
         if command is None:
             command = defense.guard_weapon(world, unit, claimed)

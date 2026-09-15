@@ -74,6 +74,12 @@ AUTH_MAX_TRIES = 6
 # 次数上限设成 10 反而成了瓶颈：枚举空间是 base×path×param×auth，
 # 10 次连一个 base 都试不完。这里放宽到 40，让秒级预算去兜底。
 HTTP_MAX_CALLS = 40
+
+# 候选矩阵最多重打几轮。每一轮结束后，如果从失败响应里读到了新候选
+# （缺哪个头 / 缺哪个参数），就带着它们再打一轮——这是"文档过时"那一族的
+# **通用解法**：不靠内置答案，靠服务端自己说缺什么。留 3 轮足够：
+# 实测那道题第一轮学参数名、第二轮就打中了。
+HTTP_MAX_ROUNDS = 3
 BODY_LIMIT = 3000  # 单条标记正文的上限
 DEFAULT_BASE = "http://localhost:8899"  # 对战日志实测的本地服务地址
 CHECK_TIMEOUT = 5.0  # 工程修复族跑 check 的秒数上限
@@ -94,10 +100,15 @@ HTTP_TIMEOUT = P["http_timeout"]
 HTTP_BUDGET = P["http_budget"]
 HTTP_MAX_CALLS = P["http_max_calls"]
 AUTH_MAX_TRIES = P["auth_max_tries"]
+HTTP_MAX_ROUNDS = P["http_max_rounds"]
 CHECK_TIMEOUT = P["check_timeout"]
 ROOTS = P["roots"]
 MAX_ENTRIES = P["max_entries"]
 DEFAULT_BASE = P["default_base"]
+
+# 跑 shell 片段用的解释器。沙盒上就是 /bin/sh；本地开发机（Windows）退到 PATH
+# 里的 sh（Git Bash 提供），好让整条任务链路在提交前能真的跑一遍。
+SHELL = "/bin/sh" if os.path.exists("/bin/sh") else "sh"
 
 
 def emit(tag, text="", **pairs):
@@ -153,9 +164,17 @@ def kv(tag, **pairs):
 
 
 def read(path, limit=None):
-    """读文件；读不到返回空串（沙盒里权限与路径都不可控）"""
+    """读文件；读不到返回空串（沙盒里权限与路径都不可控）
+
+    **`newline=""` 不能省。** 文本模式默认开 universal newlines，`\r\n` 会在
+    **读的时候**就被翻译成 `\n`——于是"这个文件有没有 CRLF"这类判断永远为假。
+    实测代价：normalize 步的 `if "\\r" not in body: continue` 恒真，
+    `[FIX] crlf=0` 修了个寂寞，而工程修复族的 `check` 脚本 shebang 上带着
+    `\\r`，内核直接拒执行（`/bin/sh^M: bad interpreter`，code=126），
+    verify 也就永远拿不到 TOKEN——整条工程修复链路必 0 分。
+    """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
             text = fh.read()
     except Exception:
         return ""
@@ -674,13 +693,49 @@ for match in re.findall(r"(Bearer\s+[A-Za-z0-9._\-]{8,})", text):
 
 # 3) 兜底：把文档里"名字像密钥"的字符串**本身**当值。它最容易产出垃圾候选
 #    （`X-API-Key: X-API-Key` 这种自指头），所以只在前面什么都没抄到时才走，
-#    并且要求长度够、不能本身就是个头名。
+#    并且要求长度够、**不能本身就是个头名**——
+#    判据是"该串在文档里是不是以 `名:` 的形态出现过"，而不是"长得像不像头名"。
+#    用后者会把 `heritage-api-key-2024` 也误杀（它自带 key 字样），
+#    实测就踩过：候选从 1 个正值掉成 0 个，只能去试裸请求。
 if not auths:
     for match in re.findall(
         r"([A-Za-z0-9_\-]*(?:key|token|secret)[A-Za-z0-9_\-]*)", text, re.I
     ):
-        if len(match) >= 12 and not AUTH_HEADER_RE.fullmatch(match):
-            auths.append("X-API-Key: " + match)
+        if len(match) < 12:
+            continue
+        if re.search(r"\b%s\s*[:=]" % re.escape(match), text):
+            continue  # 它在文档里是头名，不是值
+        auths.append("X-API-Key: " + match)
+
+# 4) **每个抄下来的值再派生两种常见头形态。**
+#    "文档写 X-API-Key、服务端只认 Authorization: Bearer"是这类任务最常见的
+#    一个坑——任务原文自己就提示"文档中的部分字段内容已经发生变化，描述不再
+#    准确"。实测报文里文档给的 `X-API-Key: <key>` 四次全 401，而同一次请求
+#    conftest 记下来的真实报错是 `Missing 'Authorization' header`：
+#    值是对的，**头名过时了**。派生变体等于在同一条命令里把两种头都试一遍。
+#
+#    `secret_values` 在派生**之前**快照：后面 `learn_from_error` 学到一个新头名
+#    时要拿"原始密钥值"去拼候选，**不能把派生出来的再喂回去**——那会滚雪球
+#    （`Authorization: Bearer X` 的值是 `Bearer X`，再派生又变成 `Bearer Bearer X`…），
+#    实测会把 `auths` 撑爆、正确组合被挤出 `auths[:AUTH_MAX_TRIES]`，40 次全打空。
+secret_values = []
+for item in auths:
+    _, sep, value = item.partition(":")
+    value = value.strip().strip('"')
+    if sep and value and value not in secret_values:
+        secret_values.append(value)
+
+expanded = []
+for item in auths:
+    expanded.append(item)
+    name, sep, value = item.partition(":")
+    if not sep:
+        continue
+    value = value.strip().strip('"')
+    if value:
+        expanded.append("X-API-Key: " + value)
+        expanded.append("Authorization: Bearer " + value)
+auths = expanded
 
 # 去重（保序）。重复的候选只会白烧调用次数——`api_calls` 是有预算的。
 deduped = []
@@ -696,55 +751,148 @@ kv("PARSE", target=target, bases=len(bases), paths=len(paths),
    params=len(params), auths=len(auths))
 
 # --- 3. 逐个候选调用接口（这一步必然发生，不存在"只读题不调接口"）---
+#
+# **这一族的题眼是"文档过时"，所以候选矩阵不是终点，服务端自己的报错才是。**
+# 过程：先按文档给的候选打一轮 → 把失败响应里的名字读出来 → 补进候选再来一轮。
+# 换一套接口、换一批字段名，同一段逻辑照样收敛；**没有任何写死的接口知识**。
+#
+# 这条通道是被一次实测逼出来的：从 `API_DOCS.md` 抄到的
+# `X-API-Key: heritage-api-key-2024` 四次全 401、换个参数名又全 400，
+# 一次都没连上，最后交了一份 `total_count: 0` 的废卷（16/80 分）。
+# 而两次失败的服务端回包把答案写得清清楚楚：
+#     {"code":401,"message":"Missing or invalid 'Authorization' header",…}
+#     {"code":400,"message":"请求参数错误：缺少 'location'"}
+# 我们只是**没去读**。
 
 records = []
 chosen = {}
 calls = 0
+learned: list[str] = []
 tried = []
+
+# 错误响应里的"名字"：`'X' header` / `header: 'X'` / `expects: X` / `参数…'X'`
+_HINT_HEADER = (
+    re.compile(r"['\"`]([A-Za-z][A-Za-z0-9_\-]{2,30})['\"`]\s*(?:header|头)", re.I),
+    re.compile(r"(?:header|头名?)\s*[:：]?\s*['\"`]([A-Za-z][A-Za-z0-9_\-]{2,30})['\"`]", re.I),
+    re.compile(r"(?:expects?|expected|require[sd]?)\s*[:：]?\s*([A-Za-z][A-Za-z0-9_\-]{2,30})", re.I),
+)
+_HINT_PARAM = (
+    re.compile(r"['\"`]([A-Za-z][A-Za-z0-9_\-]{2,30})['\"`]\s*(?:参数|parameter|param)", re.I),
+    re.compile(r"(?:参数|parameter|param|field|字段)[^0-9]{0,16}['\"`]([A-Za-z][A-Za-z0-9_\-]{2,30})['\"`]", re.I),
+)
+
+
+def learn_from_error(body):
+    """从失败响应里读出"它还想要什么"，返回 ('header'|'param', 名字)
+
+    只看**服务端自己写的字**，不猜。抽不出来就返回 None，下一轮不再重复问。
+    """
+    text = str(body or "")
+    for pattern in _HINT_HEADER:
+        match = pattern.search(text)
+        if match:
+            return "header", match.group(1)
+    for pattern in _HINT_PARAM:
+        match = pattern.search(text)
+        if match:
+            return "param", match.group(1)
+    return None
+
+
+def header_values():
+    """抄自文档的**原始密钥值**（不含我们派生出来的那些，见上面的说明）"""
+    return secret_values
 
 
 def stop():
     return bool(records) or calls >= HTTP_MAX_CALLS or time.time() - T0 > HTTP_BUDGET
 
 
-for base in bases[:3]:
-    host, prefix = split_base(base)
-    for path in paths[:5]:
-        if path == "/" and prefix:
-            continue
-        url_path = join(host, prefix, path)
-        for param in params[:3]:
-            for auth in auths[:AUTH_MAX_TRIES]:
+def apply_hint(hint):
+    """把线索补进候选列表；返回有没有真的补进去（没有就别再空转一轮）
+
+    **补到最前面**：服务端刚说过"我要这个"，那就先试它——否则新候选会排在
+    文档候选后面，白白再打一圈（实测里 7 座城平均 20+ 次调用，插到最前面
+    之后降到个位数）。这也是"读报错"这件事该有的优先级。
+    """
+    kind, name = hint
+    if kind == "param":
+        if name in params:
+            return False
+        params.insert(0, name)
+        learned.append("param=" + name)
+        return True
+    added = []
+    for value in header_values():
+        # 服务端只说"用这个名字的头"，没说值怎么渲染。两种最常见的形式都试：
+        # 原样 `<value>`，以及带 `Bearer ` 前缀的。**不特判名字**——特判
+        # `Authorization` 就等于把"哪些头要加 Bearer"写死了，换个名字就废。
+        for form in (value, "Bearer " + value):
+            candidate = "%s: %s" % (name, form)
+            if candidate not in auths and candidate not in added:
+                added.append(candidate)
+    if not added:
+        return False
+    for offset, candidate in enumerate(added):
+        auths.insert(offset, candidate)
+    learned.append("header=" + name)
+    return True
+
+
+for _round in range(HTTP_MAX_ROUNDS):
+    calls_before = calls
+    for base in bases[:3]:
+        host, prefix = split_base(base)
+        for path in paths[:5]:
+            if path == "/" and prefix:
+                continue
+            url_path = join(host, prefix, path)
+            for param in params[:4]:
+                for auth in auths[:AUTH_MAX_TRIES]:
+                    if stop():
+                        break
+                    query = urllib.parse.urlencode({param: target, "limit": 100})
+                    url = "%s?%s" % (url_path, query)
+                    headers = {"Accept": "application/json"}
+                    if auth:
+                        name, _, value = auth.partition(":")
+                        headers[name.strip()] = value.strip()
+                    calls += 1
+                    status, body = http_get(url, headers, HTTP_BUDGET)
+                    tried.append("%s%s" % (status, path))
+                    if str(status) == "200":
+                        found = records_from(body)
+                        if found:
+                            records = found
+                            chosen = {"host": host, "prefix": prefix, "path": path,
+                                      "param": param, "auth": auth, "url": url}
+                            kv("API", url=url, status=200,
+                               auth=("yes" if auth else "no"), n=len(found))
+                            break
+                        kv("APIFAIL", url=url, status=200, reason="no_records")
+                        continue
+                    reason = "missing_auth" if str(status) in ("401", "403") else "http"
+                    # 响应体必须带上：401/400 说明不了"它要什么"，服务端自己
+                    # 才说得清。这一条既是复盘证据，也是下面 apply_hint 的输入。
+                    kv("APIFAIL", url=url, status=status, reason=reason,
+                       body=" ".join(str(body).split())[:200])
+                    hint = learn_from_error(body)
+                    if hint:
+                        apply_hint(hint)
                 if stop():
                     break
-                query = urllib.parse.urlencode({param: target, "limit": 100})
-                url = "%s?%s" % (url_path, query)
-                headers = {"Accept": "application/json"}
-                if auth:
-                    name, _, value = auth.partition(":")
-                    headers[name.strip()] = value.strip()
-                calls += 1
-                status, body = http_get(url, headers, HTTP_BUDGET)
-                tried.append("%s%s" % (status, path))
-                if str(status) == "200":
-                    found = records_from(body)
-                    if found:
-                        records = found
-                        chosen = {"host": host, "prefix": prefix, "path": path,
-                                  "param": param, "auth": auth, "url": url}
-                        kv("API", url=url, status=200,
-                           auth=("yes" if auth else "no"), n=len(found))
-                        break
-                    kv("APIFAIL", url=url, status=200, reason="no_records")
-                else:
-                    reason = "missing_auth" if str(status) in ("401", "403") else "http"
-                    kv("APIFAIL", url=url, status=status, reason=reason)
             if stop():
                 break
         if stop():
             break
-    if stop():
+
+    # 一轮打完：没进展（没学到新候选）就收手，别空转
+    if stop() or calls == calls_before or not learned:
         break
+    learned = []          # 新一轮开始，允许再次学习
+
+if learned:
+    kv("LEARN", learned=",".join(learned[:6]))
 
 kv("SCAN", api_calls=calls, hits=len(records), tried="|".join(tried[:8]))
 
@@ -824,18 +972,29 @@ finish("query", "calls=%d records=%d fields=%d" % (calls, len(records), len(answ
 # locate()：定位工作区、规格文件与检查脚本。三个步骤脚本共用。
 _ENGINEER_LOCATE = r'''
 def locate():
-    """定位工作区、规格文件、检查脚本；已知就跳过扫描（省时间）"""
+    """定位工作区、规格文件、检查脚本
+
+    **返回值里的 `files` 是调用方要用的"工作区文件清单"，任何时候都不能是空的
+    （除非工作区真的是空的）。** 早先的写法是"三个路径都已知就直接 `return [], []`
+    ——省一次目录扫描"，但调用方拿 `files` 当文件清单用：normalize 靠它逐文件
+    修 CRLF，repair 靠它逐文件改配置。退空列表等于这两步从**第二个任务起全部
+    空转**（实测报文里 `[FIX] crlf=0 chmod=2` 之后紧接着 `actions=0 applied=0`）。
+
+    省时间的正确做法不是退空，而是**只扫工作区**：WS 已知时它是十几个文件，
+    比从 ROOTS 逐级扫全盘便宜得多。
+    """
     global WS, SPEC, CHECK
-    if WS and SPEC and CHECK:
-        return [], []
     budget_start = time.time()
     files, dirs = [], []
-    for root in ROOTS:
-        if not exists(root):
-            continue
-        files, dirs = walk(root, 5, budget_start)
-        if files or dirs:
-            break
+    if WS:
+        files, dirs = walk(WS, 5, budget_start)
+    else:
+        for root in ROOTS:
+            if not exists(root):
+                continue
+            files, dirs = walk(root, 5, budget_start)
+            if files or dirs:
+                break
     if not WS:
         candidates = [d for d in dirs if os.path.basename(d).startswith("ws_")]
         if not candidates:
@@ -863,10 +1022,21 @@ def locate():
 
 
 def run(cmd, cwd=None, timeout=None):
-    """跑一条命令，返回 (退出码, 合并输出)"""
+    """跑一条命令，返回 (退出码, 合并输出)
+
+    **显式走 `sh -c`，不用 `shell=True`。** 这里下发的每一条都是 POSIX shell
+    片段（`./check`、`sh <path>`、`cd && …`），而 `shell=True` 取的是**平台默认
+    shell**——沙盒上是 `/bin/sh`，到了开发机上就是 cmd.exe，于是同一段代码在
+    本地跑出来的结论和沙盒里不一样（`'...\\check' 不是内部或外部命令`）。
+    沙盒就是 Linux，两种写法在那边逐字节等价；显式写出来只是把"这条命令该由谁
+    解释"从环境约定变成代码里看得见的东西。
+
+    `SHELL` 常量在本地开发机上解析到 Git Bash 的 `sh`，好让整套任务链路能在
+    提交前真的跑一遍。
+    """
     try:
         proc = subprocess.run(
-            cmd, shell=True, cwd=cwd, timeout=(timeout or CHECK_TIMEOUT),
+            [SHELL, "-c", cmd], cwd=cwd, timeout=(timeout or CHECK_TIMEOUT),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
         return proc.returncode, proc.stdout.decode("utf-8", "replace")
@@ -951,6 +1121,90 @@ files, dirs = locate()
 spec_text = read(SPEC) if SPEC else ""
 actions = []
 
+
+def chmod(path, mode):
+    """改权限；失败就算了（有的文件系统不支持）"""
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+
+
+def write(path, text):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        return True
+    except Exception:
+        return False
+
+
+# ---- 按 spec 逐条修 ------------------------------------------------
+#
+# **spec 就是修复清单，照它做比猜键值对可靠得多。** 实测 spec 的形状是：
+#
+#     ## 目录要求
+#     - logs/alpha/ 必须存在，权限为 755
+#     ## 配置文件 config/alpha.conf
+#     - 第 3 行：`port 8080`
+#     - 第 6 行：`name alpha-app`
+#     ## 脚本要求
+#     - bin/start.sh 必须存在且可执行（权限 755）
+#
+# 旧实现只找得到 `键: 值` 这种形态，于是 `wanted` 为空、`applied=0`——
+# 实测报文里工程修复族从头到尾一个字节都没改过（`[FIX] actions=0 applied=0`），
+# 换来的是 `./check` 一直失败、任务 0 分。
+section_file = ""
+for raw in spec_text.splitlines():
+    line = raw.strip()
+
+    head = re.match(r"#+\s*(?:配置文件|文件)\s*[`\s]*([\w./\-]+)", line)
+    if head:
+        section_file = head.group(1).strip("`")
+        continue
+
+    # 目录：`- logs/alpha/ 必须存在，权限为 755`
+    match = re.match(r"[-*]\s*`?([\w./\-]+)/`?\s*必须存在", line)
+    if match and WS:
+        folder = os.path.join(WS, match.group(1))
+        if not exists(folder):
+            try:
+                os.makedirs(folder, exist_ok=True)
+                actions.append("mkdir:" + match.group(1))
+            except Exception:
+                pass
+        chmod(folder, 0o755)
+
+    # 文件：`- bin/start.sh 必须存在且可执行（权限 755）`
+    match = re.match(r"[-*]\s*`?([\w./\-]+)`?\s*必须存在", line)
+    if match and WS:
+        target = os.path.join(WS, match.group(1))
+        if not exists(target):
+            if write(target, "#!/bin/sh\n"):
+                actions.append("create:" + match.group(1))
+        chmod(target, 0o755)
+
+    # 配置文件按**行号**改：`- 第 3 行：`port 8080``
+    match = re.match(
+        r"[-*]\s*第\s*(\d+)\s*行\s*[:：]\s*`?(.+?)`?\s*$", line
+    )
+    if match and WS and section_file:
+        path = os.path.join(WS, section_file)
+        body = read(path)
+        rows = body.split("\n")
+        index = int(match.group(1)) - 1
+        want = match.group(2).strip().strip("`")
+        if 0 <= index < len(rows) and rows[index] != want:
+            rows[index] = want
+            if write(path, "\n".join(rows)):
+                actions.append("line%d:%s" % (index + 1, want))
+
+# ---- 兜底：从 check 输出里捞 "权限不够" 的路径，以及 spec 里写的 键=值 ----
+
 for match in re.findall(r"([\w./\-]+): Permission denied", OUT):
     try:
         os.chmod(match, 0o755)
@@ -963,26 +1217,6 @@ for match in re.findall(r"Permission denied[^'\"]*['\"]([^'\"]+)['\"]", OUT):
         actions.append("chmod:" + match)
     except Exception:
         pass
-
-for name in ("logs", "log", "output", "out", "data", "tmp", "run", "result"):
-    if not WS:
-        break
-    folder = os.path.join(WS, name)
-    if re.search(r"\b%s\b" % name, OUT + spec_text) and not exists(folder):
-        try:
-            os.makedirs(folder, exist_ok=True)
-            os.chmod(folder, 0o777)
-            actions.append("mkdir:" + name)
-        except Exception:
-            pass
-    elif exists(folder):
-        try:
-            for entry in os.listdir(folder)[:30]:
-                full = os.path.join(folder, entry)
-                if os.path.isfile(full):
-                    os.chmod(full, 0o666)
-        except Exception:
-            pass
 
 wanted = {}
 for key_, value in re.findall(
@@ -1009,14 +1243,10 @@ for path in files:
             applied += 1
             actions.append("set:%s" % key_)
     if updated != body:
-        try:
-            with open(path, "w", encoding="utf-8", newline="") as fh:
-                fh.write(updated)
-        except Exception:
-            pass
+        write(path, updated)
 
 emit("FIX", "actions=%d applied=%d %s" % (len(actions), applied, ",".join(actions[:8])))
-finish("repair", "applied=%d" % applied)
+finish("repair", "applied=%d" % (len(actions) + applied))
 '''
 
 _ENGINEERING_VERIFY = r'''
@@ -1154,6 +1384,7 @@ def _params(step: StepSpec, phase_task: str, facts: dict[str, str], extra: dict)
         "http_budget": HTTP_BUDGET,
         "http_max_calls": HTTP_MAX_CALLS,
         "auth_max_tries": AUTH_MAX_TRIES,
+        "http_max_rounds": HTTP_MAX_ROUNDS,
         "check_timeout": CHECK_TIMEOUT,
         "roots": SEARCH_ROOTS,
         "max_entries": DIR_MAX_ENTRIES,

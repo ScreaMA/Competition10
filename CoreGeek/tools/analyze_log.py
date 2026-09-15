@@ -325,9 +325,14 @@ class Stats:
                 "skill_saved": "技能入库",
                 "gate_reject": "答案被闸门拦下",
                 "llm_exec": "执行 LLM 兜底命令",
+                "llm_command": "拿到 LLM 兜底命令",
                 "sandbox_slow": "沙盒超时",
                 "learn": "学到新事实",
-                "rewind": "回退到取数步骤",
+                "family": "重新判族",
+                # 别写死成"回退到取数步骤"：detail 才是回退目标，工程修复族
+                # 回的是 check（`back_to_check#N`），api-query 族才回 query。
+                "rewind": "回退重试",
+                "suppress": "任务点抑制（阶梯走完后不再接）",
             }.get(name, name)
             detail = event.get("detail", "")
             suffix = f"（{detail}）" if detail else ""

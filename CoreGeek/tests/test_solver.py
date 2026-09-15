@@ -212,6 +212,101 @@ def test_engineering_ladder_advances_on_check_marker(
     assert any("advanced=check reason=ok" in e for e in plan.events), plan.events
 
 
+def test_ladder_exhausted_suppresses_next_task_point(
+    payload_factory, base_roles, task_factory
+):
+    """阶梯走完 ⇒ 这是**客户端自己**的故障，别再立刻扑下一个任务点
+
+    实测报文：第一个任务（api-query）R16 因 `ladder_exhausted` 放弃，开拓者
+    立刻走 4 个回合去接第二个任务点（engineering-fix），又在上面耗了 11 个
+    回合——两个任务点是不同的族，却栽在同一处客户端缺陷上，合计 ~15 个回合
+    颗粒无收。换个任务点大概率同样走不通，先退回经济与防守才是止损。
+    """
+    solver = TaskSolver()
+    from agent.strategy.task import solver as solver_mod
+    quiet = "[exitCode:0]\n[SCAN] files=2\n[DONE] step=recon elapsed=0.00s\n"
+    phase = "请阅读task_1_a.md，获取任务信息"
+
+    def round_at(no, output=""):
+        return solver.plan(_world(
+            payload_factory, round_no=no, roles=base_roles,
+            player_tasks=_task_point(task_factory), phase_task=phase,
+            last_cmd_result=output,
+        ))
+
+    round_at(10)
+    plan = None
+    abandoned = None
+    for round_no in range(11, 30):
+        plan = round_at(round_no, quiet)
+        if plan.action == Action.ABANDON:
+            abandoned = round_no
+            break
+    assert abandoned is not None, "阶梯始终没耗尽"
+    assert "ladder_exhausted" in plan.note, plan.note
+    assert any("suppress" in event for event in plan.events), plan.events
+
+    # 抑制期内：**任务点可接也不去接**，把角色还给经济与防守
+    def schedule_at(no):
+        return solver.plan(_world(
+            payload_factory, round_no=no, roles=base_roles,
+            player_tasks=_task_point(task_factory), phase_task="",
+        ))
+
+    assert schedule_at(abandoned + 1).note.startswith("task_suppressed")
+    assert schedule_at(abandoned + 10).note.startswith("task_suppressed")
+    # 抑制期一过照常接（这里开拓者离任务点很远 ⇒ 先 travel）
+    assert not schedule_at(
+        abandoned + solver_mod.LADDER_FAIL_SUPPRESS_ROUNDS
+    ).note.startswith("task_suppressed")
+
+
+def test_idle_pioneer_pre_positions_at_tower(payload_factory, role_factory):
+    """任务没在身时，开拓者白天也要提前站到武器旁边
+
+    任务书 §4.4：采集与建造**都只有工人能做**，开拓者空转就是纯浪费。
+    这条同时是"任务失败之后"该有的姿态——`ladder_exhausted` 会让任务链路
+    主动空一段时间（见上一条），空出来的开拓者去补防线，而不是原地站着。
+    """
+    response = decide(payload_factory(
+        round_no=30,   # 第 1 天白天，离天黑还远（`dusk_recall` 不会触发）
+        roles=[
+            role_factory(10013, "station", 20, 10),
+            role_factory(10011, "pioneer", 20, 20),
+            role_factory(10020, "gatling", 23, 10),
+        ],
+    ))
+    command = response["roleCommandMap"].get("10011")
+    assert command is not None, "开拓者被空转了"
+    assert command["action"] == "move", command
+    assert command["targetPos"][0]["y"] < 20, command  # 朝塔（y=10）走
+
+
+def test_idle_worker_keeps_working_during_day(
+    payload_factory, role_factory, zone_factory
+):
+    """但**工人**白天不该被按到塔边——那等于放弃经济
+
+    它是建造工、身上没有石头、金币为 0 ⇒ 该去最近的石矿（在 (27,17)），
+    而不是朝塔（在 (23,10)）走。
+    """
+    response = decide(payload_factory(
+        round_no=30,
+        gold=0,
+        roles=[
+            role_factory(10013, "station", 20, 10),
+            role_factory(10010, "worker", 25, 15),
+            role_factory(10020, "gatling", 23, 10),
+        ],
+        zones=[zone_factory("stone", 27, 17)],
+    ))
+    command = response["roleCommandMap"].get("10010")
+    assert command is not None, "工人被空转了"
+    assert command["action"] == "move", command
+    # 朝矿走（y 增大），不是朝塔走（y 减小）
+    assert command["targetPos"][0]["y"] > 15, command
+
+
 def test_replay_real_task_sequence_reaches_submit(
     payload_factory, role_factory, task_factory
 ):

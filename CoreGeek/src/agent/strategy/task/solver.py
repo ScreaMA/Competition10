@@ -49,6 +49,7 @@ from .memory import (
     F_FIELD_ALIAS,
     F_PARAM,
     F_SPEC_PATH,
+    F_SUPPRESS_UNTIL,
     F_TARGET,
     F_WS_ROOT,
     MEMORY,
@@ -135,6 +136,20 @@ LLM_STALL_ROUNDS = 2
 
 # 任务点冷却快结束时提前去旁边等的余量：剩余冷却 ≤ 路程 + 这个余量就出发
 WAIT_MARGIN_ROUNDS = 3
+
+# 阶梯走完（`ladder_exhausted`）之后，冷却多少回合不再接任务点。
+#
+# 这是**止损**不是认输：`ladder_exhausted` 意味着"确定性阶梯 + LLM 兜底 +
+# 通用探测"三条路都没走通，那是**客户端自己**出了故障，不是某个任务点的性质。
+# 换个任务点大概率同样走不通，继续扑上去只是再烧一遍路费。
+#
+# 实测报文里正是这个形态：第一个任务（api-query）R16 因此放弃，开拓者立刻走
+# 4 个回合去接第二个任务点（engineering-fix），又在上面耗了 11 个回合——
+# 两个任务点是不同的族，却栽在同一处客户端缺陷上，合计 ~15 个回合颗粒无收。
+#
+# 取 15（= 一个任务的超时回合数）：够久到不再"刚失败就接着扑下一个"，
+# 又不至于把整张地图的任务点都写死。
+LADDER_FAIL_SUPPRESS_ROUNDS = 15
 
 
 
@@ -398,6 +413,14 @@ class TaskSolver:
         pioneers = turn.pioneers()
         if not pioneers:
             return TaskPlan(Action.IDLE, note="no_pioneer")
+
+        # 刚在阶梯上全军覆没过：这段时间不接任务点，把角色还给经济与防守。
+        # 放在最前面——它要盖过"任务点可接就必须有人做"（设计文档V2 §6.5）：
+        # 那一条的前提是"我们真的做得完"，而 `ladder_exhausted` 恰恰证伪了它。
+        if turn.round_no < self._suppress_until():
+            return TaskPlan(
+                Action.IDLE, note=f"task_suppressed@{self._suppress_until()}"
+            )
 
         # 夜晚且尚未接上任务时先守夜。**必须放在冷却等待之前**：任务点在冷却时
         # `_wait_at` 会返回 `hold=True`（开拓者原地蹲守），如果先走到那一步，
@@ -726,6 +749,12 @@ class TaskSolver:
         最后按 0 分计——放弃路径上也必须提交，这是硬规则。
         """
         self._event(world.turn, "abandon", reason)
+        if reason == "ladder_exhausted":
+            # 三条路都走不通 ⇒ 这是客户端自己的故障，不是这个任务点的性质。
+            # 记一个抑制期，别让开拓者转头就去扑下一个任务点。
+            until = world.turn.round_no + LADDER_FAIL_SUPPRESS_ROUNDS
+            self.memory.set_fact(F_SUPPRESS_UNTIL, str(until))
+            self._event(world.turn, "suppress", f"until={until} reason={reason}")
         candidate = self._candidate(run)
         answer = None
         if candidate:
@@ -885,6 +914,13 @@ class TaskSolver:
     def _pioneer(turn: Turn) -> Unit | None:
         pioneers = turn.pioneers()
         return pioneers[0] if pioneers else None
+
+    def _suppress_until(self) -> int:
+        """任务点抑制期的截止回合（0 = 没有抑制）"""
+        try:
+            return int(self.memory.fact(F_SUPPRESS_UNTIL) or 0)
+        except ValueError:
+            return 0
 
     @staticmethod
     def _candidate(run: TaskRun) -> str | None:

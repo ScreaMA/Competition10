@@ -24,8 +24,15 @@ cd CoreGeek
 # 启动客户端（判题系统的调用方式）
 bash run.sh 8000
 
-# 单元测试（250 个用例）
+# 单元测试
 python -m pytest tests/ -q
+
+# **任务沙盒**：本地复刻沙盒里的自进化任务环境，跑一遍全部题目
+#   A 族（API 查询）7 座城 + B 族（工程修复）6 个变体；判据是判分口径：
+#   A = [ANSWER] 与标准答案逐字段相同；B = ./check 通过且客户端抓到 TOKEN
+python tools/tasksandbox/run.py
+python tools/tasksandbox/run.py --family api        # 只跑 API 查询族
+python tools/tasksandbox/run.py --variant beta      # 只跑某个修复变体
 
 # 端到端自检：真实报文 + 边界场景 + 1300 回合性能
 python tools/local_check.py
