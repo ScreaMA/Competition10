@@ -253,6 +253,35 @@ def test_station_voucher_uses_whole_footprint(payload_factory, role_factory):
     assert commands[10010]["targetPos"][0] == {"x": 20, "y": 10}
 
 
+def test_stops_building_walls_at_target(payload_factory, role_factory):
+    """围墙砌够目标段数就收手，把钱让给升级券
+
+    回归：本地模拟里出现过"9 段墙 + 1071 金币，一次升级券都没买"
+    （`day_summary upgrade=0`）——`wall_sites` 返回的是"还没建的候选段"，
+    不封顶的话建造工会围着基地一圈一圈砌下去。
+    """
+    from agent.strategy import defense
+
+    walls = [
+        role_factory(40000 + i, "wall", x, y)
+        for i, (x, y) in enumerate([
+            (28, 8), (28, 7), (28, 9), (28, 10), (29, 7),
+            (29, 11), (30, 7), (30, 11), (31, 7),
+        ])
+    ]
+    worker = _worker(role_factory, 10010, 29, 8, backpack=("stone", "stone"))
+    world = _world(
+        payload_factory, role_factory, gold=1071, roles=[worker] + walls,
+        zones=[{"neutralType": "weaponShop", "pos": {"x": 25, "y": 20}}],
+        weapon_shop=[{"name": "WeaponUpgradeVoucher1", "price": 100}],
+    )
+    assert len(world.turn.walls()) >= defense.WALL_TARGET_SEGMENTS
+    commands = economy.plan_day(world, set())
+    # 不再砌墙：要么去买升级券，要么去商店的路上
+    assert commands[10010]["action"] in ("buy", "move")
+    assert commands[10010].get("name") != "wall"
+
+
 def test_uses_held_voucher_on_tower(payload_factory, role_factory):
     """背包里有武器升级券且有一座 level1 的塔 ⇒ 走过去用掉
 

@@ -35,7 +35,9 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # 同目录的 analyze_log
 
 
-ROUNDS_PER_DAY = 130  # 一天 = 白天 70 回合 + 夜晚 60 回合（任务书 §4.2）
+ROUNDS_PER_DAY = 130   # 一天 = 白天 70 回合 + 夜晚 60 回合（任务书 §4.2）
+DAY_ROUNDS = 70
+NIGHT_ROUNDS = 60
 
 BEIJING_TASK = (
     "请阅读task_1_beijing.md，获取任务信息\n"
@@ -165,6 +167,7 @@ class Simulator:
         self.sandbox_issued = 0
         self.errors = 0
         self.submissions = 0
+        self.robot_id = 30000
 
     # --- 主循环 ---
 
@@ -217,6 +220,10 @@ class Simulator:
         if response["executeCmd"]:
             self._queue_sandbox(round_no)
 
+        # 夜战：机器人生成 / 我方攻击结算 / 机器人推进与啃基地
+        self._resolve_night(round_no, response["roleCommandMap"])
+        self._spawn_wave(round_no)
+
         # 任务点冷却每回合递减（任务书 §5：任务结束后 30 回合刷新）
         for task in self.payload["teamOur"]["playerTasks"]:
             task["coldDownRounds"] = max(0, int(task.get("coldDownRounds", 0)) - 1)
@@ -233,7 +240,10 @@ class Simulator:
             if self._walkable(target):
                 role["pos"] = {"x": target["x"], "y": target["y"]}
             return
-        if action in ("attack", "remove", "use", "drop", "summonTreasure"):
+        if action in ("move", "attack", "remove", "drop", "summonTreasure"):
+            return
+        if action == "use":
+            self._apply_use(role, command)
             return
         if action == "build":
             self.gold = max(0, self.gold - (1 if command.get("name") == "wall" else 25))
@@ -280,6 +290,75 @@ class Simulator:
                 {**t, "coldDownRounds": 30} for t in self.payload["teamOur"]["playerTasks"]
             ]
 
+    # --- 夜战（近似模型）---
+
+    def _round_in_day(self, round_no: int) -> int:
+        return (round_no - 1) % ROUNDS_PER_DAY + 1
+
+    def _is_night(self, round_no: int) -> bool:
+        return self._round_in_day(round_no) > DAY_ROUNDS
+
+    def _spawn_wave(self, round_no: int) -> None:
+        """白天最后一个回合结束时生成夜里的机器人
+
+        放在这里而不是"夜晚第一回合"，是因为真实判题器**夜晚第一回合的请求里
+        就能看到机器人**——晚一回合生成会让客户端那一整个回合白站一晚。
+        """
+        if self._round_in_day(round_no) != DAY_ROUNDS:
+            return
+        day = (round_no - 1) // ROUNDS_PER_DAY + 1
+        robots = self.payload["robot"]["roles"]
+        for index in range(2 + day):
+            self.robot_id += 1
+            robots.append({
+                "id": self.robot_id,
+                "pos": {"x": 2 + index, "y": 30},
+                "roleType": "smallRobot" if index % 3 else "middleRobot",
+                "health": 40 if index % 3 else 60,
+                "abnormalState": "",
+                "targetTeam": self.payload["teamOur"]["type"],
+            })
+
+    def _resolve_night(self, round_no: int, commands: dict) -> None:
+        """机器人生成 → 我方攻击结算 → 机器人推进 → 天亮清场
+
+        刻意做得很粗（不判遮挡、不算溅射），目的是让日志里的
+        `kills=` / `station_damage=` / `idle_weapon=` 有真实数据可跑，
+        而不是复刻判题器。
+        """
+        roles = self.payload["teamOur"]["roles"]
+        robots = self.payload["robot"]["roles"]
+
+        if not self._is_night(round_no):
+            if robots:  # 天亮清场（任务书 §4.7.3）
+                robots.clear()
+            return
+
+        # 我方攻击：落点上的机器人直接判死（近似）
+        hit = set()
+        for command in commands.values():
+            if command.get("action") != "attack":
+                continue
+            for spot in command.get("targetPos") or []:
+                hit.add((spot["x"], spot["y"]))
+        robots[:] = [
+            r for r in robots
+            if (r["pos"]["x"], r["pos"]["y"]) not in hit
+        ]
+
+        # 机器人朝基地推进一步；贴到基地就啃
+        station = next((r for r in roles if r["roleType"] == "station"), None)
+        if station is None:
+            return
+        base = station["pos"]
+        for robot in robots:
+            dx = (base["x"] > robot["pos"]["x"]) - (base["x"] < robot["pos"]["x"])
+            dy = (base["y"] > robot["pos"]["y"]) - (base["y"] < robot["pos"]["y"])
+            robot["pos"] = {"x": robot["pos"]["x"] + dx, "y": robot["pos"]["y"] + dy}
+            if max(abs(robot["pos"]["x"] - base["x"]),
+                   abs(robot["pos"]["y"] - base["y"])) <= 3:
+                station["health"] = max(0, station["health"] - 5)
+
     def _queue_sandbox(self, round_no: int) -> None:
         """模拟沙盒回包：每个任务的第 1 次下发侦察、第 2 次给出答案
 
@@ -290,6 +369,37 @@ class Simulator:
         self.sandbox_queue.append(
             RECON_RESULT if self.sandbox_issued == 1 else ANSWER_RESULT
         )
+
+    def _apply_use(self, role: dict, command: dict) -> None:
+        """结算 `use`：升级券 / 修复包 / 药剂
+
+        少了这一步，"买了券但没生效"会被误判成客户端的 bug——客户端其实
+        每回合都在正确地 `use→(x,y) <券>`，只是模拟器没结算。
+        """
+        name = str(command.get("name") or "")
+        targets = command.get("targetPos") or []
+        spot = targets[0] if targets else None
+        level = {"WeaponUpgradeVoucher1": 2, "WeaponUpgradeVoucher2": 3,
+                 "WallUpgradeVoucher1": 2, "WallUpgradeVoucher2": 3,
+                 "StationUpgradeVoucher1": 2, "StationUpgradeVoucher2": 3}
+        kind_of = {"2": {"gatling", "railgun", "rocket", "wall", "station"},
+                   "3": {"gatling", "railgun", "rocket", "wall", "station"}}
+
+        if name in level and spot is not None:
+            for unit in self.payload["teamOur"]["roles"]:
+                if unit["pos"] == spot and unit["roleType"] in kind_of[str(level[name])]:
+                    unit["level"] = level[name]
+                    if "health" in unit:
+                        unit["health"] = {1: 1000, 2: 1500, 3: 2000}.get(
+                            level[name], unit["health"]
+                        )
+        elif name == "Medicine":
+            role["health"] = {"worker": 220, "pioneer": 200}.get(
+                role["roleType"], role["health"]
+            )
+
+        if name in role["backpack"]:
+            role["backpack"].remove(name)
 
     def _add_building(self, unit_id: int, target: dict, kind: str) -> None:
         """把新建成的建筑加到地图上"""

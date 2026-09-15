@@ -202,7 +202,15 @@ def _build_tower(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
 
 
 def _build_wall(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
-    """砌墙：有石头才砌，没石头去采（这一步保证"围墙"和"采集"联动）"""
+    """砌墙：有石头才砌，没石头去采（这一步保证"围墙"和"采集"联动）
+
+    **已建够 `WALL_TARGET_SEGMENTS` 段就收手**。`wall_sites` 返回的是"还没建的
+    候选段"，不封顶的话建造工会围着基地一圈一圈砌下去——本地模拟里出现过
+    "9 段墙 + 1071 金币，建设升级券一次都没买"（`day_summary upgrade=0`），
+    钱全躺在账上，正是复盘里"金币闲置"那一类。
+    """
+    if len(world.turn.walls()) >= defense.WALL_TARGET_SEGMENTS:
+        return None
     sites = defense.wall_sites(world)
     if not sites:
         return None

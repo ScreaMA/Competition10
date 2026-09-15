@@ -85,6 +85,9 @@ class TaskPlan:
     # 编排器据此不把它交给空转兜底——否则兜底逻辑会把它拉去武器旁边站岗，
     # 而离开任务点一格内就等于放弃任务（任务书 §5）。
     hold: bool = False
+    # 本回合发生的任务链路事件（`event=… key=value` 片段），只在**状态变化**时
+    # 产生。复盘要回答"任务为什么没做完"时，这一串比逐回合的 note 好读得多。
+    events: list[str] = field(default_factory=list)
 
     @property
     def active(self) -> bool:
@@ -212,6 +215,13 @@ class TaskSolver:
     # --- 对外入口 ---
 
     def plan(self, world: World) -> TaskPlan:
+        """状态机主入口：决策 + 把本回合的事件挂到返回的 `TaskPlan.events`"""
+        plan = self._plan(world)
+        if self.diagnostics:
+            plan.events = list(self.diagnostics)
+        return plan
+
+    def _plan(self, world: World) -> TaskPlan:
         turn = world.turn
         run = self.memory.run
 
@@ -234,6 +244,35 @@ class TaskSolver:
 
         return self._drive(world, run)
 
+    # --- 事件（供 `task_event` 日志行）---
+
+    def _event(self, turn: Turn, name: str, detail: str = "") -> None:
+        """记一条任务链路事件
+
+        只在**状态变化**时调用（领任务 / 推进步骤 / 交卷 / 放弃 / 结束 / 存技能），
+        不每回合刷——复盘的"任务链路时间线"要的是转折点，不是流水账。
+
+        字段固定为 `event / key / family / step / rounds / left / detail`，
+        `tools/analyze_log.py` 与 `战术参考/Issue总结模板V2.md` 都按这套字段读。
+        """
+        parts = [f"event={name}"]
+        run = self.memory.run
+        if run is not None:
+            parts.append(f'key="{run.key}"')
+            parts.append(f"family={run.family}")
+            parts.append(f"step={self._step_name(run)}")
+            parts.append(f"rounds={turn.round_no - run.accepted_round}")
+            parts.append(f"left={max(0, run.deadline - turn.round_no)}")
+        if detail:
+            parts.append(f"detail={detail}")
+        self.diagnostics.append(" ".join(parts))
+
+    def _step_name(self, run: TaskRun) -> str:
+        steps = self._steps(run)
+        if run.step_index < len(steps):
+            return steps[run.step_index].name
+        return "-"
+
     # --- 观测 ---
 
     def _start_run(self, turn: Turn) -> TaskRun:
@@ -252,7 +291,7 @@ class TaskSolver:
         )
         self.memory.set_fact(F_FAMILY, family)
         self.memory.start_run(run)
-        self.diagnostics.append(f"family={family}({evidence}) skill={key}")
+        self._event(turn, "start", f'timeout={timeout} evidence="{evidence}"')
         return run
 
     @staticmethod
@@ -281,7 +320,7 @@ class TaskSolver:
             run.accept_step_output(output)
             learned = learn_from_output(self.memory, output)
             if learned:
-                self.diagnostics.append("learn:" + ",".join(learned[:3]))
+                self._event(turn, "learn", ",".join(learned[:3]))
             if output.payloads.get("CHECKBODY"):
                 run.check_output = output.payloads["CHECKBODY"]
 
@@ -289,7 +328,7 @@ class TaskSolver:
             command = extract_llm_command(turn.llm_resp)
             if command:
                 run.llm_command = command
-                self.diagnostics.append("llm:command")
+                self._event(turn, "llm_command")
 
     # --- 调度：该不该做任务 ---
 
@@ -298,6 +337,12 @@ class TaskSolver:
         pioneers = turn.pioneers()
         if not pioneers:
             return TaskPlan(Action.IDLE, note="no_pioneer")
+
+        # 夜晚且尚未接上任务时先守夜。**必须放在冷却等待之前**：任务点在冷却时
+        # `_wait_at` 会返回 `hold=True`（开拓者原地蹲守），如果先走到那一步，
+        # 开拓者就会为了等一个还没开放的任务点，整夜站在旁边看机器人拆家。
+        if not turn.is_day and turn.alive_robots():
+            return TaskPlan(Action.IDLE, note="night_defend")
 
         # 任务书 §5.3 + 设计文档 §6.5：**只要存在 isValid 的任务点，就要有人在做**。
         # V1 因为"接完一个再说"导致任务 2 整场未接（T5），这里把这条写死成原则。
@@ -320,11 +365,6 @@ class TaskSolver:
             return TaskPlan(Action.IDLE, note="cooling")
 
         pioneer = pioneers[0]
-        # 夜晚且尚未接上任务时先守夜：开拓者是三个操控者之一，为了赶路少操控
-        # 一座武器，换来的只是"早到几个回合"。白天有 70 个回合，路一定赶得上。
-        if not turn.is_day and turn.alive_robots():
-            return TaskPlan(Action.IDLE, note="night_defend")
-
         target = min(
             candidates,
             key=lambda t: (distance(pioneer.pos, t.pos), -t.score_reward, t.pos.x, t.pos.y),
@@ -336,6 +376,11 @@ class TaskSolver:
         if any(distance(pioneer.pos, cell) <= 1 for cell in cells) or (
             distance(pioneer.pos, target.pos) <= 1
         ):
+            self._event(
+                turn, "accept",
+                f"point={target.pos.x},{target.pos.y} "
+                f"timeout={target.timeout_rounds} score={target.score_reward}",
+            )
             return TaskPlan(
                 Action.ACCEPT,
                 pioneer_command=accept_task_command(),
@@ -386,7 +431,7 @@ class TaskSolver:
             if answer:
                 return self._submit(world, run, answer)
             if reason not in ("already_submitted", "already_rejected"):
-                self.diagnostics.append(f"gate:{reason}")
+                self._event(turn, "gate_reject", reason)
             if reason == "already_rejected":
                 # 交过且被判错：必须重取数据，不能重交同一份（V1 PK592108 R15-17）。
                 # 回退之后**跳过本回合的 `_advance`**——否则上一份被判错的答案
@@ -446,7 +491,7 @@ class TaskSolver:
             return
 
         if slow:
-            self.diagnostics.append("slow")
+            self._event(turn, "sandbox_slow")
             if run.attempts >= 2:
                 self._step_forward(run, turn, "slow")
             return
@@ -499,7 +544,7 @@ class TaskSolver:
         run.attempts = 0
         run.repeats = 0
         name = step.name if step else "-"
-        self.diagnostics.append(f"step+ {name}({reason})")
+        self._event(turn, "step", f"advanced={name} reason={reason}")
 
         # 工程修复族：verify 走完还没拿到 TOKEN 就回到 check 再来一轮
         if (
@@ -513,7 +558,7 @@ class TaskSolver:
             order = list(skills.ladder(run.family))
             if "check" in order:
                 run.step_index = order.index("check")
-                self.diagnostics.append(f"rewind check#{run.repair_rounds}")
+                self._event(turn, "rewind", f"back_to_check#{run.repair_rounds}")
 
     def _rewind_to_query(self, run: TaskRun, turn: Turn) -> int:
         """答案被打回时回到取数那一步（而不是重交同一个答案）"""
@@ -580,7 +625,7 @@ class TaskSolver:
         # 交完不重置阶梯：判题器可能打回（errorCode=2），那时按 `_rewind_to_query`
         # 回到取数步；在此之前保持现状，避免把已经拿到的答案丢掉。
         run.repeats = 0
-        self.diagnostics.append(f"submit#{len(run.submitted)}")
+        self._event(world.turn, "submit", f"n={len(run.submitted)} answer_len={len(answer)}")
         return TaskPlan(
             Action.SUBMIT,
             pioneer_command=command,
@@ -621,7 +666,7 @@ class TaskSolver:
         "不交"。V1 有整整一场对局（PK592172）接任务后 9 个回合一次都没提交，
         最后按 0 分计——放弃路径上也必须提交，这是硬规则。
         """
-        self.diagnostics.append(f"abandon:{reason}")
+        self._event(world.turn, "abandon", reason)
         candidate = self._candidate(run)
         answer = None
         if candidate:
@@ -632,7 +677,7 @@ class TaskSolver:
                 rejected=run.rejected,
             )
             if answer is None and why != "already_submitted":
-                self.diagnostics.append(f"abandon_gate:{why}")
+                self._event(world.turn, "abandon_gate", why)
         if answer:
             return self._submit(world, run, answer)
 
@@ -658,9 +703,13 @@ class TaskSolver:
             skill = skills.build_skill(run, self.memory.facts)
             if skill is not None:
                 self.memory.store_skill(skill)
-                self.diagnostics.append(f"skill:saved({len(skill.steps)}steps)")
+                self._event(turn, "skill_saved", f"steps={len(skill.steps)} family={skill.family}")
         elif run.skill_used:
             self.memory.punish_skill(run.key)
+        self._event(
+            turn, "done",
+            f"submitted={len(run.submitted)} rejected={'yes' if rejected else 'no'}",
+        )
         self._close_run(run, "closed" + ("_rejected" if rejected else "_ok"))
         return TaskPlan(
             Action.IDLE,
@@ -701,7 +750,7 @@ class TaskSolver:
             command = run.llm_command
             run.llm_command = ""
             run.pending_round = turn.round_no
-            self.diagnostics.append("llm:exec")
+            self._event(world.turn, "llm_exec")
             return TaskPlan(
                 Action.EXECUTE,
                 pioneer_command=self._hold_position(world, run),

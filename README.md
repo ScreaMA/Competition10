@@ -24,7 +24,7 @@ cd CoreGeek
 # 启动客户端（判题系统的调用方式）
 bash run.sh 8000
 
-# 单元测试（236 个用例）
+# 单元测试（250 个用例）
 python -m pytest tests/ -q
 
 # 端到端自检：真实报文 + 边界场景 + 1300 回合性能
@@ -34,7 +34,8 @@ python tools/local_check.py
 python tools/simulate.py --rounds 400 --log sim.log
 python tools/analyze_log.py --log sim.log            # 回合统计
 python tools/analyze_log.py --log sim.log --task     # 自进化任务链路
-python tools/analyze_log.py --log sim.log --template # 复盘填空稿
+python tools/analyze_log.py --log sim.log --template # 复盘填空稿（自动填 6~7/7 项）
+python tools/analyze_log.py --log sim.log --issue    # Issue 正文骨架（含日志原文位）
 
 # 一键联调（启动客户端→发请求→打印响应）
 bash tools/test_client.sh 8000
@@ -67,7 +68,7 @@ CoreGeek/
 │           ├── sandbox.py      标记解析、输出指纹
 │           ├── answer.py       答案闸门（唯一允许产出 submitAnswer 的地方）
 │           └── memory.py       跨回合持久层：事实 / 技能 / 当前任务
-├── tests/                    236 个用例（含 11 个真实故障回归）
+├── tests/                    250 个用例（含 11 个真实故障回归）
 └── tools/                    自检、模拟、复盘工具
 ```
 
@@ -138,7 +139,7 @@ V2 把它落成一套**可执行的机制**，而不是一句口号：
 cd CoreGeek && python -m pytest tests/ -q
 ```
 
-236 个用例，其中 `tests/test_solver.py` 的 11 个用例是**真实故障回归**——
+250 个用例，其中 `tests/test_solver.py` 的 11 个用例是**真实故障回归**——
 每一个都对应 Issues #1–#199 里反复出现的某一类问题：
 
 | 用例 | 对应故障 |
@@ -159,22 +160,45 @@ cd CoreGeek && python -m pytest tests/ -q
 
 ## 日志与复盘
 
-`debug.log` 是复盘流水线唯一的输入，每回合固定四行：
+`debug.log` 是复盘流水线唯一的输入。每回合固定三行 + 事件行，全部单行、`key=value`：
 
 ```
-request_decoded round=… gold=… hp=… towers=… walls=… robots=…(s m l b)
-                tasks=[…] phase=… task=… zone=… bag=…
-strategy_done   round=… commands=… actions=… sandbox=… note=… learn=… fail=[…]
-round_end       round=… kills=…(…) score=… station_damage=… idle=…
-day_summary     day=… rounds=… kills=… gold_in=… submits=… sandbox=…
+request_decoded round=85 day=1 tod=night round_in_day=85 team=challenger team_id=6324
+                gold=20 gold_delta=-25 score=280 base=(10,23) hp=1500/1500
+                towers=3[rocket1@9,25 railgun1@10,25 gatling1@9,24] walls=2[l1:2]
+                robots=4[s1 m1 l1 b1] near=9@20,24 enemy_visible=1 enemy_towers=0
+                mines=stone:2,iron:1,copper:1 tasks=[…] phase='…' task=execute
+                plan=step=query idx=1 r=0 chars=10010@5,23 … bag=10012{copper×21}
+strategy_done   round=85 commands=3 elapsed=0.62ms gold_spent=25
+                actions=10010:build→(32,12) wall 10020:attack→(24,13) smallRobot
+                fail=[10010:move] sandbox=下发 note=step=query learn=…
+round_end       round=85 kills=2(s1 m1 l0 b0) kill_score=3 station_damage=40
+                weapons=3 manned=2 idle_weapon=1 idle_target=1 idle_units=0
+task_event      round=85 event=submit key="api-query|city,…" step=query
+                rounds=4 left=9 detail=n=1 answer_len=68
+day_summary     day=1 rounds=1-130 kills=23 gold_peak=120 build=8 task_submit=3 …
+freeze_alert    round=200 gold=0 stalled_rounds=20 bag=10012{stone×3}
 ```
 
-比 V1 多出来的部分是**逐回合增量**（击杀/掉血/建筑损失/空转人·回合）与
-**任务链路事件**（步骤推进、交卷、放弃）——V1 的复盘报告里大量"日志未覆盖"
-的结论就是因为日志只有状态快照、没有增量。
+比 V1 多出来的是**逐回合增量**（击杀/掉血/建筑损失/空转）、**任务链路事件**
+（start/step/submit/abandon/skill）与**金币停滞自动告警**——V1 报告里大量
+"日志未覆盖"的结论就是因为日志只有状态快照、没有增量。
 
-`tools/analyze_log.py --template` 能直接把这些渲染成
-`战术参考/对战分析模板.md` 的填空稿。
+完整字段说明、症状→字段对照表、怎么填 `{待人工}`，都在
+**[战术参考/日志分析模板V2.md](./战术参考/日志分析模板V2.md)**；
+写 Issue 用 **[战术参考/Issue总结模板V2.md](./战术参考/Issue总结模板V2.md)**。
+
+```bash
+cd CoreGeek
+python tools/analyze_log.py                                # 回合统计摘要
+python tools/analyze_log.py --template --out 分析稿.md      # 填空版分析稿（自动填 6~7/7 项）
+python tools/analyze_log.py --issue    --out issue.md      # Issue 正文骨架（含日志原文位）
+python tools/analyze_log.py --task                         # 只看自进化任务链路
+python tools/analyze_log.py --rounds 1-130 --issue         # 只看某回合区间再出 Issue
+```
+
+`--issue` 会**留出"日志原文"一节并直接灌好相关回合的原文**——V1 的自动修复反复
+改错地方，根因就是建议只有"反推的常量名"、没有可核对的原始证据。
 
 ---
 

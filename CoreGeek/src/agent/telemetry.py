@@ -9,7 +9,7 @@ V1 的日志只有"当前状态快照"，复盘要回答"这一夜打死了几�
 
 这一层把"相邻两回合的差"算出来：
 
-    kills / lost / station_damage / idle_units / towers_lost / walls_lost
+    kills / station_damage / towers_lost / walls_lost / failed / 空转
 
 它是**唯一**允许保留跨回合战场状态的地方，而且这些状态只服务于日志，
 不参与任何决策（决策仍然是无状态的，见 `brain` 模块文档）。
@@ -19,7 +19,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .protocol import ROBOT_SPECS, ROUNDS_PER_DAY, Turn
+from .protocol import ROBOT_SPECS, ROUNDS_PER_DAY, WEAPON_BUILD_COST, Turn
+
+ROBOT_KINDS = ("smallRobot", "middleRobot", "largeRobot", "bossRobot")
+ROBOT_LETTER = {"smallRobot": "s", "middleRobot": "m", "largeRobot": "l", "bossRobot": "b"}
+
+# 连续多少个回合"没钱也没花出去"就打一次冻结告警。
+# 复盘里"金币恒 0 达 9+ 回合"是最常见的一类问题，靠人工扫 gold 序列才能发现；
+# 这里把它变成日志里显式的一行 `freeze_alert`。
+FREEZE_ALERT_STALL = 20
 
 
 @dataclass(slots=True)
@@ -31,20 +39,32 @@ class RoundDelta:
     station_damage: int = 0
     towers_lost: int = 0
     walls_lost: int = 0
+    # 上一回合下发、但被判题器判成"执行失败"的指令（`角色ID:动作`）
+    failed: list[str] = field(default_factory=list)
+    # 金币相对上一回合的变化
+    gold_delta: int = 0
 
     @property
     def total_kills(self) -> int:
         return sum(self.kills.values())
 
-    def text(self) -> str:
-        parts = [f"{kind[:1]}={count}" for kind, count in sorted(self.kills.items())]
-        return f"kills={self.total_kills}({' '.join(parts) or '-'}) score={self.kill_score}"
+    def kills_text(self) -> str:
+        """`kills=23(s10 m8 l4 b1) score=31`"""
+        detail = " ".join(
+            f"{ROBOT_LETTER[kind]}={self.kills.get(kind, 0)}" for kind in ROBOT_KINDS
+        )
+        return (
+            f"kills={self.total_kills}({detail}) kill_score={self.kill_score}"
+        )
 
 
 class Telemetry:
     """逐回合增量的计算器（模块级单例 `TELEMETRY`）
 
-    只保留**上一回合**的快照：机器人在场表、基地血量、建筑 id 集合。
+    只保留**上一回合**的快照：机器人在场表、基地血量、建筑 id 集合，
+    外加一份"上一回合给每个角色下了什么动作"（用来把判题器的失败回执翻译成
+    `角色ID:动作` 而不只是 ID）。
+
     回合号不连续（换局、重启）时自动重置，避免把上一局的账算到这一局头上。
     """
 
@@ -55,7 +75,16 @@ class Telemetry:
         self.station_health = -1
         self.towers: set[int] = set()
         self.walls: set[int] = set()
-        # 当日累计（每个游戏日第一条 `day_summary` 重置）
+        self.actions: dict[int, str] = {}
+        self.last_gold = -1
+        self.reset_day()
+
+    # --- 重置 ---
+
+    def reset(self) -> None:
+        self.__init__()
+
+    def reset_day(self) -> None:
         self.day_kills = 0
         self.day_kill_score = 0
         self.day_damage = 0
@@ -63,13 +92,15 @@ class Telemetry:
         self.day_gold_out = 0
         self.day_sandbox = 0
         self.day_submits = 0
+        self.day_accepts = 0
         self.day_idle = 0
-        self.last_gold = -1
-
-    # --- 重置 ---
-
-    def reset(self) -> None:
-        self.__init__()
+        self.day_commands = 0
+        self.day_builds = 0
+        self.day_upgrades = 0
+        self.day_sells = 0
+        self.gold_peak = 0
+        self.stall_rounds = 0
+        self.freeze_reported = 0
 
     # --- 主入口 ---
 
@@ -78,8 +109,7 @@ class Telemetry:
         if turn.round_no != self.round_no + 1:
             # 换局或断档：只记快照，不产出增量
             self._snapshot(turn)
-            self._reset_day()
-            self.last_gold = turn.gold
+            self.reset_day()
             return RoundDelta()
 
         delta = RoundDelta()
@@ -104,15 +134,23 @@ class Telemetry:
         delta.towers_lost = len(self.towers - tower_ids)
         delta.walls_lost = len(self.walls - wall_ids)
 
-        if turn.gold > self.last_gold >= 0:
-            self.day_gold_in += turn.gold - self.last_gold
-        elif 0 <= turn.gold < self.last_gold:
-            self.day_gold_out += self.last_gold - turn.gold
+        if self.last_gold >= 0:
+            delta.gold_delta = turn.gold - self.last_gold
+            if delta.gold_delta > 0:
+                self.day_gold_in += delta.gold_delta
+            elif delta.gold_delta < 0:
+                self.day_gold_out -= delta.gold_delta
+
+        # 上一回合下发、这一回合被判失败的指令：把动作名翻出来
+        for unit_id, ok in turn.last_action_results.items():
+            if not ok:
+                action = self.actions.get(unit_id, "?")
+                delta.failed.append(f"{unit_id}:{action}")
 
         self.day_kills += delta.total_kills
         self.day_kill_score += delta.kill_score
         self.day_damage += delta.station_damage
-        self.last_gold = turn.gold
+        self.gold_peak = max(self.gold_peak, turn.gold)
         self._snapshot(turn)
         return delta
 
@@ -128,26 +166,60 @@ class Telemetry:
         self.walls = {u.unit_id for u in turn.walls()}
         self.last_gold = turn.gold
 
-    def _reset_day(self) -> None:
-        self.day_kills = 0
-        self.day_kill_score = 0
-        self.day_damage = 0
-        self.day_gold_in = 0
-        self.day_gold_out = 0
-        self.day_sandbox = 0
-        self.day_submits = 0
-        self.day_idle = 0
+    # --- 事件计数（决策完成后由 brain 调用）---
 
-    # --- 事件计数（由 brain 调用）---
+    def record_round(
+        self,
+        turn: Turn,
+        commands: dict[int, dict],
+        *,
+        spend: int,
+        idle_units: list[int],
+        sandbox: bool,
+        submissions: int,
+        accepts: int,
+    ) -> None:
+        """把本回合的账记进当日总账，并维护"金币停滞"计数"""
+        self.actions = {
+            unit_id: str(command.get("action") or "?")
+            for unit_id, command in commands.items()
+        }
+        for command in commands.values():
+            action = command.get("action")
+            if action == "build":
+                self.day_builds += 1
+            elif action == "sell":
+                self.day_sells += 1
+            elif action == "use":
+                self.day_upgrades += 1
+        self.day_commands += len(commands)
+        self.day_idle += len(idle_units)
+        self.day_sandbox += 1 if sandbox else 0
+        self.day_submits += submissions
+        self.day_accepts += accepts
 
-    def count_submit(self) -> None:
-        self.day_submits += 1
+        # 金币停滞：连续"没钱也没花出去"的回合数。
+        # 这是复盘里"金币冻结 9+ 回合"那条结论的自动版——不用人工扫 gold 序列。
+        if turn.gold < WEAPON_BUILD_COST and spend <= 0:
+            self.stall_rounds += 1
+        else:
+            self.stall_rounds = 0
+            self.freeze_reported = 0
 
-    def count_sandbox(self) -> None:
-        self.day_sandbox += 1
+    def freeze_alert(self, turn: Turn, bag: str) -> str:
+        """返回冻结告警行（不到阈值时返回空串）
 
-    def count_idle(self, count: int) -> None:
-        self.day_idle += count
+        每累积 `FREEZE_ALERT_STALL` 个停滞回合报一次，不在同一个停滞期里刷屏。
+        """
+        if self.stall_rounds < FREEZE_ALERT_STALL:
+            return ""
+        if self.stall_rounds // FREEZE_ALERT_STALL <= self.freeze_reported:
+            return ""
+        self.freeze_reported = self.stall_rounds // FREEZE_ALERT_STALL
+        return (
+            f"freeze_alert round={turn.round_no} gold={turn.gold} "
+            f"stalled_rounds={self.stall_rounds} bag={bag or '-'}"
+        )
 
     # --- 汇总文本 ---
 
@@ -169,13 +241,20 @@ class Telemetry:
             f"day={index} rounds={start}-{end}"
             f" kills={self.day_kills} kill_score={self.day_kill_score}"
             f" station_damage={self.day_damage}"
+            f" gold_peak={self.gold_peak}"
             f" gold_in={self.day_gold_in} gold_out={self.day_gold_out}"
-            f" submits={self.day_submits} sandbox={self.day_sandbox}"
-            f" idle_rounds={self.day_idle}"
+            f" build={self.day_builds} upgrade={self.day_upgrades}"
+            f" sell={self.day_sells}"
+            f" task_accept={self.day_accepts} task_submit={self.day_submits}"
+            f" sandbox={self.day_sandbox}"
+            f" commands={self.day_commands} idle_units={self.day_idle}"
         )
 
     def roll_day(self) -> None:
-        self._reset_day()
+        """结完一天的账后清空当日累计（保留跨日的停滞计数）"""
+        stall, reported = self.stall_rounds, self.freeze_reported
+        self.reset_day()
+        self.stall_rounds, self.freeze_reported = stall, reported
 
 
 # 模块级单例：遥测状态活在整个客户端进程里
