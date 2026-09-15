@@ -64,7 +64,16 @@ DIR_BUDGET = 3.0  # 目录扫描的秒数上限
 DIR_MAX_ENTRIES = 3000
 HTTP_TIMEOUT = 1.5  # 单次请求
 HTTP_BUDGET = 7.0  # 全部请求合计
-HTTP_MAX_CALLS = 10
+# 鉴权候选的尝试上限。旧值按"一次枚举 (base, path, param) 四选一"设，实测
+# 报文里 `auths=11` 却只试到前 4 个，真正的那条永远轮不上（4 次全 401）。
+AUTH_MAX_TRIES = 6
+
+# 单次 `executeCmd` 里接口调用的**次数**上限。
+#
+# 真正的限流器是下面的 `HTTP_BUDGET`（秒）——实测 8 次本地调用只花 0.01s，
+# 次数上限设成 10 反而成了瓶颈：枚举空间是 base×path×param×auth，
+# 10 次连一个 base 都试不完。这里放宽到 40，让秒级预算去兜底。
+HTTP_MAX_CALLS = 40
 BODY_LIMIT = 3000  # 单条标记正文的上限
 DEFAULT_BASE = "http://localhost:8899"  # 对战日志实测的本地服务地址
 CHECK_TIMEOUT = 5.0  # 工程修复族跑 check 的秒数上限
@@ -84,14 +93,31 @@ DIR_BUDGET = P["dir_budget"]
 HTTP_TIMEOUT = P["http_timeout"]
 HTTP_BUDGET = P["http_budget"]
 HTTP_MAX_CALLS = P["http_max_calls"]
+AUTH_MAX_TRIES = P["auth_max_tries"]
 CHECK_TIMEOUT = P["check_timeout"]
 ROOTS = P["roots"]
 MAX_ENTRIES = P["max_entries"]
 DEFAULT_BASE = P["default_base"]
 
 
-def emit(tag, text=""):
-    """打一行结构化标记（正文压成单行，避免破坏标记解析）"""
+def emit(tag, text="", **pairs):
+    """打一行结构化标记（正文压成单行，避免破坏标记解析）
+
+    `pairs` 是补充的 `key=value` 字段，和 `kv()` 同一套写法（排序、空值丢弃）。
+    **两个入口必须能互相替代**：`[CHECK] ok=no code=1 head=…` 这类标记是直接
+    写成关键字参数的，`emit` 只收位置参数的话整条脚本会以
+    `TypeError: emit() got an unexpected keyword argument 'ok'` 收场。
+
+    这条不是理论风险——实测报文里工程修复族的 check / verify 两步**每一回合
+    都由此崩溃**，`[CHECK]` 标记从未出现过，`_step_satisfied("check")` 永远
+    为假，阶梯就在 check→repair→verify 之间空转到任务超时。
+    """
+    if pairs:
+        text = " ".join(
+            "%s=%s" % (key, quote(value))
+            for key, value in sorted(pairs.items())
+            if value != ""
+        )
     flat = " ".join(str(text).split())
     if len(flat) > BODY_LIMIT:
         flat = flat[:BODY_LIMIT] + " [CLIP]"
@@ -122,9 +148,8 @@ def quote(value):
 
 
 def kv(tag, **pairs):
-    emit(tag, " ".join(
-        "%s=%s" % (k, quote(v)) for k, v in sorted(pairs.items()) if v != ""
-    ))
+    """`emit` 的具名别名：所有参数都是 `key=value` 时的常见写法"""
+    emit(tag, **pairs)
 
 
 def read(path, limit=None):
@@ -306,11 +331,37 @@ BUILTIN_ERA = {
 }
 
 
+# 鉴权头的名字（`X-API-Key` / `Authorization` / `api_token` …）。
+# 用来区分"文档里写的是一个头名"和"文档里写的是一个真正的密钥值"——
+# 分不清这两者正是旧实现产出 `X-API-Key: X-API-Key` 自指垃圾的原因。
+AUTH_HEADER_RE = re.compile(r"[A-Za-z0-9_\-]*(?:key|token|secret|auth)[A-Za-z0-9_\-]*", re.I)
+
+# 明显是占位符的"值"，抄下来只会白烧调用次数
+_PLACEHOLDER_WORDS = ("your", "xxx", "example", "placeholder", "todo", "here", "sample")
+
+
+def placeholder_like(value):
+    lowered = (value or "").lower()
+    return any(word in lowered for word in _PLACEHOLDER_WORDS)
+
+
+def safe_url(url):
+    """把 URL 里的非 ASCII 字符转义掉
+
+    `urllib.request` 只接受纯 ASCII 的 URL，直接塞中文查询参数会抛
+    `UnicodeEncodeError: 'ascii' codec can't encode characters …`。这个异常被
+    `http_get` 吞成状态字符串，日志上表现成 `[APIFAIL] status=UnicodeEncodeError`，
+    看着像"服务端出错"，其实是客户端没转义。已经转义过的 `%XX` 要原样保留
+    （`%` 进 safe 集），否则会被二次转义成 `%25XX`。
+    """
+    return urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%")
+
+
 def http_get(url, headers, budget):
     """发一次 GET，返回 (状态, 正文)。异常一律映射成状态字符串，不抛出。"""
     if time.time() - T0 > budget:
         return "budget", ""
-    request = urllib.request.Request(url, headers=headers)
+    request = urllib.request.Request(safe_url(url), headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
             return response.status, response.read().decode("utf-8", "replace")
@@ -324,10 +375,18 @@ def http_get(url, headers, budget):
 
 
 def split_base(base):
-    """把 base 拆成 (scheme://host[:port], 路径前缀)"""
-    match = re.match(r"(https?://[^/]+)(/.*)?$", (base or "").rstrip("/"))
+    """把 base 拆成 (scheme://host[:port], 路径前缀)
+
+    **先砍掉查询串与锚点。** 任务文档里给的"接口地址"通常是一个**带参数的
+    示例**（`http://localhost:8899/api/v1/heritage/search?city=北京&limit=100`），
+    不砍的话整串会被当成"路径前缀"，再拼一次候选路径就得到
+    `…/search?city=北京&limit=100/api/v1/heritage/search` 这种畸形 URL——
+    实测报文里 8 次请求有 4 次栽在它上面。
+    """
+    raw = re.split(r"[?#]", (base or "").strip())[0].rstrip("/")
+    match = re.match(r"(https?://[^/]+)(/.*)?$", raw)
     if not match:
-        return (base or "").rstrip("/"), ""
+        return raw, ""
     return match.group(1), (match.group(2) or "")
 
 
@@ -600,12 +659,35 @@ if not params:
 auths = []
 if KNOWN_AUTH:
     auths.append(KNOWN_AUTH)
-for match in re.findall(r"(Bearer\s+[A-Za-z0-9._\-]{6,})", text):
+
+# 1) 文档里**成对写出来**的鉴权头，形如 `X-API-Key: sk-heritage-2026`。
+#    最可靠的一条：值直接抄下来，不做任何猜测。
+for name, value in re.findall(
+    r"([A-Za-z][A-Za-z0-9_\-]{2,30})\s*[:=]\s*([A-Za-z0-9._\-]{8,})", text
+):
+    if AUTH_HEADER_RE.fullmatch(name) and not placeholder_like(value):
+        auths.append("%s: %s" % (name, value))
+
+# 2) `Authorization: Bearer xxx`——头名与值之间隔着 "Bearer"，上面那条收不到
+for match in re.findall(r"(Bearer\s+[A-Za-z0-9._\-]{8,})", text):
     auths.append("Authorization: " + match)
-for match in re.findall(r"([A-Za-z0-9_\-]*(?:key|token|secret)[A-Za-z0-9_\-]*)", text, re.I):
-    if len(match) >= 8:
-        auths.append("X-API-Key: " + match)
-        auths.append("Authorization: Bearer " + match)
+
+# 3) 兜底：把文档里"名字像密钥"的字符串**本身**当值。它最容易产出垃圾候选
+#    （`X-API-Key: X-API-Key` 这种自指头），所以只在前面什么都没抄到时才走，
+#    并且要求长度够、不能本身就是个头名。
+if not auths:
+    for match in re.findall(
+        r"([A-Za-z0-9_\-]*(?:key|token|secret)[A-Za-z0-9_\-]*)", text, re.I
+    ):
+        if len(match) >= 12 and not AUTH_HEADER_RE.fullmatch(match):
+            auths.append("X-API-Key: " + match)
+
+# 去重（保序）。重复的候选只会白烧调用次数——`api_calls` 是有预算的。
+deduped = []
+for item in auths:
+    if item not in deduped:
+        deduped.append(item)
+auths = deduped
 # 任务原文明确提示"文档可能过时"，所以无鉴权也要试一遍（有些端点不校验）
 auths.append("")
 
@@ -632,7 +714,7 @@ for base in bases[:3]:
             continue
         url_path = join(host, prefix, path)
         for param in params[:3]:
-            for auth in auths[:4]:
+            for auth in auths[:AUTH_MAX_TRIES]:
                 if stop():
                     break
                 query = urllib.parse.urlencode({param: target, "limit": 100})
@@ -1071,6 +1153,7 @@ def _params(step: StepSpec, phase_task: str, facts: dict[str, str], extra: dict)
         "http_timeout": HTTP_TIMEOUT,
         "http_budget": HTTP_BUDGET,
         "http_max_calls": HTTP_MAX_CALLS,
+        "auth_max_tries": AUTH_MAX_TRIES,
         "check_timeout": CHECK_TIMEOUT,
         "roots": SEARCH_ROOTS,
         "max_entries": DIR_MAX_ENTRIES,

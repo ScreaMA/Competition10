@@ -70,14 +70,55 @@ def test_no_tower_without_gold(payload_factory, role_factory):
 
 
 def test_sell_when_gold_is_zero(payload_factory, role_factory, zone_factory):
-    """金币为 0 且背包有矿石 ⇒ 无条件去卖（"金币恒 0"的直接对策）"""
+    """金币为 0 且背包有**卖得掉**的矿石 ⇒ 无条件去卖（"金币恒 0"的直接对策）"""
+    world = _world(
+        payload_factory, role_factory, gold=0,
+        zones=[zone_factory("vendor", 20, 16)],
+        roles=[_worker(role_factory, backpack=("copper",))],
+    )
+    worker = world.turn.workers()[0]
+    assert economy.should_sell(world, worker) is True
+    assert economy.sell_urgent(world, worker) is True
+
+
+def test_no_sell_trip_when_only_reserved_stone(payload_factory, role_factory, zone_factory):
+    """金币为 0、但背包里只有 1 块**要留着砌墙**的石头 ⇒ 不跑这一趟
+
+    这一条是"金币见底就出发"的反例。判据分成两套（出发时按"没钱"、到了小贩
+    跟前才按"这块石头要留"）会打架：工人走到小贩旁边才发现不卖，转身折返，
+    下一回合金币还是 0 又出发。实测报文里建造工背着 1 块石头、金币 16，
+    在 (22,14)↔(21,15) 之间来回踱了 6 个回合——修好之后它直接去砌墙。
+    """
     world = _world(
         payload_factory, role_factory, gold=0,
         zones=[zone_factory("vendor", 20, 16)],
         roles=[_worker(role_factory, backpack=("stone",))],
     )
     worker = world.turn.workers()[0]
-    assert economy.should_sell(world, worker) is True
+    assert economy.sell_now(world, worker) is None
+    assert economy.should_sell(world, worker) is False
+    assert economy.sell_urgent(world, worker) is False
+
+    # 出发判据与"到了跟前卖什么"必须是同一套：站在小贩旁边也不该发 sell
+    world = _world(
+        payload_factory, role_factory, gold=0,
+        zones=[zone_factory("vendor", 20, 16)],
+        roles=[_worker(role_factory, 10010, 20, 15, backpack=("stone",))],
+    )
+    commands = economy.plan_day(world, set())
+    assert commands.get(10010, {}).get("action") != "sell"
+
+
+def test_stone_beyond_wall_reserve_is_sellable(payload_factory, role_factory, zone_factory):
+    """超出围墙需求的那部分石头是可以卖的（囤着是纯负重）"""
+    world = _world(
+        payload_factory, role_factory, gold=0,
+        zones=[zone_factory("vendor", 20, 16)],
+        roles=[_worker(role_factory, 10010, 20, 15,
+                       backpack=("stone",) * (economy.STONE_BATCH + 2))],
+    )
+    worker = world.turn.workers()[0]
+    assert economy.sell_now(world, worker) == ("stone", 2)
 
 
 def test_sell_when_gold_below_tower_price(payload_factory, role_factory, zone_factory):

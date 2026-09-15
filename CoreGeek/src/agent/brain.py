@@ -65,7 +65,7 @@ def _decide(payload: dict[str, Any]) -> dict[str, Any]:
     claimed: set[Pos] = set()
 
     # 1) 任务链路：开拓者的指令优先级最高
-    task_plan = solver.plan(world)
+    task_plan = _task_plan(world)
     used: set[int] = set()
     pioneer = _pioneer(turn)
     if task_plan.pioneer_command is not None and pioneer is not None:
@@ -107,6 +107,24 @@ def _decide(payload: dict[str, Any]) -> dict[str, Any]:
         prompt=task_plan.prompt,
         sandbox_command=task_plan.sandbox_command,
     )
+
+
+def _task_plan(world: World) -> TaskPlan:
+    """任务链路的决策，**失败时降级成"这一回合不碰任务"**
+
+    任务子系统出异常不许连累经济与防御。真实对局实测过一次：`solver.plan`
+    里一个未定义常量抛 `NameError`，`decide` 最外层那个兜底把它变成**整个回合
+    的空指令**——连续 9 个回合三个角色一次都没动（工人卡在半路、金币 0、
+    围墙 0 段、塔位没人管），而日志上只有一行 `decision failed`。
+
+    兜底的粒度必须停在任务链路上：任务失败只是"这一回合不推进阶梯"，
+    采集/建造/回防照常。
+    """
+    try:
+        return solver.plan(world)
+    except Exception:
+        LOGGER.exception("task plan failed")
+        return TaskPlan(Action.IDLE, note="task_error")
 
 
 # 单条 task_dump 的长度上限（可用环境变量 TASK_DUMP_LIMIT 覆盖）。

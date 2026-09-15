@@ -163,6 +163,55 @@ def test_reclassify_switches_to_engineering_after_recon(
     # normalize 步要真的去修 CRLF（实测报的就是 bad interpreter: /bin/sh^M）
     assert "crlf" in plan.sandbox_command or "\r" in plan.sandbox_command
 
+def test_engineering_ladder_advances_on_check_marker(
+    payload_factory, base_roles, task_factory
+):
+    """工程修复族的 check 步收到 `[CHECK]` 就必须前进
+
+    这是"阶梯空转"那条故障的后半截：生成脚本因 `emit` 签名错误每一回合都崩，
+    `[CHECK]` 从未出现过，`_step_satisfied("check")` 永远为假，`_step_forward`
+    里的 rewind 又把 `step_index` 推回 check——实测报文里走出的轨迹是
+    `['recon','normalize','check','repair','verify','check','repair','verify']`，
+    13 个回合全耗在这个环里直到任务超时（第二个任务因此 0 分）。
+    """
+    bare_phase = "请阅读task_1_alpha.md，获取任务信息"
+    recon_output = (
+        "[exitCode:0]\n"
+        "[RECON] root=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix "
+        "task=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md "
+        "ws=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws_1\n"
+        "[SCAN] files=6 sh=yes\n"
+        "[DONE] step=recon elapsed=0.00s\n"
+    )
+    fix_output = "[exitCode:0]\n[FIX] crlf=0 chmod=2\n[DONE] step=normalize elapsed=0.00s\n"
+    # 修好之后 check 脚本真的会打出这一行（见 test_scripts 里真正执行脚本的用例）
+    check_output = (
+        "[exitCode:0]\n"
+        "[CHECK] code=1 cwd=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws_1 "
+        "head=check failed ok=no\n"
+        "[DONE] step=check code=1\n"
+    )
+
+    def round_at(no, output):
+        return solver.plan(_world(
+            payload_factory, round_no=no, roles=base_roles,
+            player_tasks=_task_point(task_factory), phase_task=bare_phase,
+            last_cmd_result=output,
+        ))
+
+    solver = TaskSolver()
+    solver.plan(_world(
+        payload_factory, round_no=20, roles=base_roles,
+        player_tasks=_task_point(task_factory), phase_task=bare_phase,
+    ))
+    assert round_at(21, recon_output).note.startswith("step=normalize")
+    assert round_at(22, fix_output).note.startswith("step=check")
+    # check 步收到 `[CHECK]` ⇒ 前进到 repair，而不是原地重跑
+    plan = round_at(23, check_output)
+    assert plan.note.startswith("step=repair"), plan.note
+    assert any("advanced=check reason=ok" in e for e in plan.events), plan.events
+
+
 def test_replay_real_task_sequence_reaches_submit(
     payload_factory, role_factory, task_factory
 ):
@@ -244,6 +293,101 @@ def test_reclassify_switches_to_query_after_recon(
     assert "urllib" in second.sandbox_command
     # 换族要留痕，复盘才看得出发生过什么
     assert any("event=family" in e for e in second.events), second.events
+    # 事实区也必须跟着换。`_start_run` 是在没有侦察证据时盲判的，那一步写进去的
+    # `unknown` 不覆盖掉，实测报文里就会出现 `run key=engineering-fix` 配
+    # `facts={'task.family': 'unknown'}`，而这份事实正是发给 LLM 的兜底素材。
+    assert MEMORY.fact("task.family") == skills.FAMILY_API, MEMORY.facts
+
+
+# ==========================================================================
+# T8：基地告急放弃分支（曾经整条是坏的）
+# ==========================================================================
+
+
+def test_base_danger_abandons_task_after_submit(
+    payload_factory, role_factory, task_factory
+):
+    """基地掉到一半血以下、手上已经交过答案 ⇒ 放弃任务回防
+
+    `_abandon_reason` 里的 `BASE_DANGER_RATIO` 曾经**没有定义**，一走到就
+    `NameError`。而它在时间轴上的位置恰好是"提交之后、超时之前"——实测报文里
+    第 13 回合提交、第 24 回合超时，中间 9 个回合全部整回合空指令
+    （三个角色一次都没动，工人卡在半路、金币 0、围墙 0 段）。
+
+    塔比角色多 ⇒ 夜里确实缺人手操控武器，这一条才成立。
+    """
+    solver = TaskSolver()
+    roles = [
+        role_factory(10013, "station", 20, 10, health=600),   # 600/1500 = 40%
+        role_factory(10011, "pioneer", 21, 13),
+        role_factory(10014, "gatling", 19, 11),
+        role_factory(10015, "gatling", 21, 11),
+    ]
+    # 第 75 回合是第 1 天的夜里（白天 70 回合）
+    night = dict(roles=roles, player_tasks=_task_point(task_factory),
+                 phase_task=BEIJING_TASK_TEXT)
+    assert not _world(payload_factory, round_no=75, **night).turn.is_day
+
+    solver.plan(_world(payload_factory, round_no=75, **night))
+    assert MEMORY.run is not None
+    assert MEMORY.run.submitted == []
+
+    # 第 76 回合：拿到答案 ⇒ 先提交（部分分落袋才谈得上回防）
+    submitted = solver.plan(_world(
+        payload_factory, round_no=76, **night, last_cmd_result=SUCCESS_OUTPUT,
+    ))
+    assert submitted.action == Action.SUBMIT, submitted.note
+
+    # 第 77 回合：基地告急 + 已交过卷 + 夜里缺人手 ⇒ 放弃回防
+    plan = solver.plan(_world(
+        payload_factory, round_no=77, **night, last_cmd_result=SUCCESS_OUTPUT,
+    ))
+    assert plan.action == Action.ABANDON, plan.note
+    assert "base_danger" in plan.note, plan.note
+    assert MEMORY.run is None  # 运行已结算
+
+
+def test_base_danger_does_not_abandon_before_submit(
+    payload_factory, role_factory, task_factory
+):
+    """还没交过答案就不许因为基地掉血放弃——回防的代价必须是已落袋的分"""
+    solver = TaskSolver()
+    roles = [
+        role_factory(10013, "station", 20, 10, health=300),
+        role_factory(10011, "pioneer", 21, 13),
+        role_factory(10014, "gatling", 19, 11),
+        role_factory(10015, "gatling", 21, 11),
+    ]
+    night = dict(roles=roles, player_tasks=_task_point(task_factory),
+                 phase_task=BEIJING_TASK_TEXT)
+    solver.plan(_world(payload_factory, round_no=75, **night))
+    plan = solver.plan(_world(payload_factory, round_no=76, **night))
+    assert plan.action != Action.ABANDON, plan.note
+    assert MEMORY.run is not None
+
+
+def test_task_crash_still_leaves_other_roles_working(
+    payload_factory, base_roles, task_factory, monkeypatch
+):
+    """任务子系统抛异常时，经济与防御必须照常发指令
+
+    实测教训：`solver.plan` 里的 `NameError` 被 `decide` 最外层的兜底接住，
+    变成**整个回合的空指令**——连续 9 个回合三个角色一次都没动，而那一场
+    战场本身什么事都没有。兜底的粒度必须停在任务链路上。
+    """
+    from agent.strategy.task import solver as solver_mod
+
+    def boom(world):
+        raise NameError("BASE_DANGER_RATIO")
+
+    monkeypatch.setattr(solver_mod, "plan", boom)
+    response = decide(payload_factory(
+        round_no=1, roles=base_roles,
+        player_tasks=_task_point(task_factory), phase_task=BEIJING_TASK_TEXT,
+    ))
+    commands = response["roleCommandMap"]
+    assert commands, "任务链路失败不该让整回合空指令"
+    assert "10010" in commands  # 工人照常干活
 
 # ==========================================================================
 # T2：接取任务后从未提交（0 分）

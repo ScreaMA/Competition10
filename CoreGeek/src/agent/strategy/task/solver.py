@@ -117,6 +117,16 @@ REPEAT_LIMIT = 1
 # 距任务超时还剩几个回合就必须收手（留出提交与离开的时间）
 DEADLINE_MARGIN = 2
 
+# 基地掉到这个血量比例以下、**且手上已经交过答案**时，放弃任务回防。
+#
+# 两个前提缺一不可：
+#   - "已交过答案"——任务书 §6 部分完成按通过率给分，没交就等于 0 分；
+#     而任务一旦因为"离开任务点周围一格"结束就再也拿不到分（§5），
+#     所以回防必须是拿**已经落袋的分**去换，不能拿还没交的答案去换。
+#   - "掉了一半血"——level1 基地 1500 血（§4.5.1），一半是 750；一夜里能打掉
+#     这么多说明防线已经漏了，多守一个任务点的收益抵不上基地被推平的损失。
+BASE_DANGER_RATIO = 0.5
+
 # 工程修复族最多来回几轮 check→repair
 ENGINEERING_MAX_ROUNDS = 3
 
@@ -337,6 +347,12 @@ class TaskSolver:
         previous = run.family
         run.family = family
         run.key = skills.signature(family, turn.phase_task)
+        # 事实区也要跟着改：`_start_run` 是在**没有侦察证据**的情况下盲判的，
+        # 那一步写进去的 `unknown` 必须被重判结果覆盖掉。不覆盖的后果实测过——
+        # `run key=engineering-fix` 已经换了族，`facts={'task.family': 'unknown'}`
+        # 却一直是旧的，而 `_prompt_body` 正是把这份事实发给 LLM 的，
+        # 等于拿着错误的族信息去问兜底命令。
+        self.memory.set_fact(F_FAMILY, family)
         steps = skills.first_steps(run, self.memory.skill_for(run.key))
         run.step_index = _index_after(steps, "recon")
         run.attempts = 0

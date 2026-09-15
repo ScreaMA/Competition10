@@ -16,7 +16,13 @@ Python 部分都必须能 `compile()` 通过。
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -165,3 +171,206 @@ def test_search_roots_cover_observed_paths():
     """实测任务目录在 /tmp/selfEvolutionTask 下（对战日志里的沙盒路径）"""
     assert "/tmp/selfEvolutionTask" in scripts.SEARCH_ROOTS
     assert scripts.DEFAULT_BASE == "http://localhost:8899"
+
+
+# ==========================================================================
+# 真的执行一遍生成的脚本
+# ==========================================================================
+#
+# 上面的 `compile()` 类用例只查语法。`emit()` 签名这种"调用时才暴露"的错误
+# 在静态层面永远是绿的，而沙盒里一跑就 `TypeError`——对战日志上只表现为
+# "这一步没有任何输出"，跟"卡死"长得一模一样。所以下面几条用例把生成的
+# Python 原样执行一次，断言它真的产出了该产出的标记。
+
+
+def _run_body(command: str, cwd) -> str:
+    """把命令里的 Python 部分跑起来，返回 stdout+stderr
+
+    `PYTHONIOENCODING=utf-8`：脚本的标记正文里有中文，不钉死编码的话
+    Windows 上会按本地代码页（GBK）写 stdout，这里解出来就是乱码——
+    那是**测试脚手架**的问题，不是脚本的问题（判题器跑在 Linux 上）。
+    """
+    script = cwd / "_generated_script.py"
+    script.write_text(_body(command), encoding="utf-8")
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-u", str(script)],
+        cwd=str(cwd), env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    return proc.stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+
+
+@pytest.mark.parametrize("name", ("check", "verify"))
+def test_engineering_steps_actually_emit_check_marker(name, tmp_path):
+    """check / verify 必须真的打出 `[CHECK]` 标记
+
+    故障：脚本里写的是 `emit("CHECK", ok=…, code=…)`，而 `emit` 只收位置参数
+    ⇒ `TypeError: emit() got an unexpected keyword argument 'ok'`，脚本第一步
+    就崩。`[CHECK]` 于是从未出现过，`_step_satisfied("check")` 永远为假，
+    阶梯在 check→repair→verify 之间空转到任务超时——实测报文里第二个任务
+    整整 13 个回合全耗在这个循环上。
+    """
+    ws = tmp_path / "ws_1"
+    ws.mkdir()
+    spec = ws / "spec.md"
+    spec.write_text("## 目录要求\n- logs/alpha/ 必须存在\n", encoding="utf-8")
+    check = ws / "check"
+    check.write_text("exit 1\n", encoding="utf-8")
+
+    step = StepSpec(name).with_params(ws=str(ws), spec=str(spec), check=str(check))
+    out = _run_body(scripts.build(step, phase_task="", facts={}), ws)
+    assert "TypeError" not in out, out
+    assert "Traceback" not in out, out
+    assert "[CHECK]" in out, out
+    assert "[DONE] step=%s" % name in out, out
+
+
+def test_check_step_without_script_still_emits_marker(tmp_path):
+    """连 check 脚本都找不到时也要打 `[CHECK]`（同一个 emit 关键字参数错误）"""
+    ws = tmp_path / "ws_1"
+    ws.mkdir()
+    step = StepSpec("check").with_params(
+        ws=str(ws), spec=str(ws / "spec.md"), check=str(ws / "missing-check")
+    )
+    out = _run_body(scripts.build(step, phase_task="", facts={}), ws)
+    assert "TypeError" not in out, out
+    assert "[CHECK]" in out and "reason=no_check_script" in out, out
+
+
+# --- query：对着一个真的 HTTP 服务跑一遍 ----------------------------------
+
+STUB_KEY = "sk-heritage-2026"
+
+# 沙盒里那个接口的全部记录（用来算答案）
+STUB_RECORDS = [
+    {"name": "周口店遗址", "era": "旧石器时代", "type": "古遗址",
+     "protected_level": "世界遗产"},
+    {"name": "故宫", "era": "明", "type": "古建筑",
+     "protected_level": "世界遗产"},
+    {"name": "天坛", "era": "明", "type": "古建筑",
+     "protected_level": "全国重点文物保护单位"},
+]
+
+
+@pytest.fixture
+def stub_api():
+    """模拟沙盒里那个"端点存在、但不带鉴权就 401"的接口
+
+    复刻实测报文里的三个特征：
+      1. 端点要 `X-API-Key`，不带就 401；
+      2. 任务文档里给的"接口地址"是**带查询串的示例**；
+      3. 查询参数是中文，需要转义。
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 —— BaseHTTPRequestHandler 的接口
+            parsed = urlsplit(self.path)
+            if self.headers.get("X-API-Key") != STUB_KEY:
+                self._reply(401, {"error": "Missing 'X-API-Key' header"})
+                return
+            if parsed.path != "/api/v1/heritage/search":
+                self._reply(404, {"error": "no such endpoint"})
+                return
+            if parse_qs(parsed.query).get("city") != ["北京"]:
+                self._reply(200, {"total": 0, "records": []})
+                return
+            self._reply(200, {"total": len(STUB_RECORDS), "records": STUB_RECORDS})
+
+        def _reply(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):  # 别把测试输出刷满
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    httpd.daemon_threads = True
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield "http://127.0.0.1:%d" % httpd.server_address[1]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=3)
+
+
+def _query_task_doc(base: str) -> str:
+    """任务文档：刻意带上"带查询串的示例地址"与真实鉴权头（复刻实测报文）"""
+    return "\n".join([
+        "# 自进化任务 A-1：查询北京文化遗产",
+        "",
+        "系统提供了一个 API 服务，API 文档在 `API_DOCS.md` 中。",
+        "注意：由于该系统经过了长期迭代，文档中的部分字段内容已经发生变化。",
+        "",
+        "- 鉴权头：`X-API-Key: %s`" % STUB_KEY,
+        "- 调用示例：`%s/api/v1/heritage/search?city=北京&limit=100`" % base,
+        "",
+        "## 任务要求",
+        "",
+        "从 API 查询北京市的**全部**文化遗产记录，然后提交以下统计信息：",
+        "",
+        "```json",
+        "{",
+        '  "city": "北京",',
+        '  "total_count": <总记录条数>,',
+        '  "world_heritage_count": <保护级别为"世界遗产"的数量>,',
+        '  "types": ["<所有不重复的遗产类型，顺序不限>"],',
+        '  "oldest_era": "<年代最早的遗产名称>"',
+        "}",
+        "```",
+        "",
+        "## 提交形式",
+        "",
+        '```json',
+        '{"city":"北京","total_count":0,"world_heritage_count":0,'
+        '"types":["a","b"],"oldest_era":"c"}',
+        "```",
+        "",
+        "- 提交答案为数字/字符串敏感型，不能将数字0写成\"0\"，否则算错",
+        "",
+    ])
+
+
+def test_query_script_end_to_end_against_stub_api(stub_api, tmp_path):
+    """query 脚本必须真的取到数、算出正确的答案
+
+    这一条覆盖实测报文的三个连环坑（R13 的 `[APIFAIL]` 全在这一条里）：
+
+      1. **示例地址带查询串** → `split_base` 不砍掉它，拼出来就是
+         `…/search?city=北京&limit=100/api/v1/heritage/search` 这种畸形 URL；
+      2. **中文没转义** → `UnicodeEncodeError`（日志上伪装成"服务端出错"）；
+      3. **鉴权候选全是自指垃圾** → 旧实现把文档里的**头名**当成值，
+         生成 `X-API-Key: X-API-Key`，真正的密钥永远排不进 `auths[:4]`，
+         4 次请求全 401，最后交上去一份 `total_count: 0` 的废卷（得 16/80 分）。
+
+    修好之前这条用例必然失败：记录取不到，答案里每个聚合字段都是空/零。
+    """
+    (tmp_path / "task_1_alpha.md").write_text(
+        _query_task_doc(stub_api), encoding="utf-8"
+    )
+    step = StepSpec("query").with_params(ws=str(tmp_path))
+    out = _run_body(
+        scripts.build(step, phase_task="请阅读task_1_alpha.md，获取任务信息", facts={}),
+        tmp_path,
+    )
+
+    assert "Traceback" not in out, out
+    assert "UnicodeEncodeError" not in out, out
+    assert "[API]" in out and "status=200" in out, out
+    assert "[APIFAIL]" not in out.split("[SCAN]")[0], out
+
+    match = re.search(r"^\[ANSWER\] (\{.*\})$", out, re.M)
+    assert match, out
+    answer = json.loads(match.group(1))
+    assert answer["city"] == "北京"
+    assert answer["total_count"] == 3
+    assert answer["world_heritage_count"] == 2
+    assert answer["types"] == ["古建筑", "古遗址"]
+    assert answer["oldest_era"] == "周口店遗址"
+

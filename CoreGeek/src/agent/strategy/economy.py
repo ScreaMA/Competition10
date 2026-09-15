@@ -317,24 +317,53 @@ def _miner(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
     return None
 
 
+def keep_of(world: World, worker: Unit, name: str) -> int:
+    """这种矿至少留几块不卖（石材是围墙的唯一原料，铜铁纯换钱）"""
+    if name != WALL_MATERIAL:
+        return 0
+    # 还有墙要砌就留够一批的量，否则只留 1 块应急
+    return STONE_BATCH if defense.wall_sites(world) else STONE_RESERVE
+
+
+def sell_now(world: World, worker: Unit) -> tuple[str, int] | None:
+    """**此刻**能卖给小贩的东西，返回 (矿名, 数量)；没有则 None
+
+    这是"卖矿"这件事的**唯一判据**：`sell_urgent` / `should_sell`（该不该跑
+    这一趟）与 `_sell`（到了小贩跟前卖什么）必须共用它。分成两套判据会打架——
+    出发时认为"金币见底，必须卖"，走到了跟前又发现"这块石头要留着自己砌墙"，
+    于是原地折返；下一回合金币依然见底，又出发。
+
+    实测报文里就是这个形态：建造工背着 1 块石头、金币 16（< 25），在
+    (22,14)↔(21,15) 两个相邻格之间来回踱了 6 个回合，直到另一个工人卖了铜
+    把金币顶到 36 才脱身——从采到那块石头到砌上第一段墙，整整 28 个回合。
+    """
+    holding = [
+        item for item in ("copper", "iron", "stone") if worker.count(item) > 0
+    ]
+    for name in holding:
+        count = worker.count(name) - keep_of(world, worker, name)
+        if count > 0:
+            return name, count
+    return None
+
+
 def should_sell(world: World, worker: Unit) -> bool:
     """该不该去小贩那儿卖矿
 
     四条触发条件，任意一条成立即可：
 
     1. **金币见底**（`gold < 25`）：这是"金币冻结"的直接对策——只要背包里有
-       卖得掉的东西，就一定要把它换成金币。
-    2. **金币为 0 的兜底**：哪怕只有一块石头也卖（`gold == 0`）。
-    3. **背包快满**：采满了再卖会浪费回合。
-    4. **石材囤积**：超过围墙需求的部分留着没有意义（V1 里 stone 从 1 块
+       卖得掉的东西，就一定要把它换成金币。`gold == 0` 也在这一条里。
+    2. **背包快满**：采满了再卖会浪费回合。
+    3. **石材囤积**：墙都砌完了，背包里的石头就是纯负重（V1 里 stone 从 1 块
        堆到 3 块、金币从 R6 起恒 0 到 R17，工人背着石头空转）。
+
+    前置条件（先于以上三条）：`sell_now` 得真有东西可卖。**这条不能省**——
+    否则就是"跑过去发现自己不卖"，工人会在基地和小贩之间来回踱步。
     """
     turn = world.turn
-    sellable = [item for item in worker.backpack if item in ("stone", "iron", "copper")]
-    if not sellable:
+    if sell_now(world, worker) is None:
         return False
-    if turn.gold == 0:
-        return True
     if turn.gold < GOLD_LOW:
         return True
     if worker.capacity and len(worker.backpack) >= worker.capacity * BACKPACK_SELL_RATIO:
@@ -351,24 +380,12 @@ def _sell(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
     if vendor is None:
         return None
 
-    holding = [
-        item
-        for item in ("copper", "iron", "stone")
-        if worker.count(item) > 0
-    ]
-    if not holding:
+    picked = sell_now(world, worker)
+    if picked is None:
+        # 没有卖得掉的东西就**不要往小贩那儿走**——走了也是原地折返
         return None
-
     if distance(worker.pos, vendor) <= 1 and worker.pos != vendor:
-        name = holding[0]
-        count = worker.count(name)
-        # 石材留给围墙：至少留 STONE_RESERVE 块（还有墙要砌时留 STONE_BATCH）
-        if name == WALL_MATERIAL:
-            keep = STONE_BATCH if defense.wall_sites(world) else STONE_RESERVE
-            count -= keep
-        if count <= 0:
-            return None
-        return sell_command(name, count)
+        return sell_command(*picked)
 
     return _approach(world, worker, vendor, claimed)
 
@@ -419,19 +436,19 @@ def _approach(world: World, unit: Unit, target: Pos, claimed: set[Pos]) -> dict 
     return move_command(step)
 
 
-def _has_sellable(worker: Unit) -> bool:
-    return any(item in ("stone", "iron", "copper") for item in worker.backpack)
-
-
 def sell_urgent(world: World, worker: Unit) -> bool:
     """是否应该**立刻**去卖矿（金币见底）
 
     与 `should_sell` 的区别：这里的触发条件只有"没钱"一条，优先级高于一切
     建造/采集动作——没金币就什么都建不了、买不了。
+
+    前置条件与 `_sell` 一致（`sell_now` 得有东西可卖）。少了它就会变成
+    "金币见底 → 跑向小贩 → 到了发现这块石头要留着砌墙 → 转身走"的循环：
+    下一回合金币还是见底，于是又跑一趟。实测报文里这正是工人空转 6 回合的成因。
     """
-    if not _has_sellable(worker):
+    if world.turn.gold >= GOLD_LOW:
         return False
-    return world.turn.gold < GOLD_LOW
+    return sell_now(world, worker) is not None
 
 
 def _adjacent_mine(world: World, worker: Unit, kind: str) -> Pos | None:
