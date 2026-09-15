@@ -287,6 +287,86 @@ def test_summary_and_task_trace_do_not_crash(
     assert "回合" in capsys.readouterr().out
 
 
+def test_neutral_brief_carries_coordinates(
+    payload_factory, role_factory, zone_factory, caplog
+):
+    """`neutral=` 必须带坐标
+
+    只看数量时，"角色为什么一直往那一格走"是判不出来的——那一格是小贩、
+    是矿、还是空地，日志里没有任何线索。真实复盘里为了回答这个问题，是靠
+    另一个工人那条 `sell copper` 的落点反推出来的。
+    """
+    zones = [
+        zone_factory("stone", 30, 3),
+        zone_factory("stone", 12, 20),
+        zone_factory("vendor", 21, 15),
+    ]
+    with caplog.at_level(logging.INFO, logger="agent.brain"):
+        decide(payload_factory(
+            round_no=1,
+            roles=[role_factory(10013, "station", 20, 10)],
+            zones=zones,
+        ))
+    line = next(l for l in _lines(caplog) if l.startswith("request_decoded"))
+    # 格式沿用 `towers=`/`walls=` 的 `数量[坐标 …]`；矿在前、同类按坐标排
+    assert "neutral=stone:2[12,20 30,3],vendor:1[21,15]" in line
+
+
+def test_analyzer_reports_map_diagnosis(
+    payload_factory, role_factory, zone_factory, tmp_path, caplog
+):
+    """**往返测试**：`neutral=` 的坐标要能一路走到报告的「地图侧」那一格
+
+    这一格以前只能人工翻日志原文，而「没有小贩」与「有小贩但调度没去卖」是
+    两条互不通用的修法（前者改 `MINER_ORDER_NO_VENDOR`，后者才改调度）。
+    """
+    import analyze_log
+
+    with caplog.at_level(logging.INFO, logger="agent.brain"):
+        decide(payload_factory(
+            round_no=1,
+            roles=[role_factory(10013, "station", 20, 10)],
+            zones=[zone_factory("stone", 12, 20), zone_factory("vendor", 24, 14)],
+        ))
+    path = _dump(tmp_path, _lines(caplog))
+    stats = analyze_log.analyze(path)
+
+    assert stats.neutral_at(1)["stone"] == [(12, 20)]
+    origin = stats.base_pos()
+    assert origin is not None
+    distance = max(abs(12 - origin[0]), abs(20 - origin[1]))  # 切比雪夫
+
+    notes = "\n".join(stats.economy_diagnosis())
+    assert "小贩：有" in notes and "(24,14)" in notes
+    assert f"石矿：1 处，最近 (12,20) 离基地 {distance} 格" in notes
+    assert "铁矿：地图上没有" in notes
+
+    # 生成器要把这一格填进报告正文，而不是留成 `{待人工}`
+    report = analyze_log.render_template(stats, path)
+    assert "地图侧" in report
+    assert "石矿：1 处" in report
+
+
+def test_analyzer_flags_missing_vendor_with_the_right_fix(
+    payload_factory, role_factory, zone_factory, tmp_path, caplog
+):
+    """没有小贩 ⇒ 结论是"改采集目标"，不是"改调度"（两条修法不通用）"""
+    import analyze_log
+
+    with caplog.at_level(logging.INFO, logger="agent.brain"):
+        decide(payload_factory(
+            round_no=1,
+            roles=[role_factory(10013, "station", 20, 10)],
+            zones=[zone_factory("stone", 12, 20)],
+        ))
+    path = _dump(tmp_path, _lines(caplog))
+    stats = analyze_log.analyze(path)
+
+    notes = "\n".join(stats.economy_diagnosis())
+    assert "小贩：**没有**" in notes
+    assert "MINER_ORDER_NO_VENDOR" in notes
+
+
 # ==========================================================================
 # 自进化任务的全量日志（DEBUG 级 task_dump）
 # ==========================================================================

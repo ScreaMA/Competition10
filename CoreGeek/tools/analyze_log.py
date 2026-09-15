@@ -53,6 +53,16 @@ TOWER_ITEM_RE = re.compile(r"^([a-zA-Z]+)(\d+)@(-?\d+),(-?\d+)$")
 WALLS_RE = re.compile(r"^(\d+)\[(.*)\]$")
 WALL_ITEM_RE = re.compile(r"^l(\d+):(\d+)$")
 ACTIONS_RE = re.compile(r"(?=\d+:)")
+# `neutral=stone:6[29,14 12,3],vendor:1[21,15]` —— 值里有空格，要用 `_field_value`
+NEUTRAL_RE = re.compile(r"([A-Za-z][A-Za-z0-9_]*):(\d+)\[([^\]]*)\]")
+POS_RE = re.compile(r"(-?\d+),(-?\d+)")
+BASE_RE = re.compile(r"\((-?\d+),(-?\d+)\)")
+
+# 中立元素的中文名（只有这几类值得单独点名，其余按原名显示）
+NEUTRAL_NAMES = {
+    "stone": "石矿", "iron": "铁矿", "copper": "铜矿",
+    "vendor": "小贩", "weaponShop": "武器商店",
+}
 
 TOWER_NAMES = {"gatling": "加特林", "railgun": "电磁", "rocket": "火箭"}
 # ==========================================================================
@@ -235,6 +245,69 @@ class Stats:
             f"塔{state.get('enemy_towers', '?')}座 / 墙{state.get('enemy_walls', '?')}段"
         )
 
+    def base_pos(self) -> tuple[int, int] | None:
+        """基地 footprint 原点坐标（`base=(x,y)`）"""
+        if self.last is None:
+            return None
+        match = BASE_RE.match(self.last.state.get("base", ""))
+        return (int(match.group(1)), int(match.group(2))) if match else None
+
+    def neutral_at(self, round_no: int) -> dict[str, list[tuple[int, int]]]:
+        """某个回合的中立元素坐标：类型 -> [(x, y), …]
+
+        `neutral=` 的值里有空格（`stone:6[29,14 12,3]`），必须走
+        `_field_value` 取完整值——`_fields` 用的 `\\S+` 只会截到第一个坐标。
+        """
+        record = self.rounds.get(round_no)
+        if record is None:
+            return {}
+        out: dict[str, list[tuple[int, int]]] = {}
+        for name, _count, body in NEUTRAL_RE.findall(record.state.get("neutral", "")):
+            out[name] = [(int(x), int(y)) for x, y in POS_RE.findall(body)]
+        return out
+
+    def economy_diagnosis(self) -> list[str]:
+        """从 `neutral=` 直接得出的两条经济结论（模板 §二 的判据表）
+
+        这一格以前只能人工翻日志原文，而**没有小贩**与**有小贩但调度没去卖**
+        是完全相反的两个结论：前者要改采集目标（`MINER_ORDER_NO_VENDOR`），
+        后者才是调度问题，两者的修法不通用。矿到基地的距离同理——往返一趟的
+        成本决定"值不值得去采"，没有坐标这个账根本算不了。
+        """
+        neutrals = self.neutral_at(self.first_round)
+        if not neutrals:
+            return [f"中立元素：{PENDING}（日志里没有可解析的 `neutral=`）"]
+
+        origin = self.base_pos() or (0, 0)
+        notes: list[str] = []
+
+        vendor = neutrals.get("vendor") or []
+        if vendor:
+            spots = " / ".join(f"({x},{y})" for x, y in vendor)
+            notes.append(
+                f"小贩：有，{spots}（最近离基地 {_chebyshev(vendor[0], origin)} 格）"
+            )
+        else:
+            notes.append(
+                "小贩：**没有** ⇒ 矿石卖不出去、金币再也回不来；"
+                "此时采集工应当改采石（`MINER_ORDER_NO_VENDOR`），"
+                "而不是当成「调度没去卖」去改调度"
+            )
+
+        for kind in ("stone", "iron", "copper"):
+            spots = neutrals.get(kind) or []
+            if not spots:
+                notes.append(f"{NEUTRAL_NAMES[kind]}：地图上没有")
+                continue
+            distance, nearest = min(
+                (_chebyshev(spot, origin), spot) for spot in spots
+            )
+            notes.append(
+                f"{NEUTRAL_NAMES[kind]}：{len(spots)} 处，"
+                f"最近 ({nearest[0]},{nearest[1]}) 离基地 {distance} 格"
+            )
+        return notes
+
     def task_summary(self) -> str:
         return f"交卷{self.submitted}次 / 领任务{self.accepted}次"
 
@@ -329,6 +402,11 @@ def _float(text: str, default: float = 0.0) -> float:
     return float(match.group(0)) if match else default
 
 
+def _chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
+    """切比雪夫距离——任务书 §4.5.4 规定的移动/攻击距离口径"""
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
 def _add_event(stats: Stats, round_no: int, text: str, limit: int = 40) -> None:
     if any(existing == text for _, existing in stats.events):
         return
@@ -392,6 +470,9 @@ def analyze(log_file: Path, window: tuple[int, int] | None = None) -> Stats | No
                 record.state["walls"] = _field_value(line, "walls")
                 record.state["chars"] = _field_value(line, "chars")
                 record.state["bag"] = _field_value(line, "bag")
+                # `neutral=` 的值里有空格（`stone:6[29,14 12,3]`），`\S+` 只会
+                # 截到第一个坐标，必须取完整值
+                record.state["neutral"] = _field_value(line, "neutral")
                 continue
 
             if "strategy_done" in line:
@@ -547,6 +628,8 @@ def print_summary(stats: Stats, log_file: Path) -> None:
     print(f"角色空转  : {stats.idle_units} 人·回合（占比 {stats.idle_ratio:.1%}）")
     print(f"任务      : {stats.task_summary()}，下发沙盒 {stats.sandbox_rounds} 回合")
     print(f"建造/卖矿 : {stats.builds} 次建造，{stats.sells} 次卖矿")
+    for note in stats.economy_diagnosis():
+        print(f"  地图     : {note}")
     if stats.alerts:
         print(f"冻结告警  : {len(stats.alerts)} 次（首次 "
               f"R{_int(_fields(stats.alerts[0]).get('round', '0'))}）")
@@ -703,6 +786,15 @@ def render_template(stats: Stats, log_path: Path) -> str:
         f"- 金币总收入 {stats.gold_in}，总支出 {stats.gold_out}",
         f"- 建造支出合计：{sum(spend for _, spend in stats.spends)}"
         f"（{len(stats.spends)} 个回合有支出）",
+        "",
+        "**地图侧（`neutral=` 自动解析，判据见 §二）**：",
+    ]
+    lines += [f"- {note}" for note in stats.economy_diagnosis()]
+    lines += [
+        "",
+        "> 往返一趟矿的成本就写在上面的距离里（切比雪夫距离，任务书 §4.5.4）；"
+        "「工人一直没去采」之前要先看这一格——**没有小贩**与**有小贩没去卖**"
+        "是两条不同的修法。",
         "",
         "---",
         "",

@@ -169,7 +169,7 @@ request_decoded round=85 day=1 tod=night round_in_day=85 team=challenger team_id
                 gold=20 gold_delta=-25 score=280 base=(10,23) hp=1500/1500
                 towers=3[rocket1@9,25 railgun1@10,25 gatling1@9,24] walls=2[l1:2]
                 robots=4[s1 m1 l1 b1] near=9@20,24 enemy_visible=1 enemy_towers=0
-                neutral=stone:6,iron:4,copper:4,vendor:1,weaponShop:1
+                neutral=stone:6[3,3 12,29 17,5 24,12 31,30 36,20],iron:4[…],copper:4[…],vendor:1[21,15],weaponShop:1[38,4]
                 tasks=[…] phase='…' task=execute
                 plan=step=query idx=1 r=0 chars=10010@5,23 … bag=10012{copper×21}
 strategy_done   round=85 commands=3 elapsed=0.62ms gold_spent=25

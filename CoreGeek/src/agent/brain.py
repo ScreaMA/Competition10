@@ -409,23 +409,43 @@ def _enemy_brief(turn: Turn) -> str:
 
 
 def _neutral_brief(turn: Turn) -> str:
-    """地图上的中立元素清单（矿 / 小贩 / 武器商店 / 任务点）
+    """地图上的中立元素清单（矿 / 小贩 / 武器商店 / 任务点），**带坐标**
 
-    只报矿是不够的：**没有小贩 = 永远卖不出矿 = 金币永远回不来**，而这一条在
-    日志里曾经完全看不出来（真实对局里金矿从 R9 起恒为 0、工人背包里攒着铜却
-    一直没卖，光看 `mines=` 根本判不出是"没小贩"还是"调度没去卖"）。
+    只报数量是不够的，这一条被真实复盘卡过：日志里工人背着 1 块石头在
+    (22,14)↔(21,15) 之间来回踱了 6 个回合，而"那一格有什么"从数量栏里完全
+    看不出来——是小贩、是矿、还是空地？最后是靠另一个工人那条 `sell copper`
+    的落点反推出来的。**为了回答"角色为什么往那儿走"要绕这么大一圈，正是
+    这个字段缺坐标的直接代价。**
+
+    两类判据都靠它：
+
+    - **有没有 `vendor`**：没有小贩 = 卖不出矿 = 金币再也回不来，此时采集工
+      应当改采石（`MINER_ORDER_NO_VENDOR`）——而"没有小贩"与"有小贩但调度
+      没去卖"是完全相反的两个结论，只看数量是分不出来的。
+    - **矿离基地多远**：往返一趟的成本决定"值不值得去采"，配合同行的
+      `base=(x,y)` 就能算。
+
+    格式沿用 `_tower_brief` 的 `数量[坐标 …]` 写法。注意值里**含空格**，
+    分析侧必须用 `_field_value` 取完整值，走 `\\S+` 那种只会截到第一个空格。
     """
-    counts: dict[str, int] = {}
-    for name in turn.zones.values():
-        counts[name] = counts.get(name, 0) + 1
-    if not counts:
+    groups: dict[str, list[Pos]] = {}
+    for pos, name in turn.zones.items():
+        groups.setdefault(name, []).append(pos)
+    if not groups:
         return "-"
     # 矿放前面（最常用），其余按名字排
     order = {"stone": 0, "iron": 1, "copper": 2, "vendor": 3, "weaponShop": 4}
     return ",".join(
-        f"{name}:{count}"
-        for name, count in sorted(
-            counts.items(), key=lambda kv: (order.get(kv[0], 9), kv[0])
+        "%s:%d[%s]" % (
+            name,
+            len(spots),
+            " ".join(
+                f"{spot.x},{spot.y}"
+                for spot in sorted(spots, key=lambda p: (p.x, p.y))
+            ),
+        )
+        for name, spots in sorted(
+            groups.items(), key=lambda kv: (order.get(kv[0], 9), kv[0])
         )
     )
 
