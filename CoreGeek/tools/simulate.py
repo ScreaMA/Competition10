@@ -439,16 +439,20 @@ def main() -> None:
     parser.add_argument("--log", default="", help="日志文件（默认打到 stdout）")
     args = parser.parse_args()
 
+    # 文件收 DEBUG（含 task_dump 全量任务日志），stdout 只收 INFO；
+    # 与 main3.py 的双通道配置一致，模拟出来的日志和真机同构。
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     handlers: list[logging.Handler] = []
     if args.log:
-        handlers.append(logging.FileHandler(args.log, encoding="utf-8"))
-    else:
-        handlers.append(logging.StreamHandler(sys.stdout))
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        handlers=handlers,
-    )
+        file_handler = logging.FileHandler(args.log, encoding="utf-8", mode="w")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(fmt)
+        handlers.append(file_handler)
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setLevel(logging.INFO)
+    stream.setFormatter(fmt)
+    handlers.append(stream)
+    logging.basicConfig(level=logging.DEBUG, handlers=handlers)
 
     started = time.perf_counter()
     simulator = Simulator(rounds=args.rounds, team=args.team)

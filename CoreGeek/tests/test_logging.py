@@ -285,3 +285,95 @@ def test_summary_and_task_trace_do_not_crash(
     analyze_log.print_summary(stats, path)
     analyze_log.print_task_trace(stats)
     assert "回合" in capsys.readouterr().out
+
+
+# ==========================================================================
+# 自进化任务的全量日志（DEBUG 级 task_dump）
+# ==========================================================================
+
+
+def test_task_dump_emitted_for_task_rounds(
+    payload_factory, role_factory, task_factory, caplog
+):
+    """任务回合要打全量日志：任务描述 / 下发的沙盒命令 / 沙盒回包 / 提交的答案
+
+    INFO 那三行是给复盘按字段读的，一律截断压行；排查任务问题要看的是**原文**，
+    所以这些走 DEBUG（只进 `debug.log`，不进判题器收到的 stdout）。
+    """
+    roles = [role_factory(10013, "station", 20, 10),
+             role_factory(10011, "pioneer", 24, 11)]
+    tasks = [task_factory("自进化类1", 24, 12)]
+
+    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+        # 第 1 回合领任务、第 2 回合任务开始并下发 recon
+        decide(payload_factory(round_no=1, roles=roles, player_tasks=tasks))
+        decide(payload_factory(
+            round_no=2, roles=roles, player_tasks=tasks,
+            phase_task="请阅读task_1_beijing.md，获取任务信息" * 3,
+        ))
+    dumps = [r.getMessage() for r in caplog.records if "task_dump" in r.getMessage()]
+    kinds = {line.split("kind=")[1].split()[0] for line in dumps}
+    assert "phase_task" in kinds, dumps
+    assert "execute_cmd" in kinds, dumps
+
+
+def test_task_dump_not_emitted_without_task(payload_factory, base_roles, caplog):
+    """没任务就一行都不多打——否则 debug.log 会被撑爆"""
+    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+        decide(payload_factory(round_no=1, roles=base_roles))
+    assert not [r for r in caplog.records if "task_dump" in r.getMessage()]
+
+
+def test_task_dump_is_single_line(payload_factory, role_factory, task_factory, caplog):
+    """多行正文必须转义（分析侧按行读）"""
+    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+        decide(payload_factory(
+            round_no=2,
+            roles=[role_factory(10013, "station", 20, 10),
+                   role_factory(10011, "pioneer", 24, 11)],
+            player_tasks=[task_factory("自进化类1", 24, 12)],
+            phase_task="第一行\n第二行\r\n第三行",
+        ))
+    for record in caplog.records:
+        message = record.getMessage()
+        if "task_dump" in message:
+            assert "\n" not in message
+            assert "\r" not in message
+
+
+def test_task_dump_survives_roundtrip_through_analyzer(
+    payload_factory, role_factory, task_factory, tmp_path, caplog
+):
+    """转义 → 还原必须逐字节一致（原文里有反斜杠也不能被吃掉）
+
+    沙盒命令里全是转义过的换行，还原错一位这条日志就没法用来查问题了。
+    """
+    import analyze_log
+
+    raw = 'python3 - <<' + "'PYEOF'\n" + 'print("a\\nb")\nPYEOF'
+    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+        decide(payload_factory(
+            round_no=2,
+            roles=[role_factory(10013, "station", 20, 10),
+                   role_factory(10011, "pioneer", 24, 11)],
+            player_tasks=[task_factory("自进化类1", 24, 12)],
+            phase_task=raw,
+        ))
+    path = _dump(tmp_path, [r.getMessage() for r in caplog.records])
+    stats = analyze_log.analyze(path)
+    restored = [text for _, kind, text in stats.dumps if kind == "phase_task"]
+    assert restored, stats.dumps
+    assert restored[0] == raw
+
+
+def test_full_mode_reports_when_nothing_to_show(capsys, tmp_path):
+    import analyze_log
+
+    path = tmp_path / "empty.log"
+    path.write_text(
+        "2026-09-15 00:00:00,000 | INFO | agent.brain | request_decoded round=1\n",
+        encoding="utf-8",
+    )
+    stats = analyze_log.analyze(path)
+    analyze_log.print_full(stats)
+    assert "task_dump" in capsys.readouterr().out

@@ -36,6 +36,7 @@ python tools/analyze_log.py --log sim.log            # 回合统计
 python tools/analyze_log.py --log sim.log --task     # 自进化任务链路
 python tools/analyze_log.py --log sim.log --template # 复盘填空稿（自动填 6~7/7 项）
 python tools/analyze_log.py --log sim.log --issue    # Issue 正文骨架（含日志原文位）
+python tools/analyze_log.py --log sim.log --full     # 任务的**全量**日志（题面/沙盒命令/沙盒回包/提交的答案）
 
 # 一键联调（启动客户端→发请求→打印响应）
 bash tools/test_client.sh 8000
@@ -179,6 +180,11 @@ task_event      round=85 event=submit key="api-query|city,…" step=query
 day_summary     day=1 rounds=1-130 kills=23 gold_peak=120 build=8 task_submit=3 …
 freeze_alert    round=200 gold=0 stalled_rounds=20 bag=10012{stone×3}
 ```
+
+**凡是碰到自进化任务的回合**，还会额外打一组 DEBUG 级的全量日志
+（`task_dump`：题面全文 / 下发的沙盒命令全文 / 沙盒原样回的内容 / LLM 问答 /
+提交的答案 / 任务链路内部状态）——INFO 行是给机器按字段读的，一律截断；
+排查任务问题看的是这一组，用 `--full` 还原成多行。
 
 比 V1 多出来的是**逐回合增量**（击杀/掉血/建筑损失/空转）、**任务链路事件**
 （start/step/submit/abandon/skill）与**金币停滞自动告警**——V1 报告里大量

@@ -6,6 +6,7 @@
     python CoreGeek/tools/analyze_log.py --template          # 渲染日志分析模板 V2
     python CoreGeek/tools/analyze_log.py --issue             # 渲染 Issue 总结模板 V2
     python CoreGeek/tools/analyze_log.py --task              # 只看自进化任务链路
+    python CoreGeek/tools/analyze_log.py --full              # 任务全量日志（原文）
     python CoreGeek/tools/analyze_log.py --rounds 1-130      # 只看某个回合区间
     python CoreGeek/tools/analyze_log.py --out report.md     # 写到文件
 
@@ -109,6 +110,9 @@ class Stats:
 
     # 时间线（首次出现的事件）
     events: list[tuple[int, str]] = field(default_factory=list)
+
+    # 任务全量转储：[(回合, kind, 原文)]，来自 DEBUG 级的 `task_dump` 行
+    dumps: list[tuple[int, str, str]] = field(default_factory=list)
 
     # --- 汇总属性 ---
 
@@ -284,6 +288,36 @@ def _field_value(line: str, key: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _unescape(text: str) -> str:
+    """还原 `task_dump` 的转义（`brain._escape` 的逆运算）
+
+    必须**从左到右扫描**，不能连着做几次 `replace`：原文里本来就可能有
+    反斜杠（我们下发给沙盒的命令里全是），逐次替换会把它二次解读。
+    """
+    out: list[str] = []
+    index = 0
+    source = text or ""
+    while index < len(source):
+        char = source[index]
+        if char == "\\" and index + 1 < len(source):
+            nxt = source[index + 1]
+            if nxt == "n":
+                out.append("\n")
+                index += 2
+                continue
+            if nxt == "r":
+                out.append("\r")
+                index += 2
+                continue
+            if nxt == "\\":
+                out.append("\\")
+                index += 2
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def _int(text: str, default: int = 0) -> int:
     match = re.match(r"-?\d+", text or "")
     return int(match.group(0)) if match else default
@@ -388,6 +422,15 @@ def analyze(log_file: Path, window: tuple[int, int] | None = None) -> Stats | No
 
             if "freeze_alert" in line:
                 stats.alerts.append(line.strip())
+                continue
+
+            if "task_dump" in line:
+                fields = _fields(line)
+                stats.dumps.append((
+                    _int(fields.get("round", "0")),
+                    fields.get("kind", "?"),
+                    _unescape(_field_value(line, "text")),
+                ))
                 continue
 
     if window is not None:
@@ -510,6 +553,30 @@ def print_summary(stats: Stats, log_file: Path) -> None:
     print(f"错误条数  : {len(stats.errors)}")
     for line in stats.errors[:10]:
         print(f"  {line}")
+
+
+def print_full(stats: Stats) -> None:
+    """打印自进化任务的**全量日志**（`--full`）
+
+    这些是 `debug.log` 里 DEBUG 级的 `task_dump` 行，还原成多行后打印：
+    任务描述原文、我们下发的沙盒命令、沙盒原样回的什么、提交的答案、
+    LLM 的 prompt 与回复。INFO 那三行是给复盘按字段读的，排查问题要看这个。
+    """
+    if not stats.dumps:
+        print("（日志里没有 task_dump 行——只有涉及自进化任务的回合才会打，")
+        print("  另外它走 DEBUG 级，确认 debug.log 是用默认配置写的）")
+        return
+
+    current = None
+    for round_no, kind, text in stats.dumps:
+        if round_no != current:
+            current = round_no
+            print()
+            print("=" * 70)
+            print(f"回合 R{round_no}")
+            print("=" * 70)
+        print(f"--- {kind} ---")
+        print(text if text.strip() else "（空）")
 
 
 def print_task_trace(stats: Stats) -> None:
@@ -963,6 +1030,8 @@ def main() -> None:
     parser.add_argument("--issue", action="store_true",
                         help="渲染 战术参考/Issue总结模板V2.md 的正文骨架")
     parser.add_argument("--task", action="store_true", help="只打印任务链路")
+    parser.add_argument("--full", action="store_true",
+                        help="打印自进化任务的全量日志（任务描述/沙盒命令/沙盒输出/提交的答案）")
     parser.add_argument("--rounds", default="", help="只看某个回合区间，如 1-130 或 85")
     parser.add_argument("--out", default="", help="输出文件（默认打印到终端）")
     args = parser.parse_args()
@@ -978,6 +1047,9 @@ def main() -> None:
         body = render_issue(stats, log_path)
     elif args.task:
         print_task_trace(stats)
+        raise SystemExit(0)
+    elif args.full:
+        print_full(stats)
         raise SystemExit(0)
     else:
         print_summary(stats, log_path)

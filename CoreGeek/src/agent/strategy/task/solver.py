@@ -868,3 +868,38 @@ class TaskSolver:
 def plan(world: World) -> TaskPlan:
     """模块级入口（每次构造 solver 的代价可以忽略）"""
     return TaskSolver().plan(world)
+
+
+def describe_state() -> str:
+    """当前任务运行状态 + 技能库的多行摘要（给 `task_dump` 用）
+
+    回答的是"日志里看不出为什么"的那几个问题：这一步试了几次、输出重复了几次、
+    交过什么、被拒过什么、LLM 兜底有没有用上、技能库里现在有什么。
+    """
+    run = MEMORY.run
+    lines: list[str] = []
+    if run is not None:
+        lines.append(
+            f"run key={run.key} family={run.family} "
+            f"state={run.state.value} step_index={run.step_index} "
+            f"attempts={run.attempts} repeats={run.repeats} "
+            f"accepted_round={run.accepted_round} deadline={run.deadline} "
+            f"skill_used={run.skill_used} repair_rounds={run.repair_rounds}"
+        )
+        lines.append(
+            f"  submitted={len(run.submitted)} rejected={len(run.rejected)} "
+            f"generic_tried={run.generic_tried} llm_requested={run.llm_requested} "
+            f"llm_command={'yes' if run.llm_command else 'no'}"
+        )
+        lines.append(f"  steps={[s.name for s in run.used_steps]}")
+        lines.append(f"  evidence={sorted(run.evidence)[:12]}")
+        for answer in run.rejected:
+            lines.append(f"  rejected_answer={answer[:200]}")
+    if MEMORY.facts:
+        lines.append(f"facts={MEMORY.facts}")
+    if MEMORY.skills:
+        for signature, skill in MEMORY.skills.items():
+            lines.append(f"skill {skill.summary()} signature={signature}")
+    else:
+        lines.append("skills=(空)")
+    return "\n".join(lines)

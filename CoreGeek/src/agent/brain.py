@@ -99,11 +99,107 @@ def _decide(payload: dict[str, Any]) -> dict[str, Any]:
     # 4) 记账 + 日志（记账必须在日志之前：`record_round` 会把本回合的动作存下来，
     #    下一回合用它把判题器的失败回执翻译成"角色ID:动作"）
     elapsed_ms = (time.perf_counter() - started) * 1000.0
+    _dump_task_context(turn, task_plan, commands)
     _account(turn, world, commands, task_plan, learned, delta, elapsed_ms)
     return build_response(
         commands,
         prompt=task_plan.prompt,
         sandbox_command=task_plan.sandbox_command,
+    )
+
+
+# 单条 task_dump 的长度上限（防止某次沙盒输出把 debug.log 撑爆）
+TASK_DUMP_LIMIT = 200_000
+
+
+def _dump_task_context(
+    turn: Turn,
+    task_plan: TaskPlan,
+    commands: dict[int, dict[str, Any]],
+) -> None:
+    """**自进化任务相关的全量日志**（DEBUG 级，只进 `debug.log`）
+
+    INFO 那三行是给复盘流水线按字段读的，所以一律截断、压行；
+    任务出问题时真正要看的却是**原文**：任务描述写了什么、我们下发了哪条
+    沙盒命令、沙盒原样回了什么、提交的答案长什么样。这些在 INFO 里都看不到，
+    于是 V1 的复盘只能靠"反推"——报告里那句"日志未覆盖"多半就是指这个。
+
+    设计取舍：
+
+    - **只进 DEBUG**。`debug.log` 收 DEBUG、stdout 收 INFO，所以判题器那一侧
+      的报文长度不受影响，而复盘要的原文全在文件里。
+    - **换行转义成 `
+`**。保持"一行一条记录"的不变量，分析侧按行读不会散；
+      `analyze_log.py --full` 会还原成多行给你看。
+    - **只在涉及任务时打**。非任务回合一行都不多写。
+
+    只打**与当前这一回合相关**的东西，不做全量战场转储——后者在
+    `request_decoded` 里已经有了。
+    """
+    if not LOGGER.isEnabledFor(logging.DEBUG):
+        return
+
+    # 只有**这一回合确实碰了任务**才打。否则每个普通回合都跟着一条
+    # `run_state`，debug.log 会被无意义的内容撑大。
+    touches_task = bool(
+        turn.phase_task
+        or turn.last_cmd_result
+        or task_plan.sandbox_command
+        or task_plan.prompt
+        or turn.llm_resp
+        or task_plan.events
+        or any(
+            c.get("action") in ("acceptTask", "submitAnswer")
+            for c in commands.values()
+        )
+    )
+    if not touches_task:
+        return
+
+    dumps: list[tuple[str, str]] = []
+    if turn.phase_task:
+        dumps.append(("phase_task", turn.phase_task))
+    if turn.last_cmd_result:
+        dumps.append(("last_cmd_result", turn.last_cmd_result))
+    if task_plan.sandbox_command:
+        dumps.append(("execute_cmd", task_plan.sandbox_command))
+    if task_plan.prompt:
+        dumps.append(("llm_prompt", task_plan.prompt))
+    if turn.llm_resp:
+        dumps.append(("llm_resp", turn.llm_resp))
+    for unit_id, command in sorted(commands.items()):
+        if command.get("action") == "submitAnswer":
+            dumps.append((f"submit_answer@{unit_id}", str(command.get("taskAnswer") or "")))
+
+    # 任务子系统的内部状态：这是"为什么这一步又重试了 / 技能为什么没复用"的唯一
+    # 直接证据——`task_event` 只给状态变化，中间态在这里。
+    state = solver.describe_state()
+    if state:
+        dumps.append(("run_state", state))
+
+    # 打在任务链路事件之前不合适（事件是 INFO 行），所以这里只放 DEBUG 转储
+
+    for kind, text in dumps:
+        body = _escape(text)
+        if len(body) > TASK_DUMP_LIMIT:
+            body = body[:TASK_DUMP_LIMIT] + "\\n[CLIPPED]"
+        LOGGER.debug(
+            "task_dump round=%d kind=%s bytes=%d text=%s",
+            turn.round_no, kind, len(text), body,
+        )
+
+
+def _escape(text: str) -> str:
+    """把多行正文压成单行
+
+    **先转义反斜杠**：原文里可能本来就写着转义过的换行（我们下发给沙盒的那条
+    命令里全是这种字面量），不先处理它就会被后面的换行转义二次解读，
+    `analyze_log --full` 还原出来就是错的。
+    """
+    return (
+        text.replace("\\", "\\\\")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
     )
 
 
