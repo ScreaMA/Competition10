@@ -196,6 +196,12 @@ freeze_alert    round=200 gold=0 stalled_rounds=20 bag=10012{stone×3}
 结构化那几行是给机器按字段读的、一律截断，排查任务问题要看的是这一组；
 本地用 `--full` 还原成多行。单条上限 200KB，可用环境变量 `TASK_DUMP_LIMIT` 调整。
 
+**脚本正文不进 stdout**：`execute_cmd` 只打参数摘要（`step=query params={…}`）——
+正文由 `scripts.build(step, 参数)` 从仓库里的模板确定性生成，参数就是全部输入。
+这么做是因为实测全文占了整份日志的 **70%**（每回合 6–8KB），把 INFO 的预算吃光，
+两次真实日志都在 ~180–200KB 处从记录中间截断、**夜间一条都没采到**。
+要全文时打开 `TASK_DUMP_FULL=1`，或直读本地 `debug.log`（全文一直在 DEBUG 上）。
+
 比 V1 多出来的是**逐回合增量**（击杀/掉血/建筑损失/空转）、**任务链路事件**
 （start/step/submit/abandon/skill）与**金币停滞自动告警**——V1 报告里大量
 "日志未覆盖"的结论就是因为日志只有状态快照、没有增量。

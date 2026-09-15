@@ -465,3 +465,44 @@ def test_full_mode_reports_when_nothing_to_show(capsys, tmp_path):
     stats = analyze_log.analyze(path)
     analyze_log.print_full(stats)
     assert "task_dump" in capsys.readouterr().out
+
+
+def test_execute_cmd_dump_is_a_summary_not_the_whole_script(
+    payload_factory, role_factory, task_factory, caplog
+):
+    """`execute_cmd` 进 stdout 的必须是**参数摘要**，不是脚本全文
+
+    全文占了整份日志的 **70%**（每回合 6–8KB），把 INFO 的预算吃光——两次真实
+    日志都在 ~180–200KB 处**从记录中间截断**，`tod=night` 一条都没有，于是
+    "夜里炮塔为什么没人操作"根本无从查起。
+
+    正文没丢：它由 `scripts.build(step, 参数)` 从仓库里的模板确定性生成，
+    而这行摘要里的参数就是全部输入。要原文时 `TASK_DUMP_FULL=1`，或看
+    `debug.log`（全文一直在 DEBUG 上）。
+    """
+    roles = [role_factory(10013, "station", 20, 10),
+             role_factory(10011, "pioneer", 24, 11)]
+    tasks = [task_factory("自进化类1", 24, 12)]
+    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+        decide(payload_factory(round_no=1, roles=roles, player_tasks=tasks))
+        decide(payload_factory(
+            round_no=2, roles=roles, player_tasks=tasks,
+            phase_task="请阅读task_1_beijing.md，获取任务信息",
+        ))
+
+    def dumps(level):
+        return [r.getMessage() for r in caplog.records
+                if "task_dump" in r.getMessage() and "kind=execute_cmd " in r.getMessage()
+                and r.levelno == level]
+
+    info = dumps(logging.INFO)
+    assert info, "没有 INFO 的 execute_cmd 转储"
+    for line in info:
+        assert "step=" in line and "params=" in line, line
+        assert len(line) < 2000, "INFO 里出现了脚本全文：%d 字节" % len(line)
+        assert "PYEOF" not in line, "INFO 里出现了脚本正文"
+
+    # 全文照旧发一份，但走 DEBUG（落本地 debug.log）
+    debug = dumps(logging.DEBUG)
+    assert debug, "全文没有走 DEBUG"
+    assert any("PYEOF" in line for line in debug), "DEBUG 里没有脚本正文"

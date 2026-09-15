@@ -80,6 +80,10 @@ class TaskPlan:
     action: str = Action.IDLE
     pioneer_command: dict[str, Any] | None = None
     sandbox_command: str = ""
+    #: 这一步的参数摘要（不含脚本正文），给决策日志用。正文由
+    #: `scripts.build(step, 参数)` 确定性生成，所以参数就是全部输入——
+    #: 记摘要能把 `execute_cmd` 从 6–8KB 压到几百字节，见 `scripts.summarize`。
+    sandbox_summary: str = ""
     prompt: str = ""
     note: str = ""
     submit_payload: str | None = None
@@ -656,9 +660,10 @@ class TaskSolver:
         run.remember_step(step)
         run.pending_round = world.turn.round_no
         run.state = RunState.EXPLORE
+        phase_task = world.turn.phase_task
         command = scripts.build(
             step,
-            phase_task=world.turn.phase_task,
+            phase_task=phase_task,
             facts=self.memory.facts,
             check_output=run.check_output,
         )
@@ -667,6 +672,12 @@ class TaskSolver:
             Action.EXECUTE,
             pioneer_command=self._hold_position(world, run),
             sandbox_command=command,
+            sandbox_summary=scripts.summarize(
+                step,
+                phase_task=phase_task,
+                facts=self.memory.facts,
+                check_output=run.check_output,
+            ),
             prompt=self._maybe_prompt(run, world),
             note=note,
             hold=True,
@@ -843,6 +854,8 @@ class TaskSolver:
                 Action.EXECUTE,
                 pioneer_command=self._hold_position(world, run),
                 sandbox_command=command,
+                # LLM 给的是一条现成命令（≤800 字符），本身就是它的摘要
+                sandbox_summary="step=llm cmd=%s" % command[:400],
                 note="step=llm",
                 hold=True,
             )
@@ -875,6 +888,9 @@ class TaskSolver:
                 Action.EXECUTE,
                 pioneer_command=self._hold_position(world, run),
                 sandbox_command=command,
+                sandbox_summary=scripts.summarize(
+                    step, phase_task=turn.phase_task, facts=self.memory.facts
+                ),
                 note="step=generic",
                 hold=True,
             )

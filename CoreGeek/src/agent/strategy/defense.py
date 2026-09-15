@@ -16,12 +16,14 @@ V1 的塔位是一组写死的常量（实测落在 `(30,8)/(29,9)/(30,11)`，�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
+from itertools import combinations, permutations
 
 from .. import grid
 from ..protocol import (
+    CHARACTER_TYPES,
     GATLING,
     GATLING_CONE_DEGREES,
+    LAND,
     RAILGUN,
     ROCKET,
     ROCKET_MISSILE_DAMAGE,
@@ -31,6 +33,7 @@ from ..protocol import (
     Robot,
     Turn,
     Unit,
+    attack_command,
     distance,
     move_command,
     neighbours,
@@ -54,6 +57,17 @@ SIDE_ORDER = ("up", "down", "left", "right")
 
 # 天黑前预留几个回合回防（路程正好等于剩余回合时才出发就太紧了）
 DUSK_MARGIN = 1
+
+# 判断"够不够得着这座塔"时，最多向外搜几步。
+#
+# 这不是可有可无的优化：夜间配位每回合都要问 人×塔 次"够不够得着"，不限深
+# 就是全图 BFS，实测把单回合决策从 0.9ms 抬到 10.4ms（local_check 的 1300
+# 回合基线）；限深 8 之后是 2.5ms，而要求是 <1s/回合，余量足够。
+#
+# 限深还有个好性质：**它只改变"有区分度"的判断**。从任务点往回走的角色可能
+# 离三座塔都超过 8 步，那时三座塔一律判"够不着"，排序自动退回按距离——正是
+# 该有的行为。
+REACH_PROBE_STEPS = 8
 
 # 只在"距天黑还剩这么多回合"以内才去算回防距离。
 # 再早就不用回：哪怕要走 20 步也来得及。这条早退是性能上限——
@@ -379,17 +393,20 @@ def night_actions(
     weapons = list(turn.towers())
     claimed: set[Pos] = set()
     actions: list[NightAction] = []
-    paired_weapons: set[int] = set()
     paired_characters: set[int] = set()
 
     if robots:
-        for weapon, controller in _pair(characters, weapons):
-            paired_weapons.add(weapon.unit_id)
+        # `assigned` 只装**已经有人站到位、真的在开火**的塔。装"所有已配对的塔"
+        # 是不行的：三塔三人时最后一个人看到的就是全集，换塔那条路直接死掉。
+        covered: set[int] = set()
+        for weapon, controller in _pair(world, characters, weapons):
             paired_characters.add(controller.unit_id)
             actions.append(_act(
                 world, weapon, controller, robots, claimed,
-                assigned=frozenset(paired_weapons),
+                assigned=frozenset(covered),
             ))
+            if distance(controller.pos, weapon.pos) <= 1:
+                covered.add(weapon.unit_id)
 
     for character in characters:
         if character.unit_id in paired_characters:
@@ -400,40 +417,109 @@ def night_actions(
     return actions
 
 
+def _static_blockers(world: World) -> set[Pos]:
+    """反向可达性用的障碍：**建筑 + 中立 + 机器人**，不含角色
+
+    `grid.reachable()` 默认只看地形（它本来是为"预演建成后的连通性"写的），
+    但夜里真正把路堵死的是**机器人**：任务书 §4.1 规定机器人与角色都阻挡移动。
+    实测报文里开拓者就是这么被闷在基地东南角的——旁边的机器人一直不动，
+    地形上算"连通"，实际一步也走不了。
+
+    **刻意不把角色算进去**：反向搜索要回答的是"这个人够不够得着这座塔"，
+    把他自己当成障碍会让每个人把自己判成到不了。代价是忽略了"队友挡路"
+    这一个小情形——真发生时 `_act` 的换塔兜底会接住。
+    """
+    turn = world.turn
+    blocked = {pos for pos, name in turn.zones.items() if name != LAND}
+    blocked |= {
+        pos
+        for unit in turn.ours
+        if unit.is_alive and unit.kind not in CHARACTER_TYPES
+        for pos in turn.footprint(unit)
+    }
+    blocked |= {robot.pos for robot in turn.robots if robot.is_alive}
+    return blocked
+
+
 def _pair(
+    world: World,
     characters: list[Unit],
     weapons: list[Unit],
 ) -> list[tuple[Unit, Unit]]:
-    """角色 <-> 武器配对
+    """角色 <-> 武器配对：**先看够不够得着，再看离得近不近**
 
-    贪心：按距离从小到大配对，跳过已经配过的双方。武器最多 3 座、角色最多 3 个，
-    直接排序即可。已经在武器旁边的角色距离为 0，天然排在前面——这保证了
-    "上回合已经就位的人这回合不动"，不会每晚重新跑位。
+    只按距离贪心会配出"隔着基地"的组合，而且代价是持续的。实测报文里开拓者
+    站在基地东侧 `(30,11)`、离加特林只有 1 格，却因为"加特林被 id 更小的工人
+    先挑走"而被配到基地西侧那两座塔之一——绕过去要 6 步，机器人一压过来路就
+    断了，于是它整晚站在原地：**72 个夜战回合只开了 3 次火，三座塔长期只有
+    两座在开火**，首夜基地被打掉 1415 血。
+
+    两处都不能省：
+
+    1. **只按距离贪心不够，要整体指派。** 贪心挑"单个最优"会漏掉"加特林离
+       两个人都只有 1 格、而开拓者除了加特林哪座都去不了"这种局面——它先把
+       加特林给 id 更小的工人，开拓者就只剩那座走不到的塔。枚举全指派
+       （武器 ≤3，最多十几组）才看得出该把加特林让给谁。
+    2. **可达性要限深。** 每回合问 人×塔 次"够不够得着"，不限深就是全图 BFS，
+       实测把单回合决策从 0.9ms 抬到 10.4ms。
+
+    外加一条稳态短路：人人都贴着某座塔时（夜间绝大多数回合），配对没有歧义，
+    一次搜索都不用跑——那正是 0.9ms 基线的情形。
     """
     if not weapons:
         return []
-    ranked = sorted(
-        (
-            distance(weapon.pos, character.pos),
-            weapon.pos.x,
-            weapon.pos.y,
-            character.unit_id,
-            wi,
-            ci,
+
+    plain = _assign(characters, weapons, lambda ci, wi: True)
+    if all(distance(w.pos, c.pos) <= 1 for w, c in plain):
+        return plain
+
+    static = _static_blockers(world)
+    reach_sets = {
+        ci: grid.reachable_set(
+            world.turn, [characters[ci].pos], static, limit=REACH_PROBE_STEPS
         )
-        for wi, weapon in enumerate(weapons)
-        for ci, character in enumerate(characters)
-    )
-    used_weapon: set[int] = set()
-    used_character: set[int] = set()
-    pairs: list[tuple[Unit, Unit]] = []
-    for _, _, _, _, wi, ci in ranked:
-        if wi in used_weapon or ci in used_character:
-            continue
-        used_weapon.add(wi)
-        used_character.add(ci)
-        pairs.append((weapons[wi], characters[ci]))
-    return pairs
+        for ci in range(len(characters))
+    }
+    stands_cache: dict[int, tuple[Pos, ...]] = {}
+
+    def reachable(ci: int, wi: int) -> bool:
+        if wi not in stands_cache:
+            stands_cache[wi] = grid.stand_cells(world.turn, weapons[wi].pos)
+        return any(cell in reach_sets[ci] for cell in stands_cache[wi])
+
+    return _assign(characters, weapons, reachable)
+
+
+def _assign(characters, weapons, reachable) -> list[tuple[Unit, Unit]]:
+    """枚举"哪几个人上塔 × 怎么配"，取最好的那组
+
+    排序键：① 够不着的人最少 ② 总距离最短 ③ 已经在位的人最多（少折腾）
+
+    要**同时**枚举"哪几个人"和"怎么配"：塔比人少时（1 塔 2 人）
+    `permutations(range(1), 2)` 是空集，只枚举配对会把所有人都漏掉。
+    """
+    size = min(len(characters), len(weapons))
+    best_key: tuple | None = None
+    best_slots: tuple[tuple[int, ...], tuple[int, ...]] = ((), ())
+    for chosen in combinations(range(len(characters)), size):
+        for perm in permutations(range(len(weapons)), size):
+            unreachable = 0
+            total = 0
+            in_place = 0
+            for slot, ci in enumerate(chosen):
+                wi = perm[slot]
+                if not reachable(ci, wi):
+                    unreachable += 1
+                gap = distance(weapons[wi].pos, characters[ci].pos)
+                total += gap
+                if gap <= 1:
+                    in_place += 1
+            key = (unreachable, total, -in_place, chosen, perm)
+            if best_key is None or key < best_key:
+                best_key, best_slots = key, (chosen, perm)
+
+    chosen, perm = best_slots
+    return [(weapons[perm[slot]], characters[ci]) for slot, ci in enumerate(chosen)]
 
 
 def _act(
@@ -448,25 +534,21 @@ def _act(
     if distance(controller.pos, weapon.pos) <= 1:
         targets = fire_targets(world.turn, weapon, robots)
         if targets:
-            from ..protocol import attack_command
-
             command = attack_command(controller.unit_id, weapon, targets)
             if command is not None:
                 return NightAction(controller, command, "fire")
 
-        # **够不着就换一座有目标的塔。** 配对是按距离硬配的：站在加特林
-        # （射程 3）旁边的角色，哪怕火箭（射程 10）那边正有一堆目标，也只会
-        # 站着不动守一整晚——日志上就是 `idle_target` 一直大于 0、击杀很少。
-        better = _tower_with_targets(world, controller, robots, assigned)
-        if better is not None:
-            stand = _stand_near(world, better, controller, claimed)
-            if stand is not None:
-                step = grid.next_step(world.turn, controller, stand, claimed)
-                if step is not None:
-                    claimed.add(step)
-                    return NightAction(controller, move_command(step), "switch")
+    # **够不着就换一座有目标的塔。** 两种情况都走这里：
+    #   1. 人已经在某座塔旁边，但这座射程内没目标（配对按时序硬配的）
+    #   2. 人还没到位，而配对那座**根本走不过去**——隔着基地，或者被机器人堵死
+    # 实测报文里缺的正是第 2 条：开拓者被配到基地另一侧那座塔，绕行要 6 步，
+    # 机器人一压过来路就断了，于是整晚站在原地（72 个夜战回合只开了 3 次火）。
+    switched = _switch(world, weapon, controller, robots, claimed, assigned)
+    if switched is not None:
+        return switched
 
-        # 所有塔都够不着（或都被占了）：站住别乱跑
+    if distance(controller.pos, weapon.pos) <= 1:
+        # 站在塔边、这座没目标、也换不了：站住别乱跑
         return NightAction(controller, None, "idle")
 
     stand = _stand_near(world, weapon, controller, claimed)
@@ -477,6 +559,39 @@ def _act(
         return NightAction(controller, None, "idle")
     claimed.add(step)
     return NightAction(controller, move_command(step), "approach")
+
+
+def _switch(
+    world: World,
+    weapon: Unit,
+    controller: Unit,
+    robots: list[Robot],
+    claimed: set[Pos],
+    assigned: frozenset[int],
+) -> NightAction | None:
+    """换到另一座"射程内有目标且没人管"的塔；没有就返回 None
+
+    塔挨在一起时人可能**同时**邻着两座——那种情况直接开火，不用先走过去。
+    """
+    better = _tower_with_targets(world, controller, robots, assigned)
+    if better is None or better.unit_id == weapon.unit_id:
+        return None
+
+    if distance(controller.pos, better.pos) <= 1:
+        targets = fire_targets(world.turn, better, robots)
+        if targets:
+            command = attack_command(controller.unit_id, better, targets)
+            if command is not None:
+                return NightAction(controller, command, "fire")
+
+    stand = _stand_near(world, better, controller, claimed)
+    if stand is None or stand == controller.pos:
+        return None
+    step = grid.next_step(world.turn, controller, stand, claimed)
+    if step is None:
+        return None
+    claimed.add(step)
+    return NightAction(controller, move_command(step), "switch")
 
 
 def _tower_with_targets(

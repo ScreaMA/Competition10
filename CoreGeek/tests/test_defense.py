@@ -353,3 +353,104 @@ def test_controller_fires_when_own_tower_has_targets(
     actions = {a.unit.unit_id: a for a in defense.night_actions(world)}
     assert actions[10010].role == "fire"
     assert actions[10010].command["action"] == "attack"
+
+
+# ==========================================================================
+# 三人三塔：配对要看可达性（实测 2.log R71–R212）
+# ==========================================================================
+#
+# 实测报文里这条链路的形态：基地原点 (30,9)（footprint 占 (30,9)(31,9)(30,10)(31,10)），
+# 三座塔挤在基地左侧一列 (29,8)(29,9)(29,10)，三个人分别在
+#   (29,11) 加特林旁边、(30,11) 基地东南角、(30,8) 火箭旁边。
+# 结果是**三座塔长期只有两座在开火**：开拓者在 (30,11) 待了 70+ 个回合没拿到
+# 任何指令（`idle_ids=20011`），72 个夜战回合只开了 3 次火；首夜基地被打掉
+# 1415 血、三塔全毁。
+
+
+def _war(payload_factory, role_factory, robot_factory, *, chars, robots):
+    """复刻实测战场：基地 (30,9) + 左列三塔 + 给定位置的三个人"""
+    return _world(
+        payload_factory, role_factory, base=(30, 10),
+        towers=[
+            _tower(role_factory, 20090, "rocket", 29, 8),
+            _tower(role_factory, 20091, "railgun", 29, 9),
+            _tower(role_factory, 20092, "gatling", 29, 10),
+        ],
+        roles=[
+            role_factory(uid, "pioneer" if uid == 20011 else "worker", x, y)
+            for uid, (x, y) in chars
+        ],
+        robots=[robot_factory(30000 + i, x, y) for i, (x, y) in enumerate(robots)],
+    )
+
+
+def _paired(world):
+    return {
+        c.unit_id: w
+        for w, c in defense._pair(
+            world, list(world.turn.characters()), list(world.turn.towers())
+        )
+    }
+
+
+def test_pairing_prefers_a_tower_the_controller_can_reach(
+    payload_factory, role_factory, robot_factory
+):
+    """配对**先看够不够得着**，再看离得近不近
+
+    只按距离贪心（平局用 id 兜底）会先把加特林派给 id 更小的工人，再把基地
+    **另一侧**那两座塔之一派给开拓者。而开拓者这时已经被机器人封在基地东南角
+    ——它唯一的落脚点就是身旁那座加特林。配对一旦配错，它整晚都动不了。
+    """
+    # 把开拓者之外的每一条出路都堵上：它只能留在 (30,11)
+    world = _war(
+        payload_factory, role_factory, robot_factory,
+        chars=[(20010, (29, 11)), (20011, (30, 11)), (20012, (30, 8))],
+        robots=[(29, 12), (30, 12), (31, 11), (31, 12)],
+    )
+    paired = _paired(world)
+    assert paired[20011].kind == "gatling", (
+        "开拓者被配到了走不过去的塔：%s" % paired[20011].kind
+    )
+    # 工人 (29,11) 在基地西侧，西侧那两座它都走得过去
+    assert paired[20010].kind in ("rocket", "railgun"), paired[20010].kind
+
+
+def test_unreachable_controller_switches_instead_of_standing_still(
+    payload_factory, role_factory, robot_factory
+):
+    """配到走不过去的塔时要**换一座**，不是原地站着
+
+    实测里缺的就是这条：开拓者在基地东侧、被配到西侧的塔，绕行要 6 步，
+    机器人一压过来路就断了 —— 72 个夜战回合只开了 3 次火。
+    """
+    # 塔旁边留一个够得着的目标，但把开拓者封在东南角
+    world = _war(
+        payload_factory, role_factory, robot_factory,
+        chars=[(20010, (29, 11)), (20011, (30, 11)), (20012, (30, 8))],
+        robots=[(29, 12), (30, 12), (31, 11), (31, 12), (27, 6)],
+    )
+    actions = {a.unit.unit_id: a for a in defense.night_actions(world)}
+    action = actions[20011]
+    assert action.command is not None, "开拓者被空转了"
+    # 要么直接开火（够得着的那座），要么往它走——总之不能站着
+    assert action.role in ("fire", "switch", "approach"), action.role
+
+
+def test_three_towers_all_fire_in_steady_state(
+    payload_factory, role_factory, robot_factory
+):
+    """三人三塔、机器人压过来时，**三座塔都要开火**
+
+    这是实测报文里最刺眼的一条：`manned=3` 长期报 3，而实际只有 2 座在开火
+    ——`manned` 数的是"有人站在旁边"，不是"这座塔打了"。
+    """
+    import nightsim
+
+    sim = nightsim.NightSim(chars=nightsim.CHARS_SPREAD, robot_count=70)
+    report = sim.run(rounds=25)
+    steady = [row[1] for row in report.steady]
+    assert steady, report.summary()
+    assert min(steady) >= 3, (
+        "稳态里有回合没打满三座：%s（%s）" % (sorted(set(steady)), report.summary())
+    )

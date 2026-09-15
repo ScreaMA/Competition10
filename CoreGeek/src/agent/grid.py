@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable
 from heapq import heappop, heappush
 from itertools import count
 
@@ -223,6 +224,44 @@ def reachable_any(
     extra_blocked: frozenset[Pos] | set[Pos] = frozenset(),
 ) -> bool:
     return any(reachable(turn, origin, goal, extra_blocked) for goal in goals)
+
+
+def reachable_set(
+    turn: Turn,
+    origins: Iterable[Pos],
+    extra_blocked: frozenset[Pos] | set[Pos] = frozenset(),
+    *,
+    limit: int | None = None,
+) -> frozenset[Pos]:
+    """从一组起点出发**在 `limit` 步内能走到的所有格子**（多源 BFS，含起点）
+
+    `reachable()` 一次只回答"能不能到某一个点"，夜间配位要对着三座塔问九次。
+    换个方向搜一次就能回答一串问题。
+
+    **`limit` 不是可选优化，是性能的关键。** 不限深时这是个全图 BFS（~1300 格），
+    比"找到目标就停"的 `reachable()` 还慢——实测把单回合决策从 0.9ms 抬到
+    10.4ms（`tools/local_check.py` 的 1300 回合基线）。限深之后只搜起点周围
+    几十格，而"够不够得着"这个问题本来就只需要看附近。
+    """
+    targets = [pos for pos in origins]
+    if not targets:
+        return frozenset()
+    blocked = {pos for pos, name in turn.zones.items() if name != LAND}
+    blocked |= set(extra_blocked)
+
+    seen = set(targets)
+    frontier = deque((pos, 0) for pos in targets)
+    while frontier:
+        current, depth = frontier.popleft()
+        if limit is not None and depth >= limit:
+            continue
+        for dx, dy in _STEPS:
+            step = Pos(current.x + dx, current.y + dy)
+            if step in seen or step in blocked or not turn.is_land(step):
+                continue
+            seen.add(step)
+            frontier.append((step, depth + 1))
+    return frozenset(seen)
 
 
 def stand_cells(

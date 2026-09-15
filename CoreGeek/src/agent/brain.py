@@ -132,6 +132,11 @@ def _task_plan(world: World) -> TaskPlan:
 # 判题器侧的 stdout 采集有大小限制。
 TASK_DUMP_LIMIT = int(os.getenv("TASK_DUMP_LIMIT", "200000"))
 
+# 把 `execute_cmd` 的**脚本正文**也打进 INFO（默认只打参数摘要，正文走 DEBUG）。
+# 需要"扣着字节复盘沙盒到底跑了什么"时打开它——代价是日志体积涨回 ~5 倍，
+# 实测会把夜间那一段挤出采集上限。
+TASK_DUMP_FULL = os.getenv("TASK_DUMP_FULL", "") not in ("", "0")
+
 
 def _dump_task_context(
     turn: Turn,
@@ -179,12 +184,23 @@ def _dump_task_context(
         return
 
     dumps: list[tuple[str, str]] = []
+    # 走 DEBUG 的**大块**日志：脚本正文由 `scripts.build(step, 参数)` 从仓库里的
+    # 模板确定性生成，而这行摘要里的参数就是全部输入——所以正文放进
+    # `debug.log` 就够了，没必要每回合往 stdout 灌 6–8KB。
+    # 实测代价：`execute_cmd` 全文长期占整份日志的 **70%**，两次真实日志都在
+    # ~180–200KB 处**从记录中间截断**、`tod=night` 一条都没有——"夜里炮塔为什么
+    # 没人操作"就是这么变成无头案的。要全文时打开 `TASK_DUMP_FULL=1`。
+    verbose: list[tuple[str, str]] = []
     if turn.phase_task:
         dumps.append(("phase_task", turn.phase_task))
     if turn.last_cmd_result:
         dumps.append(("last_cmd_result", turn.last_cmd_result))
     if task_plan.sandbox_command:
-        dumps.append(("execute_cmd", task_plan.sandbox_command))
+        (dumps if TASK_DUMP_FULL else verbose).append(
+            ("execute_cmd", task_plan.sandbox_command)
+        )
+    if task_plan.sandbox_summary:
+        dumps.append(("execute_cmd", task_plan.sandbox_summary))
     if task_plan.prompt:
         dumps.append(("llm_prompt", task_plan.prompt))
     if turn.llm_resp:
@@ -199,17 +215,21 @@ def _dump_task_context(
     if state:
         dumps.append(("run_state", state))
 
-    # 打在任务链路事件之前不合适（事件是 INFO 行），所以这里只放 DEBUG 转储
-
     for kind, text in dumps:
-        body = _escape(text)
-        if len(body) > TASK_DUMP_LIMIT:
-            body = body[:TASK_DUMP_LIMIT] + "\\n[CLIPPED]"
-        # INFO：stdout（判题器采集）与 debug.log（本地复盘）各一份
-        LOGGER.info(
-            "task_dump round=%d kind=%s bytes=%d text=%s",
-            turn.round_no, kind, len(text), body,
-        )
+        _emit_dump(turn.round_no, kind, text, logging.INFO)
+    for kind, text in verbose:
+        _emit_dump(turn.round_no, kind, text, logging.DEBUG)
+
+
+def _emit_dump(round_no: int, kind: str, text: str, level: int) -> None:
+    body = _escape(text)
+    if len(body) > TASK_DUMP_LIMIT:
+        body = body[:TASK_DUMP_LIMIT] + "\\n[CLIPPED]"
+    # 正文照旧两边都发：stdout（判题器采集）与 debug.log（本地复盘）
+    LOGGER.log(
+        level, "task_dump round=%d kind=%s bytes=%d text=%s",
+        round_no, kind, len(text), body,
+    )
 
 
 def _escape(text: str) -> str:
