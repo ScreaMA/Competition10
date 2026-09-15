@@ -143,10 +143,10 @@ def test_no_sell_when_gold_is_plenty(payload_factory, role_factory, zone_factory
 
 
 def test_miner_collects_when_adjacent(payload_factory, role_factory, zone_factory):
-    """采集工就在矿旁边 ⇒ 发 collect（采集不该被"去建塔"打断）"""
+    """有小贩时采集工优先采铜（卖价最高）"""
     world = _world(
         payload_factory, role_factory, gold=0,
-        zones=[zone_factory("copper", 24, 13)],
+        zones=[zone_factory("copper", 24, 13), zone_factory("vendor", 20, 16)],
         roles=[_worker(role_factory, 10010, 18, 12, backpack=("copper",)),
                _worker(role_factory, 10012, 24, 12, backpack=())],
     )
@@ -163,7 +163,7 @@ def test_miner_walks_to_mine_when_far(payload_factory, role_factory, zone_factor
     """
     world = _world(
         payload_factory, role_factory, gold=200,
-        zones=[zone_factory("copper", 30, 13)],
+        zones=[zone_factory("copper", 30, 13), zone_factory("vendor", 20, 16)],
         roles=[_worker(role_factory, 10010, 18, 12),
                _worker(role_factory, 10012, 10, 10, backpack=())],
     )
@@ -173,6 +173,36 @@ def test_miner_walks_to_mine_when_far(payload_factory, role_factory, zone_factor
     step = Pos(command["targetPos"][0]["x"], command["targetPos"][0]["y"])
     # 这一步必须在靠近矿的方向上，且不能踩到矿本身
     assert step != Pos(30, 13)
+
+
+def test_miner_mines_stone_when_no_vendor(payload_factory, role_factory, zone_factory):
+    """**地图上没有小贩时，采集工改采石**
+
+    铜/铁的唯一用途是卖给小贩；没有小贩它们就是纯负重，而墙只有石头能砌。
+    回归：真实对局里 `gold` 从 R9 起恒为 0、工人背包里攒着铜一直没卖、
+    围墙全程 0 段——日志里 `neutral=` 有没有 `vendor` 就是这两种情况的判据。
+    """
+    world = _world(
+        payload_factory, role_factory, gold=0,
+        zones=[zone_factory("copper", 24, 13), zone_factory("stone", 25, 14)],
+        roles=[_worker(role_factory, 10010, 18, 12, backpack=("copper",)),
+               _worker(role_factory, 10012, 25, 13, backpack=())],
+    )
+    assert economy.miner_order(world, world.turn.workers()[1]) == ("stone",)
+    commands = economy.plan_day(world, set())
+    assert commands[10012]["action"] == "collect"
+    assert commands[10012]["targetPos"][0] == {"x": 25, "y": 14}
+
+
+def test_miner_order_prefers_valuable_ore_with_vendor(
+    payload_factory, role_factory, zone_factory
+):
+    world = _world(
+        payload_factory, role_factory, gold=0,
+        zones=[zone_factory("copper", 24, 13), zone_factory("vendor", 20, 16)],
+        roles=[_worker(role_factory, 10012, 24, 12, backpack=())],
+    )
+    assert economy.miner_order(world, world.turn.workers()[0])[0] == "copper"
 
 
 def test_builder_mines_stone_when_walls_pending(payload_factory, role_factory, zone_factory):

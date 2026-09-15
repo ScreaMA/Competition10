@@ -50,8 +50,18 @@ from . import defense
 # 采集工的矿石偏好（按小贩收购价从高到低，任务书 §4.6.1 + docs/request.txt）
 MINER_ORDER: tuple[str, ...] = (COPPER_MINE, IRON_MINE, STONE_MINE)
 
-# 建造工采石的目标批次：够砌几段墙就够
-STONE_BATCH = 3
+# **地图上没有小贩时**的采集顺序
+#
+# 铜/铁的唯一用途就是卖给小贩换金币；没有小贩，它们就是纯负重。而墙只有石头
+# 能砌，所以此时全员采石。真实对局里出现过"金矿从 R9 起恒为 0、工人背包里
+# 攒着铜一直没卖、围墙全程 0 段"——光看日志判不出是哪一种，`neutral=` 里
+# 有没有 `vendor` 一看便知（见 `战术参考/日志分析模板V2.md` §1.1）。
+MINER_ORDER_NO_VENDOR: tuple[str, ...] = (STONE_MINE,)
+
+# 建造工采石的目标批次：够砌几段墙就够。
+# 一次多采几块能显著减少往返——真实对局里最近的石矿离基地十几格，
+# 来回一趟 20+ 回合，采 3 块就回来的话大部分时间都花在路上。
+STONE_BATCH = 6
 
 # 背包占用超过这个比例就去卖一次（防止采满背包再卖，浪费回合）
 BACKPACK_SELL_RATIO = 0.6
@@ -217,12 +227,18 @@ def _build_wall(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
     stones = worker.count(WALL_MATERIAL)
     if stones <= 0:
         return _go_mine(world, worker, STONE_MINE, claimed)
-    if stones < STONE_BATCH and not _has_pressing_job(world):
-        # 顺手再采两块，但只在没有更急的事（建塔/升级）时才这么做
+
+    # **人已经在矿区就把这一批采满再走。** 之前这里还挂着"没有更急的事才顺手
+    # 采"（建塔 / 金币 ≥100 要买券就不采），结果是"采 1 块 → 走 10 格回基地 →
+    # 砌 1 段 → 再走 10 格回矿"——本地模拟实测 13 回合才出 1 段墙，首夜防线
+    # 根本来不及成型（真实对局同理，开局 75 金全砸进 3 座塔之后围墙全程 0 段）。
+    # 账很好算：**在矿边多采 1 块只要 1 回合，回一趟矿要 ~20 回合。**
+    if stones < STONE_BATCH:
         mine = _adjacent_mine(world, worker, STONE_MINE)
         if mine is not None:
             claimed.add(mine)
             return collect_command(mine)
+
     for site in sorted(sites, key=lambda p: (distance(worker.pos, p), p.x, p.y)):
         if site in claimed:
             continue
@@ -230,14 +246,6 @@ def _build_wall(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
         if command is not None:
             return command
     return None
-
-
-def _has_pressing_job(world: World) -> bool:
-    """还有比采矿更急的事吗（建塔 / 用券）"""
-    turn = world.turn
-    if not _tower_ready(world) and turn.gold >= WEAPON_BUILD_COST:
-        return True
-    return turn.gold >= 100
 
 
 def _go_and_build(
@@ -274,6 +282,16 @@ def _go_and_build(
 # ==========================================================================
 
 
+def miner_order(world: World, worker: Unit) -> tuple[str, ...]:
+    """采集工该采什么
+
+    有小贩 ⇒ 按收购价采（铜 5 > 铁 3 > 石 1）；没有小贩 ⇒ 只采石（墙的唯一原料）。
+    """
+    if _nearest_zone(world.turn, VENDOR, worker.pos) is None:
+        return MINER_ORDER_NO_VENDOR
+    return MINER_ORDER
+
+
 def _miner(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
     """采集工：卖矿优先于采集，但两端之间不做无谓往返
 
@@ -284,7 +302,7 @@ def _miner(world: World, worker: Unit, claimed: set[Pos]) -> dict | None:
         command = _sell(world, worker, claimed)
         if command is not None:
             return command
-    for kind in MINER_ORDER:
+    for kind in miner_order(world, worker):
         command = _go_mine(world, worker, kind, claimed)
         if command is not None:
             return command

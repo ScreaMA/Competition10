@@ -32,6 +32,7 @@ python tools/local_check.py
 
 # 本地对局模拟：不用判题系统也能看出行为是否正常
 python tools/simulate.py --rounds 400 --log sim.log
+python tools/simulate.py --rounds 130 --no-vendor --log sim.log  # 复现"没有小贩"的地图
 python tools/analyze_log.py --log sim.log            # 回合统计
 python tools/analyze_log.py --log sim.log --task     # 自进化任务链路
 python tools/analyze_log.py --log sim.log --template # 复盘填空稿（自动填 6~7/7 项）
@@ -168,7 +169,8 @@ request_decoded round=85 day=1 tod=night round_in_day=85 team=challenger team_id
                 gold=20 gold_delta=-25 score=280 base=(10,23) hp=1500/1500
                 towers=3[rocket1@9,25 railgun1@10,25 gatling1@9,24] walls=2[l1:2]
                 robots=4[s1 m1 l1 b1] near=9@20,24 enemy_visible=1 enemy_towers=0
-                mines=stone:2,iron:1,copper:1 tasks=[…] phase='…' task=execute
+                neutral=stone:6,iron:4,copper:4,vendor:1,weaponShop:1
+                tasks=[…] phase='…' task=execute
                 plan=step=query idx=1 r=0 chars=10010@5,23 … bag=10012{copper×21}
 strategy_done   round=85 commands=3 elapsed=0.62ms gold_spent=25
                 actions=10010:build→(32,12) wall 10020:attack→(24,13) smallRobot

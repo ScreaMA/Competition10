@@ -274,6 +274,53 @@ def test_task_two_is_accepted_after_first(
     assert plan.action == Action.ACCEPT
 
 
+def test_accept_only_when_really_adjacent(payload_factory, role_factory, task_factory):
+    """离任务点 **2 格**时不能发 acceptTask（判题器会判非法，且开拓者会原地卡死）
+
+    回归：真实对局里 `20011:acceptTask` 连续 7 个回合被拒（`fail=[20011:acceptTask]`），
+    开拓者停在 (24,12)、任务点在 (23,14)，距离 2。根因是判据写成
+    "离**落脚点**一格内"——落脚点是任务点的邻居，于是距离 2 也被当成到位；
+    而 ACCEPT 分支不发移动指令，开拓者就一直站着重复接任务。
+    """
+    solver = TaskSolver()
+    plan = solver.plan(_world(
+        payload_factory,
+        round_no=5,
+        roles=[role_factory(10013, "station", 20, 10),
+               role_factory(10011, "pioneer", 24, 12)],
+        player_tasks=[task_factory("自进化类1", 23, 14)],
+    ))
+    assert plan.action == Action.TRAVEL, plan.note
+    assert plan.pioneer_command["action"] == "move"
+
+
+def test_accept_when_adjacent(payload_factory, role_factory, task_factory):
+    """站在任务点旁边才是接受任务的时候"""
+    solver = TaskSolver()
+    plan = solver.plan(_world(
+        payload_factory,
+        round_no=5,
+        roles=[role_factory(10013, "station", 20, 10),
+               role_factory(10011, "pioneer", 23, 13)],
+        player_tasks=[task_factory("自进化类1", 23, 14)],
+    ))
+    assert plan.action == Action.ACCEPT, plan.note
+
+
+def test_wait_holds_only_when_adjacent(payload_factory, role_factory, task_factory):
+    """冷却期"原地等"同样只能在真的站到位之后"""
+    solver = TaskSolver()
+    plan = solver.plan(_world(
+        payload_factory,
+        round_no=5,
+        roles=[role_factory(10013, "station", 20, 10),
+               role_factory(10011, "pioneer", 24, 12)],
+        player_tasks=[task_factory("自进化类1", 23, 14, cooldown=5)],
+    ))
+    assert plan.action == Action.TRAVEL, plan.note
+    assert plan.pioneer_command["action"] == "move"
+
+
 def test_pioneer_travels_to_task_point(payload_factory, role_factory, task_factory):
     """开拓者离任务点远时应该往那儿走"""
     solver = TaskSolver()

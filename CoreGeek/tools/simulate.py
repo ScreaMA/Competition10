@@ -75,7 +75,7 @@ ANSWER_RESULT = (
 )
 
 
-def build_base_payload(team: str = "challenger") -> dict:
+def build_base_payload(team: str = "challenger", vendor: bool = True) -> dict:
     """构造一份接近 `docs/request.txt` 的开局报文"""
     roles = [
         {"id": 10013 if team == "challenger" else 20013,
@@ -101,7 +101,7 @@ def build_base_payload(team: str = "challenger") -> dict:
         {"neutralType": "stone", "pos": {"x": 14, "y": 3}},
         {"neutralType": "iron", "pos": {"x": 25, "y": 22}},
         {"neutralType": "copper", "pos": {"x": 8, "y": 24}},
-        {"neutralType": "vendor", "pos": {"x": 33, "y": 16}},
+        *([{"neutralType": "vendor", "pos": {"x": 33, "y": 16}}] if vendor else []),
         {"neutralType": "weaponShop", "pos": {"x": 25, "y": 20}},
         {"neutralType": f"{prefix}TaskPoint1", "pos": {"x": 23, "y": 14}},
         {"neutralType": f"{prefix}TaskPoint2", "pos": {"x": 26, "y": 17}},
@@ -158,8 +158,10 @@ class Simulator:
     不做移动与碰撞的真实结算——那需要复刻整个判题器，不是这个工具的用途。
     """
 
-    def __init__(self, rounds: int = 130, team: str = "challenger") -> None:
-        self.payload = build_base_payload(team)
+    def __init__(
+        self, rounds: int = 130, team: str = "challenger", vendor: bool = True
+    ) -> None:
+        self.payload = build_base_payload(team, vendor=vendor)
         self.rounds = rounds
         self.gold = 75
         self.task_ids: dict[int, int] = {}
@@ -437,6 +439,8 @@ def main() -> None:
     parser.add_argument("--team", default="challenger",
                         choices=("challenger", "defender"))
     parser.add_argument("--log", default="", help="日志文件（默认打到 stdout）")
+    parser.add_argument("--no-vendor", action="store_true",
+                        help="地图上不放小贩（复现：没有小贩则矿石卖不掉、金币回不来）")
     args = parser.parse_args()
 
     # 文件收 DEBUG（含 task_dump 全量任务日志），stdout 只收 INFO；
@@ -455,7 +459,9 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG, handlers=handlers)
 
     started = time.perf_counter()
-    simulator = Simulator(rounds=args.rounds, team=args.team)
+    simulator = Simulator(
+        rounds=args.rounds, team=args.team, vendor=not args.no_vendor
+    )
     simulator.run()
     elapsed = time.perf_counter() - started
 

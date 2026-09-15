@@ -373,9 +373,7 @@ class TaskSolver:
         if not cells:
             return TaskPlan(Action.IDLE, note="task_unreachable")
 
-        if any(distance(pioneer.pos, cell) <= 1 for cell in cells) or (
-            distance(pioneer.pos, target.pos) <= 1
-        ):
+        if self._at_task_point(pioneer, target.pos, cells):
             self._event(
                 turn, "accept",
                 f"point={target.pos.x},{target.pos.y} "
@@ -402,7 +400,7 @@ class TaskSolver:
         cells = self._task_stand_cells(turn, point, pioneer)
         if not cells:
             return TaskPlan(Action.IDLE, note="wait_unreachable")
-        if any(distance(pioneer.pos, cell) <= 1 for cell in cells):
+        if self._at_task_point(pioneer, point, cells):
             return TaskPlan(Action.IDLE, note="waiting", hold=True)
         step = grid.step_toward_any(turn, pioneer, tuple(cells))
         if step is None:
@@ -836,6 +834,24 @@ class TaskSolver:
             or run.last_output.token
             or run.last_output.solution
         )
+
+    @staticmethod
+    def _at_task_point(pioneer: Unit, point: Pos, cells: tuple[Pos, ...]) -> bool:
+        """开拓者是不是真的站在任务点周围一格内（任务书 §4.4）
+
+        **判据必须是"我在落脚点上"，不是"我离落脚点不远"。** `cells` 是任务点的
+        邻居，写成 `distance(pioneer.pos, cell) <= 1` 会把"离任务点 2 格"也算成
+        到位——于是开拓者在 2 格外发 `acceptTask`，判题器判非法
+        （真实对局里 `fail=[20011:acceptTask]` 连续 7 个回合），而 ACCEPT 分支
+        不发移动指令，开拓者就原地站着反复接任务，整场卡死。
+
+        两个条件取或：
+            1. 站在某个落脚点上（等价于与任务点切比雪夫距离 = 1）
+            2. 与任务点本身距离 ≤ 1（任务点 2 占两格，站到相邻那格旁边也算）
+        """
+        if pioneer.pos in cells:
+            return True
+        return distance(pioneer.pos, point) <= 1
 
     @staticmethod
     def _task_stand_cells(

@@ -383,9 +383,25 @@ def _enemy_brief(turn: Turn) -> str:
 
 
 
-def _mine_brief(turn: Turn) -> str:
+def _neutral_brief(turn: Turn) -> str:
+    """地图上的中立元素清单（矿 / 小贩 / 武器商店 / 任务点）
+
+    只报矿是不够的：**没有小贩 = 永远卖不出矿 = 金币永远回不来**，而这一条在
+    日志里曾经完全看不出来（真实对局里金矿从 R9 起恒为 0、工人背包里攒着铜却
+    一直没卖，光看 `mines=` 根本判不出是"没小贩"还是"调度没去卖"）。
+    """
+    counts: dict[str, int] = {}
+    for name in turn.zones.values():
+        counts[name] = counts.get(name, 0) + 1
+    if not counts:
+        return "-"
+    # 矿放前面（最常用），其余按名字排
+    order = {"stone": 0, "iron": 1, "copper": 2, "vendor": 3, "weaponShop": 4}
     return ",".join(
-        f"{kind}:{len(turn.mines(kind))}" for kind in ("stone", "iron", "copper")
+        f"{name}:{count}"
+        for name, count in sorted(
+            counts.items(), key=lambda kv: (order.get(kv[0], 9), kv[0])
+        )
     )
 
 
@@ -506,7 +522,7 @@ def _log_turn(
         "request_decoded round=%d day=%d tod=%s round_in_day=%d "
         "team=%s team_id=%s gold=%d gold_delta=%+d score=%d "
         "base=(%d,%d) hp=%s towers=%s walls=%s "
-        "robots=%s %s mines=%s "
+        "robots=%s %s neutral=%s "
         "tasks=[%s] phase=%r task=%s plan=%s "
         "chars=%s bag=%s zone=%s",
         turn.round_no,
@@ -525,7 +541,7 @@ def _log_turn(
         _wall_brief(turn),
         _robot_brief(turn),
         _enemy_brief(turn),
-        _mine_brief(turn),
+        _neutral_brief(turn),
         _task_brief(turn),
         turn.phase_task[:60],
         task_plan.action,

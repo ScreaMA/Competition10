@@ -98,7 +98,7 @@ def test_request_decoded_has_documented_fields(
         "round=75", "day=1", "tod=night", "round_in_day=75",
         "team=challenger", "gold=", "gold_delta=", "score=",
         "base=(20,9)", "hp=1500/1500", "towers=", "walls=", "robots=",
-        "enemy_visible=", "mines=", "tasks=[", "phase=", "task=", "plan=",
+        "enemy_visible=", "neutral=", "tasks=[", "phase=", "task=", "plan=",
         "chars=", "bag=", "zone=",
     ):
         assert field in line, f"{field} 不在 request_decoded 里：{line}"
