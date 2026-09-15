@@ -48,10 +48,48 @@ def test_classify_uses_sandbox_evidence():
 
 
 def test_classify_unknown_without_signal():
-    family, evidence = skills.classify("今天天气不错", None)
+    family, _ = skills.classify("今天天气不错", None)
     assert family == skills.FAMILY_UNKNOWN
-    assert evidence == "no_signal"
 
+
+# --- 实测回归：phaseTask 只是一句"请阅读 xxx.md"，靠侦察输出定族 ---
+
+# 真实日志里的 phaseTask：27 字节，**一个关键词都没有**
+BARE_PHASE_TASK = "请阅读task_1_beijing.md，获取任务信息"
+
+RECON_API = parse_output(
+    "[exitCode:0]\n" "[RECON] docs=1 py=0 root=/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api task=/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md\n" "[SCAN] dirs=0 files=2 py=no sh=no timed_out=no\n" "[DOCPATH] /tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/API_DOCS.md\n" "[DOCBODY]\n" "# API 参考文档\n" "**基础URL**: `http://localhost:8899`\n" "X-API-Key: heritage-api-key-2024\n" "[DONE] step=recon elapsed=0.00s\n"
+)
+
+RECON_ENGINEER = parse_output(
+    "[exitCode:0]\n" "[RECON] docs=1 py=0 root=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix task=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md ws=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws_1\n" "[SCAN] dirs=4 files=6 py=no sh=yes timed_out=no\n" "[DOCBODY]\n" "# 应用 alpha 部署规范\n" "## 目录要求\n" "- logs/alpha/ 必须存在\n" "[WS] path=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws_1\n" "[SCRIPTS] check start.sh\n" "[DONE] step=recon elapsed=0.00s\n"
+)
+
+
+def test_bare_phase_task_alone_has_no_signal():
+    """只给 phaseTask 判不出族——这正是实测里 0 分的根因"""
+    family, _ = skills.classify(BARE_PHASE_TASK, None)
+    assert family == skills.FAMILY_UNKNOWN
+
+
+def test_classify_api_family_from_recon_output():
+    """侦察输出一到，族就明确了（API_DOCS / 基础URL / X-API-Key）"""
+    family, evidence = skills.classify(BARE_PHASE_TASK, RECON_API)
+    assert family == skills.FAMILY_API, evidence
+
+
+def test_classify_engineering_family_from_recon_output():
+    family, evidence = skills.classify("请阅读task_1_alpha.md，获取任务信息", RECON_ENGINEER)
+    assert family == skills.FAMILY_ENGINEERING, evidence
+
+
+def test_classify_uses_task_directory_name():
+    """任务目录名本身就是最强的信号：1-unknown-api / 2-engineering-fix"""
+    only_path = parse_output(
+        "[exitCode:0]\n" "[RECON] root=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix\n" "[DONE] step=recon\n"
+    )
+    family, evidence = skills.classify("", only_path)
+    assert family == skills.FAMILY_ENGINEERING, evidence
 
 # ==========================================================================
 # 签名：同族任务的匹配键

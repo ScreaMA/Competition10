@@ -126,13 +126,131 @@ def test_query_attempt_cap_then_escalate(payload_factory, base_roles, task_facto
     assert any("generic" in note or "llm" in note or "abandon" in note for note in notes), notes
 
 
+def test_reclassify_switches_to_engineering_after_recon(
+    payload_factory, base_roles, task_factory
+):
+    """对称回归：工程修复族的短 phaseTask 也要在侦察后切到 normalize
+
+    真实对局 R23–R26：`phaseTask` 是"请阅读task_1_alpha.md，获取任务信息"，
+    侦察回 `2-engineering-fix` + `ws_1` + `spec.md` + `bad interpreter: /bin/sh^M`，
+    却仍在 `unknown` 阶梯上打转、5 个回合后放弃。
+    """
+    bare_phase = "请阅读task_1_alpha.md，获取任务信息"
+    recon_output = (
+        "[exitCode:0]\n"
+        "[RECON] docs=1 py=0 root=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix scripts=2 task=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/task_1_alpha.md ws=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws_1\n"
+        "[SCAN] dirs=4 files=6 py=no sh=yes timed_out=no\n"
+        "[DOCBODY]\n"
+        "# 应用 alpha 部署规范\n"
+        "[WS] path=/tmp/selfEvolutionTask/1-fixed-step/2-engineering-fix/ws_1\n"
+        "[SCRIPTS] check start.sh\n"
+        "[DONE] step=recon elapsed=0.00s\n"
+    )
+    solver = TaskSolver()
+    solver.plan(_world(
+        payload_factory, round_no=20, roles=base_roles,
+        player_tasks=_task_point(task_factory), phase_task=bare_phase,
+    ))
+    assert MEMORY.run.family == skills.FAMILY_UNKNOWN
+
+    plan = solver.plan(_world(
+        payload_factory, round_no=21, roles=base_roles,
+        player_tasks=_task_point(task_factory), phase_task=bare_phase,
+        last_cmd_result=recon_output,
+    ))
+    assert MEMORY.run.family == skills.FAMILY_ENGINEERING, MEMORY.run.family
+    assert plan.note.startswith("step=normalize"), plan.note
+    # normalize 步要真的去修 CRLF（实测报的就是 bad interpreter: /bin/sh^M）
+    assert "crlf" in plan.sandbox_command or "\r" in plan.sandbox_command
+
+def test_replay_real_task_sequence_reaches_submit(
+    payload_factory, role_factory, task_factory
+):
+    """按真实对局的顺序回放：R12 侦察 → R13 判族并 query → R14 提交
+
+    用的是 2026-09-15 02:04 那份日志里的真实文本（`phaseTask` 27 字节、
+    侦察输出带 `API_DOCS.md` 与 `X-API-Key`）。修之前这条链路是
+    recon → generic → 放弃（`event=abandon detail=ladder_exhausted`），整场 0 分。
+    """
+    roles = [role_factory(10013, "station", 30, 9),
+             role_factory(10011, "pioneer", 22, 13)]
+    tasks = [task_factory("自进化类1", 23, 14)]
+    bare = "请阅读task_1_beijing.md，获取任务信息"
+    common = dict(roles=roles, player_tasks=tasks, phase_task=bare)
+
+    first = decide(payload_factory(round_no=12, **common))
+    assert first["executeCmd"]
+
+    recon = (
+        "[exitCode:0]\n"
+        "[RECON] docs=1 py=0 root=/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api task=/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md\n"
+        "[DOCBODY]\n"
+        "**基础URL**: `http://localhost:8899`\n"
+        "X-API-Key: heritage-api-key-2024\n"
+        "[DONE] step=recon\n"
+    )
+    second = decide(payload_factory(round_no=13, last_cmd_result=recon, **common))
+    assert "urllib" in second["executeCmd"]  # 真的去调接口，不是再读一遍文档
+
+    answer = (
+        "[exitCode:0]\n"
+        "[DATA] n=15 total=15 pages=1\n"
+        '[ANSWER] {"city":"北京","total_count":15,"world_heritage_count":7,'
+        '"types":["古建筑","古遗址"],"oldest_era":"周口店遗址"}\n'
+        "[DONE] step=query\n"
+    )
+    third = decide(payload_factory(round_no=14, last_cmd_result=answer, **common))
+    command = third["roleCommandMap"]["10011"]
+    assert command["action"] == "submitAnswer", command
+    assert json.loads(command["taskAnswer"])["total_count"] == 15
+
+
+def test_reclassify_switches_to_query_after_recon(
+    payload_factory, base_roles, task_factory
+):
+    """实测回归：`phaseTask` 没有关键词时，侦察回来必须重新判族并切到 query
+
+    真实对局里 `phaseTask` 只有"请阅读task_1_beijing.md，获取任务信息"这一句
+    （27 字节、零关键词），分类成 `unknown`，阶梯是 recon→generic，
+    **`query` 那一步从头到尾没走过**，任务 5 个回合就被放弃、整场 0 分。
+    """
+    bare_phase = "请阅读task_1_beijing.md，获取任务信息"
+    recon_output = (
+        "[exitCode:0]\n"
+        "[RECON] docs=1 py=0 root=/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api task=/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/task_1_beijing.md\n"
+        "[SCAN] dirs=0 files=2 py=no sh=no timed_out=no\n"
+        "[DOCBODY]\n"
+        "**基础URL**: `http://localhost:8899`\n"
+        "X-API-Key: heritage-api-key-2024\n"
+        "[DONE] step=recon elapsed=0.00s\n"
+    )
+    solver = TaskSolver()
+    # 第 1 回合：只有短 phaseTask ⇒ 判不出族，走 recon
+    first = solver.plan(_world(
+        payload_factory, round_no=10, roles=base_roles,
+        player_tasks=_task_point(task_factory), phase_task=bare_phase,
+    ))
+    assert first.note.startswith("step=recon")
+    assert MEMORY.run.family == skills.FAMILY_UNKNOWN
+
+    # 第 2 回合：侦察回来了 ⇒ 必须重判为 api-query，并直接进入 query
+    second = solver.plan(_world(
+        payload_factory, round_no=11, roles=base_roles,
+        player_tasks=_task_point(task_factory), phase_task=bare_phase,
+        last_cmd_result=recon_output,
+    ))
+    assert MEMORY.run.family == skills.FAMILY_API, MEMORY.run.family
+    assert second.note.startswith("step=query"), second.note
+    assert "urllib" in second.sandbox_command
+    # 换族要留痕，复盘才看得出发生过什么
+    assert any("event=family" in e for e in second.events), second.events
+
 # ==========================================================================
 # T2：接取任务后从未提交（0 分）
 # ==========================================================================
 
 
 def test_success_output_triggers_submit(payload_factory, base_roles, task_factory):
-    """沙盒给出 `[ANSWER]` ⇒ 本回合必须发 `submitAnswer`"""
     solver = TaskSolver()
     # 先起任务
     solver.plan(_world(

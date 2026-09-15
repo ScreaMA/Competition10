@@ -36,42 +36,68 @@ LADDERS: dict[str, tuple[str, ...]] = {
 }
 
 # 识别用的关键词（中文任务原文与英文沙盒路径都覆盖）
-_API_TOKENS = ("http://", "https://", "api", "接口", "查询", "请求", "文档", "端点")
-_ENGINEER_TOKENS = (
-    "spec", "修复", "配置", "工程", "工作区", "check", "构建", "编译",
-    "权限", "脚本", "部署", "服务", "启动",
+_API_TOKENS = (
+    "http://", "https://", "api_docs", "api key", "x-api-key", "authorization",
+    "api", "接口", "查询", "请求", "文档", "端点", "url",
 )
+_ENGINEER_TOKENS = (
+    "spec.md", "ws_1", "./check", "bad interpreter", "chmod", "权限", "配置",
+    "修复", "工程", "部署", "工作区", "脚本", "目录要求", "compile", "构建",
+)
+
+# **路径本身就是最强的信号**：任务目录名直接把族写在里面
+# —— `/tmp/selfEvolutionTask/1-fixed-step/1-unknown-api/` 与 `.../2-engineering-fix/`。
+# 这些命中一次就够定族，所以给一个压过所有关键词的权重。
+_API_PATH_TOKENS = ("unknown-api", "selfevolutiontask/1-fixed-step/1-")
+_ENGINEER_PATH_TOKENS = ("engineering-fix", "selfevolutiontask/1-fixed-step/2-")
+
+PATH_WEIGHT = 8
 
 
 def classify(task_text: str, recon: SandboxOutput | None) -> tuple[str, str]:
     """识别任务族，返回 (家族, 证据串)
 
-    只看**任务原文**与**沙盒侦察输出**这两样，不猜。识别结果会连同证据一起
-    写进 `Memory.facts`，同族的下一个任务可以直接沿用。
+    判据是**任务原文 + 沙盒侦察的原文**，而不是任务原文一个。
 
-    评分而不是短路：`1-fixed-step/2-engineering-fix` 的原文里也可能出现
-    "读取文档"之类的词，单纯按第一个命中的关键词分类会分错。
+    实测教训：`phaseTask` 在很多任务里只是一句"请阅读 task_1_beijing.md，
+    获取任务信息"（27 字节），**里面一个关键词都没有**——只按它分类必然得到
+    `unknown`，于是走 `recon → generic` 阶梯，**`query` 那一步从头到尾没走过**，
+    任务直接 0 分。真正的族信号在侦察回来的沙盒输出里：文件路径、`API_DOCS.md`、
+    `X-API-Key`、`spec.md`、`./check`……
+
+    评分而不是短路：`engineering-fix` 的原文里也可能出现"读取文档"之类的词。
     """
     text = task_text or ""
-    lowered = text.lower()
-    api_score = sum(1 for token in _API_TOKENS if token in lowered or token in text)
-    eng_score = sum(1 for token in _ENGINEER_TOKENS if token in lowered or token in text)
+    # 侦察输出是第二份证据；截断防止把整篇文档喂进关键词匹配
+    scout = (recon.raw[:8000] if recon is not None else "")
+    evidence_text = text + "\n" + scout
+    lowered = evidence_text.lower()
+
+    api_score = sum(1 for token in _API_TOKENS if token in lowered)
+    eng_score = sum(1 for token in _ENGINEER_TOKENS if token in lowered)
+
+    path_api = sum(1 for token in _API_PATH_TOKENS if token in lowered)
+    path_eng = sum(1 for token in _ENGINEER_PATH_TOKENS if token in lowered)
+    api_score += path_api * PATH_WEIGHT
+    eng_score += path_eng * PATH_WEIGHT
 
     if recon is not None:
         if recon.has("PROFILE") or recon.has("API"):
             api_score += 3
-        if recon.get("RECON.ws"):
+        if recon.get("RECON.ws") or recon.get("FIND.ws"):
             eng_score += 3
-        if recon.has("CHECK") or recon.has("FIX"):
+        if recon.has("CHECK") or recon.has("CHECKBODY") or recon.has("FIX"):
             eng_score += 3
-        if recon.get("SCAN.py") == "yes" and recon.get("SCAN.sh") == "yes":
-            eng_score += 1
 
+    evidence = (
+        f"api={api_score} eng={eng_score}"
+        f"(path {path_api}/{path_eng})"
+    )
     if eng_score > api_score:
-        return FAMILY_ENGINEERING, f"eng={eng_score} api={api_score}"
+        return FAMILY_ENGINEERING, evidence
     if api_score > 0:
-        return FAMILY_API, f"api={api_score} eng={eng_score}"
-    return FAMILY_UNKNOWN, "no_signal"
+        return FAMILY_API, evidence
+    return FAMILY_UNKNOWN, evidence
 
 
 def signature(family: str, task_text: str) -> str:

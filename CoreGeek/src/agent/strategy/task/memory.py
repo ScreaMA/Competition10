@@ -32,6 +32,7 @@ F_PARAM = "api.param"               # 查询参数名（location / city / …）
 F_FIELD_ALIAS = "api.field_alias"   # 中文字段说明 -> 记录字段名（JSON 串）
 F_ERA_ORDER = "api.era_order"       # 年代排序（JSON 串）
 F_TARGET = "task.target"            # 任务的目标参数（如"北京"）
+F_ROOT = "sandbox.root"            # 任务根目录（侦察回来的）
 F_WS_ROOT = "sandbox.ws"            # 工程修复族的工作区路径
 F_SPEC_PATH = "sandbox.spec"        # 工程修复族的规格文件路径
 F_CHECK_CMD = "sandbox.check"       # 工程修复族的检查命令

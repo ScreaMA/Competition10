@@ -41,6 +41,7 @@ from . import answer as answer_mod
 from . import scripts, skills
 from .memory import (
     F_AUTH_VALUE,
+    F_ROOT,
     F_BASE_URL,
     F_CHECK_CMD,
     F_ENDPOINT,
@@ -149,6 +150,7 @@ def learn_from_output(memory: Memory, output: SandboxOutput) -> list[str]:
         "PROFILE.param": F_PARAM,
         "PROFILE.auth": F_AUTH_VALUE,
         "PROFILE.target": F_TARGET,
+        "RECON.root": F_ROOT,
         "RECON.ws": F_WS_ROOT,
         "FIND.ws": F_WS_ROOT,
         "FIND.spec": F_SPEC_PATH,
@@ -237,6 +239,9 @@ class TaskSolver:
 
         self._observe(turn, run)
 
+        # 拿到侦察证据后重新判族——首轮分类是在没有证据的情况下做的
+        self._reclassify(world, run)
+
         # 硬性放弃条件（优先级最高：先保命再交卷）
         abandon_reason = self._abandon_reason(world, run)
         if abandon_reason:
@@ -308,6 +313,40 @@ class TaskSolver:
             return min(t.timeout_rounds for t in turn.player_tasks)
         return 15
 
+    def _reclassify(self, world: World, run: TaskRun) -> None:
+        """侦察回来后重新判定任务族，命中就换到对应的阶梯
+
+        判据是"**收到过沙盒输出**"而不是"recon 这一步已经结束"——重判发生在
+        `_drive` 推进阶梯之前，那时 `step_index` 还停在 recon 上。
+
+        **首轮分类必然是盲判**：`phaseTask` 常常只是一句"请阅读
+        task_1_beijing.md，获取任务信息"（27 字节），里面一个关键词都没有。
+        真正的族信号在侦察输出里——任务目录名（`1-unknown-api` /
+        `2-engineering-fix`）、`API_DOCS.md`、`X-API-Key`、`spec.md`、`./check`。
+
+        不重判的后果实测过：一直按 `unknown` 的阶梯（recon → generic）走，
+        **`query` 那一步从头到尾轮不上**，任务 5 个回合就被放弃、永远 0 分。
+        """
+        if run.last_output is None:
+            return  # 还没收到过任何沙盒输出，没有新证据
+        turn = world.turn
+        family, evidence = skills.classify(turn.phase_task, run.last_output)
+        if family == skills.FAMILY_UNKNOWN or family == run.family:
+            return
+
+        previous = run.family
+        run.family = family
+        run.key = skills.signature(family, turn.phase_task)
+        steps = skills.first_steps(run, self.memory.skill_for(run.key))
+        run.step_index = _index_after(steps, "recon")
+        run.attempts = 0
+        run.repeats = 0
+        self._event(
+            turn, "family",
+            f"from={previous} to={family} evidence={evidence} "
+            f"step={_step_name_of(steps, run.step_index)}",
+        )
+
     def _observe(self, turn: Turn, run: TaskRun) -> None:
         """把上一回合的沙盒输出与 LLM 回复吸收进运行状态
 
@@ -327,6 +366,12 @@ class TaskSolver:
         if turn.llm_resp:
             command = extract_llm_command(turn.llm_resp)
             if command:
+                # LLM 常给相对路径（`cat task_1_beijing.md`），而沙盒命令的 cwd
+                # 不是任务目录——实测直接报 `No such file or directory`，
+                # 白烧一个回合。侦察回来的根目录已知时先 cd 过去。
+                root = self.memory.fact(F_ROOT)
+                if root:
+                    command = f"cd {root} 2>/dev/null; " + command
                 run.llm_command = command
                 self._event(turn, "llm_command")
 
@@ -919,3 +964,15 @@ def describe_state() -> str:
     else:
         lines.append("skills=(空)")
     return "\n".join(lines)
+
+
+def _index_after(steps: tuple[StepSpec, ...], name: str) -> int:
+    """步骤序列里 `name` 之后的那个下标（找不到就从 0 开始）"""
+    for index, step in enumerate(steps):
+        if step.name == name:
+            return index + 1
+    return 0
+
+
+def _step_name_of(steps: tuple[StepSpec, ...], index: int) -> str:
+    return steps[index].name if 0 <= index < len(steps) else "-"
