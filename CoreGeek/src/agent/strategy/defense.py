@@ -69,6 +69,17 @@ DUSK_MARGIN = 1
 # 该有的行为。
 REACH_PROBE_STEPS = 8
 
+# 校验"这堵墙会不会把塔封死"时的搜深。塔就在基地周围 1–3 格，8 步绰绰有余；
+# 这个校验在围墙建造期每回合要跑好几次，限深是必须的。
+WALL_WALK_LIMIT = 10
+
+# 每座塔至少留几个从基地走得到的落脚点。
+#
+# **不能只留 1 个**：塔能不能开火全靠"有人站在它旁边"，只留一格的话一台机器人
+# 走过去堵上，这座塔整晚就哑了。实测报文里八段墙正好铺满三座塔西侧的全部落脚点
+# （railgun 的可达落脚点直接归零），塔从西面彻底够不着。
+WALL_KEEP_STANDS = 2
+
 # 只在"距天黑还剩这么多回合"以内才去算回防距离。
 # 再早就不用回：哪怕要走 20 步也来得及。这条早退是性能上限——
 # 否则白天每回合都要给每个角色跑一次寻路。
@@ -184,6 +195,12 @@ def tower_sites(world: World, limit: int = MAX_TOWERS) -> tuple[Pos, ...]:
 
     先按战术优先级取前 8 个可用偏移，再从中挑出一个**通过建成预演**的组合。
     预演不通过就换下一个组合（候选很少，直接组合枚举）。
+
+    试过"按 两两不相邻 + 总路程 给候选组合打分、取最好的那个"，**实测更差**：
+    把三座塔摊开之后总有一座离角色很远，`tools/nightsim.py` 三种来敌方向下
+    稳态都掉到每回合只开 2 炮（原布局是 3/3、2/2、3/3）。摆得开不等于守得住——
+    塔要靠人操控，人走过去是要花回合的。所以仍取"第一个通过预演的"：
+    那正是"离基地最近、最朝来敌方向"的组合。
     """
     turn = world.turn
     station = turn.station()
@@ -250,6 +267,18 @@ def wall_sites(world: World, target: int = WALL_TARGET_SEGMENTS) -> tuple[Pos, .
 
     取基地周围**第二圈**（切比雪夫半径 2）：第一圈紧贴基地，建满了会把基地
     围死、角色出不去。
+
+    **两道过滤，缺一个就会自己把自己封死**（实测报文里两个都犯了）：
+
+    1. **不建在已占用的格子上。** 旧实现只跳过"已有的墙"和基地 footprint，
+       不管塔——实测选出来的墙位里就有一格正压在炮塔身上。
+    2. **不挡住任何一座塔的落脚点。** 八段墙正好铺在 `(28,8)(28,9)(28,10)`，
+       那是三座塔（x=29）西侧的**全部**落脚点：塔从西面彻底够不着，角色只能从
+       北/南绕，机器人一压就断——`2.log` R81 开拓者被闷在 `(30,11)` 打不了炮，
+       72 个夜战回合只开了 3 次火，就是这么来的。
+
+    第二道必须**边选边验**，不能事后补：墙是按"先封来敌方向"排的，事后砍掉
+    前面几段就等于把来敌方向的防线让开。
     """
     turn = world.turn
     station = turn.station()
@@ -257,7 +286,7 @@ def wall_sites(world: World, target: int = WALL_TARGET_SEGMENTS) -> tuple[Pos, .
         return ()
     zone = world.zone()
     enemy = world.defence_sides()
-    footprint = set(station_footprint(station.pos))
+    occupied = _building_cells(turn)
     existing = {w.pos for w in turn.walls()}
 
     offsets: list[Pos] = []
@@ -273,14 +302,52 @@ def wall_sites(world: World, target: int = WALL_TARGET_SEGMENTS) -> tuple[Pos, .
     result: list[Pos] = []
     for offset in sorted(offsets, key=lambda o: _offset_key(o, zone, WALL, enemy)):
         absolute = world.absolute_of(offset)
-        if absolute in footprint or absolute in existing:
+        if absolute in occupied or absolute in existing:
             continue
         if not world.buildable_now(absolute):
+            continue
+        if _seals_a_tower(turn, existing | set(result) | {absolute}, occupied):
             continue
         result.append(absolute)
         if len(result) >= target:
             break
     return tuple(result)
+
+
+def _building_cells(turn: Turn) -> set[Pos]:
+    """我方建筑（基地/塔/墙）占掉的格子——它们都在 `ours` 里，不在 `zones` 里
+
+    注意 `turn.zones` 装的是报文 `mapInfo.zones`（矿、小贩、任务点这类中立元素），
+    建筑是 `ours` 里的单位。只查 `zones` 会以为塔位是空地。
+    """
+    cells: set[Pos] = set()
+    for unit in turn.ours:
+        if unit.is_alive and unit.kind not in CHARACTER_TYPES:
+            cells |= set(turn.footprint(unit))
+    return cells
+
+
+def _seals_a_tower(turn: Turn, walls: set[Pos], occupied: set[Pos]) -> bool:
+    """这些墙摆下去之后，是不是有哪座塔的落脚点不够用了
+
+    判据是"剩几个"而不是"有没有"：只留一个落脚点等于把这座塔交给对面——
+    一台机器人堵上去它就哑了。见 `WALL_KEEP_STANDS`。
+    """
+    station = turn.station()
+    if station is None:
+        return False
+    reach = grid.reachable_set(
+        turn, [station.pos], occupied | walls | {station.pos},
+        limit=WALL_WALK_LIMIT,
+    )
+    for tower in turn.towers():
+        stands = grid.stand_cells(turn, tower.pos)
+        if not stands:
+            continue
+        left = sum(1 for cell in stands if cell in reach)
+        if left < WALL_KEEP_STANDS:
+            return True
+    return False
 
 
 # ==========================================================================

@@ -454,3 +454,87 @@ def test_three_towers_all_fire_in_steady_state(
     assert min(steady) >= 3, (
         "稳态里有回合没打满三座：%s（%s）" % (sorted(set(steady)), report.summary())
     )
+
+
+# ==========================================================================
+# 围墙不能把自己人封死（实测 2.log：八段墙铺满三座塔西侧的全部落脚点）
+# ==========================================================================
+
+
+def _wall_world(payload_factory, role_factory, base=(30, 10)):
+    """基地 + 三座塔（用 `tower_sites` 选出来的真实布局）"""
+    world = _world(payload_factory, role_factory, base=base)
+    sites = defense.tower_sites(world)
+    roles = [role_factory(20090 + i, kind, p.x, p.y, level=1,
+                          attackRange=6, attackPower=10)
+             for i, (kind, p) in enumerate(zip(("rocket", "railgun", "gatling"), sites))]
+    return _world(payload_factory, role_factory, base=base, towers=roles), sites
+
+
+def test_walls_never_sit_on_a_building(payload_factory, role_factory):
+    """围墙不能建在已经占用的格子上（**守不变式**，不是当前布局的回归）
+
+    旧实现只跳过"已有的墙"和基地 footprint，**不管塔**——塔在 `ours` 里、
+    不在 `mapInfo.zones` 里，只查 `zones` 会以为那格是空地。当前这套塔位恰好
+    没撞上（所以这条在修复前也是绿的），但塔位一旦变化就会撞上：验"把三座塔摊开"
+    那一版时，选出来的墙位里就有一格正压在炮台上。
+    """
+    world, _ = _wall_world(payload_factory, role_factory)
+    walls = defense.wall_sites(world)
+    assert walls, "没有给出任何墙位"
+    blocked = set()
+    for unit in world.turn.ours:
+        if unit.is_alive and unit.kind not in ("worker", "pioneer"):
+            blocked |= set(world.turn.footprint(unit))
+    assert not (set(walls) & blocked), sorted(
+        (p.x, p.y) for p in set(walls) & blocked
+    )
+
+
+def test_walls_leave_every_tower_maneuverable(payload_factory, role_factory):
+    """八段墙全部建起来之后，**每座塔都还有落脚点**
+
+    实测报文里八段墙正好铺在 `(28,8)(28,9)(28,10)`——那是三座塔（x=29）西侧的
+    全部落脚点，railgun 的可达落脚点直接归零：塔从西面彻底够不着，角色只能从
+    北/南绕，机器人一压就断（`2.log` R81 开拓者被闷在 `(30,11)`，72 个夜战
+    回合只开了 3 次火）。
+
+    判据是"至少留 `WALL_KEEP_STANDS` 个"而不是"有就行"：只留一格的话，
+    一台机器人走过去堵上，这座塔整晚就哑了。
+    """
+    from agent import grid
+
+    # `getattr` 兜底：这条用例的价值在于"修好之前会红"，所以判据要写成
+    # 独立于被测常量——不然旧代码上是 `AttributeError` 而不是断言失败，
+    # 看上去像用例自己坏了。
+    keep = getattr(defense, "WALL_KEEP_STANDS", 2)
+
+    world, sites = _wall_world(payload_factory, role_factory)
+    assert len(sites) == 3
+    walls = defense.wall_sites(world)
+    assert len(walls) == defense.WALL_TARGET_SEGMENTS
+
+    roles = [role_factory(30000 + i, "wall", p.x, p.y, level=1)
+             for i, p in enumerate(walls)]
+    built = _world(payload_factory, role_factory, base=(30, 10),
+                   towers=[role_factory(20090 + i, kind, p.x, p.y, level=1,
+                                        attackRange=6, attackPower=10)
+                           for i, (kind, p) in enumerate(zip(
+                               ("rocket", "railgun", "gatling"), sites))],
+                   roles=roles)
+    turn = built.turn
+    blocked = set()
+    for unit in turn.ours:
+        if unit.is_alive and unit.kind not in ("worker", "pioneer"):
+            blocked |= set(turn.footprint(unit))
+    station = turn.station()
+    reach = grid.reachable_set(turn, [station.pos], blocked, limit=25)
+
+    for tower in turn.towers():
+        stands = grid.stand_cells(turn, tower.pos)
+        left = [c for c in stands if c in reach]
+        assert len(left) >= keep, (
+            "%s@%d,%d 只剩 %d 个落脚点（%s）"
+            % (tower.kind, tower.pos.x, tower.pos.y, len(left),
+               [(c.x, c.y) for c in left])
+        )

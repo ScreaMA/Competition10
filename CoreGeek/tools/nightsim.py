@@ -38,8 +38,12 @@ from agent.strategy import defense                            # noqa: E402
 from agent.world import World                                 # noqa: E402
 
 # 实测报文的战场：基地原点 (30,9)（footprint 占 (30,9)(31,9)(30,10)(31,10)）
-# 三座塔挤在基地左侧一列，枪口朝西
 BASE = Pos(30, 9)
+
+#: 实测报文里那三座塔：挤在基地左侧一列、两两相邻，朝西（来敌方向）。
+#: 这就是 `tower_sites` 现在摆出来的样子——试过"摊开"（打分偏好两两不相邻），
+#: 三种来敌方向下稳态都掉到每回合只开 2 炮，所以退回去了：塔要靠人操控，
+#: 摆得开不等于守得住，人走过去是要花回合的。
 TOWERS = (("rocket", Pos(29, 8)), ("railgun", Pos(29, 9)), ("gatling", Pos(29, 10)))
 
 #: 三人在基地**同一侧**（都贴着塔，理想情况）
@@ -256,7 +260,7 @@ def main() -> int:
     args = parser.parse_args()
 
     chars = CHARS_SPREAD if args.spread else CHARS_TIGHT
-    sim = NightSim(chars=chars, robot_count=args.robots)
+    sim = NightSim(chars=chars, towers=TOWERS, robot_count=args.robots)
     print("布局: %s" % ("开拓者在另一侧（实测）" if args.spread else "三人同侧"))
     print("塔: %s" % " ".join("%s@%d,%d" % (k, p.x, p.y) for k, p in sim.tower_spec))
     print("人: %s" % " ".join("%d@%d,%d" % (i, p.x, p.y) for i, p in chars))
