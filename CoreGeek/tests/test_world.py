@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent import world as world_mod
 from agent.protocol import Pos, Turn
 from agent.world import World
@@ -192,3 +194,60 @@ def test_buildable_now_excludes_occupied(payload_factory, role_factory):
     assert world.buildable_now(Pos(30, 30)) is True
     assert world.buildable_now(Pos(25, 25)) is False   # 工人占着
     assert world.buildable_now(Pos(20, 10)) is False   # 基地占着
+
+
+# ==========================================================================
+# 布防方位：**每回合从报文里推，且分主次**（不能写死，也不能不分主次）
+# ==========================================================================
+#
+# 两个出生基地在地图对角（左上 vs 右下），所以敌基地**几乎总是斜的**——横向
+# 与纵向都命中。只把它们当成"都算来敌方向"，谁排前面就由环数、坐标这些与敌情
+# 无关的因素决定了。实测 10 个敌基地方位里有 4 个把塔摆到了次要那一边。
+
+
+@pytest.mark.parametrize(
+    ("enemy", "expect"),
+    [
+        # 敌基地在左上方：横向偏移更大 ⇒ 左是主轴
+        ((8, 22), ("left", "up", "down", "right")),
+        # 在正上方偏左：纵向偏移更大 ⇒ 上是主轴
+        ((20, 24), ("up", "left", "down", "right")),
+        # 在右下方：右是主轴
+        ((36, 14), ("right", "up", "down", "left")),
+        # 正下方：只有下
+        ((30, 2), ("down", "up", "left", "right")),
+        # 正左方：只有左
+        ((5, 10), ("left", "up", "down", "right")),
+    ],
+)
+def test_defence_order_puts_the_dominant_axis_first(
+    payload_factory, role_factory, enemy, expect
+):
+    """主轴（偏移更大的那一维）必须排在布防顺序最前面"""
+    base = (30, 10)   # station 左上角；原点 (30,9)
+    turn = _turn(
+        payload_factory, role_factory, base=base,
+        enemies=[role_factory(9001, "station", *enemy)],
+    )
+    assert World.load(turn).defence_order() == expect
+
+
+def test_defence_order_mirrors_when_the_team_switches_side(
+    payload_factory, role_factory
+):
+    """上下半场换边：同一份代码必须自动跟着镜像，不能出现写死的方位
+
+    上半场我们在右下、敌人在左上；下半场反过来。塔位也跟着翻到另一侧——
+    "朝哪边布防"完全由报文推出来。
+    """
+    lower_right = _turn(
+        payload_factory, role_factory, base=(30, 10),
+        enemies=[role_factory(9001, "station", 8, 22)],
+    )
+    upper_left = _turn(
+        payload_factory, role_factory, base=(10, 22),
+        enemies=[role_factory(9001, "station", 32, 10)],
+    )
+    first = World.load(lower_right).defence_order()[0]
+    second = World.load(upper_left).defence_order()[0]
+    assert first == "left" and second == "right", (first, second)

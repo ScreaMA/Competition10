@@ -39,7 +39,7 @@ from ..protocol import (
     neighbours,
     station_footprint,
 )
-from ..world import World
+from ..world import SIDE_ORDER, World
 
 # 武器建造顺序：射程优先（火箭 10 > 电磁狙击炮 6 > 加特林 3）。
 # 对战复盘里敌方开局就建射程 10 的火箭发射台，我方却先建射程 3 的加特林，
@@ -52,8 +52,6 @@ MAX_TOWERS = 3
 
 # 围墙目标段数：够盖住来向 + 两侧即可（石头是稀缺资源，铺满一圈不现实）
 WALL_TARGET_SEGMENTS = 8
-
-SIDE_ORDER = ("up", "down", "left", "right")
 
 # 天黑前预留几个回合回防（路程正好等于剩余回合时才出发就太紧了）
 DUSK_MARGIN = 1
@@ -120,15 +118,21 @@ def _outside(value: int) -> int:
     return 0
 
 
-def side_rank(side: str, enemy_sides: frozenset[str]) -> int:
-    if side in enemy_sides:
-        return 0
-    return 1 + (SIDE_ORDER.index(side) if side in SIDE_ORDER else 9)
+def side_rank(side: str, order: tuple[str, ...]) -> int:
+    """这个方位在布防顺序里排第几（**越小越该优先布防**）
+
+    `order` 是 `World.defence_order()` 给的完整排序，不是"来敌方向集合"——
+    敌基地在对角时横竖两维都会命中，用集合就没法区分主次了（实测因此有 4/10
+    的敌基地方位把塔摆到了次要那一边）。
+    """
+    try:
+        return order.index(side)
+    except ValueError:
+        return len(order) + SIDE_ORDER.index(side)
 
 
 def ordered_sides(world: World) -> tuple[str, ...]:
-    enemy = world.defence_sides()
-    return tuple(sorted(SIDE_ORDER, key=lambda s: (side_rank(s, enemy), SIDE_ORDER.index(s))))
+    return world.defence_order()
 
 
 # ==========================================================================
@@ -159,12 +163,12 @@ def candidate_offsets(world: World, name: str, radius: int = 3) -> tuple[Pos, ..
     """某类建筑的候选偏移（相对基地原点），按战术优先级排序
 
     排序依据：
-      1. 来敌方向优先（`side_rank`）
+      1. 来敌方向优先（`side_rank`，**按主轴分主次**）
       2. 已确证可建造的排在未知的前面（学到的知识立刻生效）
       3. 同档次内按距离基地由近到远
     """
     zone = world.zone()
-    enemy = world.defence_sides()
+    enemy = world.defence_order()
     offsets: list[Pos] = []
     for ring in range(1, radius + 1):
         for dx in range(-ring, ring + 1):
@@ -285,7 +289,7 @@ def wall_sites(world: World, target: int = WALL_TARGET_SEGMENTS) -> tuple[Pos, .
     if station is None:
         return ()
     zone = world.zone()
-    enemy = world.defence_sides()
+    enemy = world.defence_order()
     occupied = _building_cells(turn)
     existing = {w.pos for w in turn.walls()}
 

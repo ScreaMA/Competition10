@@ -33,6 +33,11 @@ from .protocol import (
     station_footprint,
 )
 
+#: 四个方位的固定次序。**只是同分时的兜底排序，不是「来敌方向」**——
+#: 真正的来向由 `defence_order()` 每回合从报文里推（敌基地全图可见）。
+SIDE_ORDER = ("up", "down", "left", "right")
+
+
 # ==========================================================================
 # 可建造区（在线学习）
 # ==========================================================================
@@ -281,13 +286,61 @@ class World:
             sides.add("up")
         return frozenset(sides) if sides else frozenset({"left", "right"})
 
-    def defence_sides(self) -> frozenset[str]:
-        """布防方位：来敌方向优先，看不到任何敌方单位时朝地图中心
+    def enemy_order(self) -> tuple[str, ...]:
+        """敌方来向，**按主轴优先排序**（最能来敌的方向排最前）
 
-        直接用 `enemy_sides()`（可能为空集）的话，无信息时会退化成按固定的
-        `SIDE_ORDER` 排序——塔位因此永远压在基地正北，与来路无关。
+        两个出生基地就在地图的对角（左上 vs 右下），所以敌基地**几乎总是斜的**，
+        横向与纵向都算"来敌方向"。
+
+        **但两者不能等价。** 只给它们相同的优先级，谁排前面就由切比雪夫环数、
+        坐标这些**与敌情无关**的因素决定了。实测：我方基地 `(30,10)`、敌基地
+        `(20,24)`——dx=-10、dy=+14，**"上"才是主轴**——塔位却压到了左边。
+
+        主轴 = 偏移绝对值更大的那一维，另一维作为次方向排在其后。
         """
-        return self.enemy_sides() or frozenset({self.map_center_side()})
+        station = self.turn.station()
+        if station is None:
+            return ()
+        visible = [u for u in self.turn.enemies if u.is_alive]
+        candidates = [u for u in visible if u.kind == "station"] or visible
+        if not candidates:
+            return ()
+        target = min(
+            candidates,
+            key=lambda u: (distance(u.pos, station.pos), u.pos.x, u.pos.y),
+        )
+        dx = target.pos.x - station.pos.x
+        dy = target.pos.y - station.pos.y
+        if dx == 0 and dy == 0:
+            return ()
+        horizontal = "right" if dx >= 0 else "left"
+        vertical = "up" if dy >= 0 else "down"
+        if dy == 0:
+            return (horizontal,)
+        if dx == 0:
+            return (vertical,)
+        return (
+            (horizontal, vertical) if abs(dx) >= abs(dy) else (vertical, horizontal)
+        )
+
+    def defence_order(self) -> tuple[str, ...]:
+        """布防方位：**完整排序**，越靠前越该优先布防
+
+        来敌方向（主轴优先）排在前面，其余方位按 `SIDE_ORDER` 兜在后面。
+        看不到任何敌方单位时退回"朝地图中心"的保守选择——设计文档V2 §11.3：
+        不对不可见信息做推断。
+
+        **方向是每回合从报文里推出来的**（敌基地全图可见，接口文档 §1.4），
+        不写死任何一侧：上下半场换边之后同一份代码自动跟着镜像。
+        """
+        primary = self.enemy_order() or (self.map_center_side(),)
+        return tuple(primary) + tuple(
+            side for side in SIDE_ORDER if side not in primary
+        )
+
+    def defence_sides(self) -> frozenset[str]:
+        """布防方位（只看"有哪几面"，保留给只要集合的调用方）"""
+        return frozenset(self.defence_order()[:2])
 
     def map_center_side(self) -> str:
         """看不到任何敌方单位时的保守来向：朝地图中心的那一边"""

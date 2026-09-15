@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agent.protocol import Pos, Turn
 from agent.strategy import defense
 from agent.world import World
@@ -538,3 +540,42 @@ def test_walls_leave_every_tower_maneuverable(payload_factory, role_factory):
             % (tower.kind, tower.pos.x, tower.pos.y, len(left),
                [(c.x, c.y) for c in left])
         )
+
+
+# ==========================================================================
+# 塔位必须朝**主轴**（敌人的出生点在斜对角，横竖两维都会命中）
+# ==========================================================================
+
+
+def _side_of_offset(pos: Pos, origin: Pos) -> str:
+    dx, dy = pos.x - origin.x, pos.y - origin.y
+    if abs(dx) > abs(dy):
+        return "right" if dx > 0 else "left"
+    return "up" if dy > 0 else "down"
+
+
+@pytest.mark.parametrize(
+    "enemy", [(8, 22), (8, 4), (20, 24), (36, 14), (38, 4), (20, 4), (2, 30)],
+)
+def test_towers_face_the_dominant_enemy_axis(
+    payload_factory, role_factory, enemy
+):
+    """塔位要压在**主轴**那一侧，不能摆到次要方向去
+
+    两个出生基地在地图对角（左上 vs 右下），敌基地几乎总是斜的：横竖两维都
+    算"来敌方向"。只把它们当成等价，谁排前面就由环数、坐标这些与敌情无关的
+    因素决定——实测 10 个方位里有 4 个把塔摆到了次要那一边。
+
+    这条同时钉住"**方向是推出来的、不是写死的**"：换一套敌我位置，塔位自动
+    跟着翻。
+    """
+    origin = Pos(30, 9)                     # station 左上角 (30,10)
+    world = _world(
+        payload_factory, role_factory, base=(30, 10),
+        enemies=[role_factory(9001, "station", *enemy)],
+    )
+    dom = _side_of_offset(Pos(*enemy), Pos(origin.x, origin.y + 1))
+    sites = defense.tower_sites(world)
+    assert sites, "没有给出塔位"
+    sides = {_side_of_offset(p, origin) for p in sites}
+    assert dom in sides, "主轴是 %s，塔却摆到了 %s" % (dom, sorted(sides))
