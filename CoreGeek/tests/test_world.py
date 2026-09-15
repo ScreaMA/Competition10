@@ -208,28 +208,58 @@ def test_buildable_now_excludes_occupied(payload_factory, role_factory):
 @pytest.mark.parametrize(
     ("enemy", "expect"),
     [
-        # 敌基地在左上方：横向偏移更大 ⇒ 左是主轴
+        # 敌基地在左上方：横向偏移更大 ⇒ 左是主轴，其次是上（垂直那一维），
+        # 背面（右）垫底
         ((8, 22), ("left", "up", "down", "right")),
-        # 在正上方偏左：纵向偏移更大 ⇒ 上是主轴
-        ((20, 24), ("up", "left", "down", "right")),
+        # 在正上方偏左：上是主轴；**两翼左右并列**排在次方向，
+        # 背面（下）垫底
+        ((20, 24), ("up", "left", "right", "down")),
         # 在右下方：右是主轴
         ((36, 14), ("right", "up", "down", "left")),
-        # 正下方：只有下
-        ((30, 2), ("down", "up", "left", "right")),
-        # 正左方：只有左
+        # 正下方：下是主轴，**左右两翼并列**，背面（上）垫底
+        ((30, 2), ("down", "left", "right", "up")),
+        # 正左方：左是主轴，上下两翼并列，背面（右）垫底
         ((5, 10), ("left", "up", "down", "right")),
     ],
 )
 def test_defence_order_puts_the_dominant_axis_first(
     payload_factory, role_factory, enemy, expect
 ):
-    """主轴（偏移更大的那一维）必须排在布防顺序最前面"""
+    """排序必须是"正对来敌 > 两翼 > 背面"，且**两翼并列**
+
+    两个出生基地在地图对角（左上 vs 右下），敌基地几乎总是斜的：横竖两维都
+    命中。旧实现把它们当成等价、再按固定次序兜底，于是——斜向时谁排前面由
+    环数/坐标这些与敌情无关的因素决定；正上正下时"背面"排在两翼之前。
+    """
     base = (30, 10)   # station 左上角；原点 (30,9)
     turn = _turn(
         payload_factory, role_factory, base=base,
         enemies=[role_factory(9001, "station", *enemy)],
     )
     assert World.load(turn).defence_order() == expect
+
+
+def test_defence_order_keeps_the_two_flanks_tied(payload_factory, role_factory):
+    """**两翼必须并列**，不能分出先后
+
+    "正对来敌"与"两翼"之间是质的差别，"左翼"与"右翼"之间没有。分出先后会让
+    围墙全砌到同一侧：实测敌人在正上方时，八段墙里五段在左翼、右翼一段没有。
+    """
+    turn = _turn(
+        payload_factory, role_factory, base=(30, 10),
+        enemies=[role_factory(9001, "station", 30, 26)],   # 正上方
+    )
+    world = World.load(turn)
+    # 旧代码没有 `defence_ranks`，用 `defence_order` 的位置兜底——这样修复前
+    # 是**断言失败**（左 2、右 3），而不是用例自己 `AttributeError` 崩掉。
+    ranks = getattr(world, "defence_ranks", None)
+    if ranks is None:
+        ranks = {side: i for i, side in enumerate(world.defence_order())}
+    else:
+        ranks = ranks()
+    assert ranks["left"] == ranks["right"], ranks
+    assert ranks["up"] < ranks["left"], ranks          # 正面优于两翼
+    assert ranks["down"] > ranks["left"], ranks        # 两翼优于背面
 
 
 def test_defence_order_mirrors_when_the_team_switches_side(

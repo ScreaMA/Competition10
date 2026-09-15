@@ -118,17 +118,15 @@ def _outside(value: int) -> int:
     return 0
 
 
-def side_rank(side: str, order: tuple[str, ...]) -> int:
-    """这个方位在布防顺序里排第几（**越小越该优先布防**）
+def side_rank(side: str, ranks: dict[str, int]) -> int:
+    """这个方位在布防名次里排第几（**越小越该优先布防**）
 
-    `order` 是 `World.defence_order()` 给的完整排序，不是"来敌方向集合"——
-    敌基地在对角时横竖两维都会命中，用集合就没法区分主次了（实测因此有 4/10
-    的敌基地方位把塔摆到了次要那一边）。
+    `ranks` 来自 `World.defence_ranks()`，是"方位 -> 名次"的映射而不是一条
+    排序：**同分的方位必须并列**。"正对来敌"与"两翼"之间是质的差别，"左翼"
+    与"右翼"之间没有——把它们分出先后，围墙会全砌到同一侧（实测敌人在正上方
+    时，八段墙里五段在左翼、右翼一段没有）。
     """
-    try:
-        return order.index(side)
-    except ValueError:
-        return len(order) + SIDE_ORDER.index(side)
+    return ranks.get(side, len(ranks))
 
 
 def ordered_sides(world: World) -> tuple[str, ...]:
@@ -168,7 +166,7 @@ def candidate_offsets(world: World, name: str, radius: int = 3) -> tuple[Pos, ..
       3. 同档次内按距离基地由近到远
     """
     zone = world.zone()
-    enemy = world.defence_order()
+    enemy = world.defence_ranks()
     offsets: list[Pos] = []
     for ring in range(1, radius + 1):
         for dx in range(-ring, ring + 1):
@@ -289,7 +287,7 @@ def wall_sites(world: World, target: int = WALL_TARGET_SEGMENTS) -> tuple[Pos, .
     if station is None:
         return ()
     zone = world.zone()
-    enemy = world.defence_order()
+    enemy = world.defence_ranks()
     occupied = _building_cells(turn)
     existing = {w.pos for w in turn.walls()}
 

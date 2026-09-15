@@ -37,6 +37,10 @@ from .protocol import (
 #: 真正的来向由 `defence_order()` 每回合从报文里推（敌基地全图可见）。
 SIDE_ORDER = ("up", "down", "left", "right")
 
+#: 四个方位的单位向量（算"哪一面离来敌方向更近"用）
+_DIRECTION_VECTORS = {"up": (0, 1), "down": (0, -1),
+                      "left": (-1, 0), "right": (1, 0)}
+
 
 # ==========================================================================
 # 可建造区（在线学习）
@@ -286,61 +290,63 @@ class World:
             sides.add("up")
         return frozenset(sides) if sides else frozenset({"left", "right"})
 
-    def enemy_order(self) -> tuple[str, ...]:
-        """敌方来向，**按主轴优先排序**（最能来敌的方向排最前）
+    def enemy_vector(self) -> tuple[int, int] | None:
+        """敌方来向的**原始向量**（我方基地 → 最近的可见敌方单位）
 
-        两个出生基地就在地图的对角（左上 vs 右下），所以敌基地**几乎总是斜的**，
-        横向与纵向都算"来敌方向"。
-
-        **但两者不能等价。** 只给它们相同的优先级，谁排前面就由切比雪夫环数、
-        坐标这些**与敌情无关**的因素决定了。实测：我方基地 `(30,10)`、敌基地
-        `(20,24)`——dx=-10、dy=+14，**"上"才是主轴**——塔位却压到了左边。
-
-        主轴 = 偏移绝对值更大的那一维，另一维作为次方向排在其后。
+        优先用可见的敌方基地（接口文档 §1.4：敌基地全图可见），看不到就退回
+        最近的可见敌方单位；都没有时返回 None——不做方位假设。
         """
         station = self.turn.station()
         if station is None:
-            return ()
+            return None
         visible = [u for u in self.turn.enemies if u.is_alive]
         candidates = [u for u in visible if u.kind == "station"] or visible
         if not candidates:
-            return ()
+            return None
         target = min(
             candidates,
             key=lambda u: (distance(u.pos, station.pos), u.pos.x, u.pos.y),
         )
-        dx = target.pos.x - station.pos.x
-        dy = target.pos.y - station.pos.y
-        if dx == 0 and dy == 0:
-            return ()
-        horizontal = "right" if dx >= 0 else "left"
-        vertical = "up" if dy >= 0 else "down"
-        if dy == 0:
-            return (horizontal,)
-        if dx == 0:
-            return (vertical,)
-        return (
-            (horizontal, vertical) if abs(dx) >= abs(dy) else (vertical, horizontal)
-        )
+        return (target.pos.x - station.pos.x, target.pos.y - station.pos.y)
+
+    def defence_ranks(self) -> dict[str, int]:
+        """每个方位的**布防名次**（越小越该优先布防；**同分的方位并列**）
+
+        名次由方位向量与敌我连线的点积决定：
+
+            正对来敌的那一面  >  两翼（垂直方向）  >  **背面**
+
+        两个出生基地在地图对角（左上 vs 右下），敌基地**几乎总是斜的**，横竖
+        两维都会"命中"。按命中集合排序（旧实现）有两个后果：
+
+          - **斜向时**谁排前面由切比雪夫环数、坐标这些与敌情无关的因素决定——
+            实测敌基地 `(20,24)`、我方 `(30,10)`（dx=-10 dy=+14，"上"是主轴）
+            时，塔位压到了左边；
+          - **正上/正下时**，"下"排在左右两翼**之前**——八段墙里三段砌在了
+            背对敌人的那一面。
+
+        **并列是必须的，不能靠固定次序把两翼分出先后。** "正对来敌"和"两翼"
+        之间是质的差别，"左翼"和"右翼"之间没有——分先后会让围墙全砌到同一侧：
+        实测敌人在正上方时，八段墙里五段砌在左翼、右翼一段没有。
+
+        看不到任何敌方单位时退回"朝地图中心"的保守选择（设计文档V2 §11.3：
+        不对不可见信息做推断）。**方向每回合从报文里推、不写死**：换边之后
+        同一份代码自动镜像。
+        """
+        vector = self.enemy_vector() or _DIRECTION_VECTORS[self.map_center_side()]
+        vx, vy = vector
+        dots = {
+            side: sx * vx + sy * vy
+            for side, (sx, sy) in _DIRECTION_VECTORS.items()
+        }
+        # 按点积从大到小排名次；点积相同 ⇒ 名次相同（两翼并列）
+        levels = sorted(set(dots.values()), reverse=True)
+        return {side: levels.index(dot) for side, dot in dots.items()}
 
     def defence_order(self) -> tuple[str, ...]:
-        """布防方位：**完整排序**，越靠前越该优先布防
-
-        来敌方向（主轴优先）排在前面，其余方位按 `SIDE_ORDER` 兜在后面。
-        看不到任何敌方单位时退回"朝地图中心"的保守选择——设计文档V2 §11.3：
-        不对不可见信息做推断。
-
-        **方向是每回合从报文里推出来的**（敌基地全图可见，接口文档 §1.4），
-        不写死任何一侧：上下半场换边之后同一份代码自动跟着镜像。
-        """
-        primary = self.enemy_order() or (self.map_center_side(),)
-        return tuple(primary) + tuple(
-            side for side in SIDE_ORDER if side not in primary
-        )
-
-    def defence_sides(self) -> frozenset[str]:
-        """布防方位（只看"有哪几面"，保留给只要集合的调用方）"""
-        return frozenset(self.defence_order()[:2])
+        """布防顺序（名次 + 固定次序兜底，给需要序列的调用方）"""
+        ranks = self.defence_ranks()
+        return tuple(sorted(SIDE_ORDER, key=lambda s: (ranks[s], SIDE_ORDER.index(s))))
 
     def map_center_side(self) -> str:
         """看不到任何敌方单位时的保守来向：朝地图中心的那一边"""
