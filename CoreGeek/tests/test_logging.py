@@ -297,36 +297,42 @@ def test_task_dump_emitted_for_task_rounds(
 ):
     """任务回合要打全量日志：任务描述 / 下发的沙盒命令 / 沙盒回包 / 提交的答案
 
-    INFO 那三行是给复盘按字段读的，一律截断压行；排查任务问题要看的是**原文**，
-    所以这些走 DEBUG（只进 `debug.log`，不进判题器收到的 stdout）。
+    结构化那几行是给复盘按字段读的，一律截断压行；排查任务问题要看的是
+    **原文**，所以这些走 INFO——**必须进 stdout**，判题系统采集的是进程的
+    stdout，只写 `debug.log` 的话对局结束后拿不出来。
     """
     roles = [role_factory(10013, "station", 20, 10),
              role_factory(10011, "pioneer", 24, 11)]
     tasks = [task_factory("自进化类1", 24, 12)]
 
-    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+    with caplog.at_level(logging.INFO, logger="agent.brain"):
         # 第 1 回合领任务、第 2 回合任务开始并下发 recon
         decide(payload_factory(round_no=1, roles=roles, player_tasks=tasks))
         decide(payload_factory(
             round_no=2, roles=roles, player_tasks=tasks,
             phase_task="请阅读task_1_beijing.md，获取任务信息" * 3,
         ))
-    dumps = [r.getMessage() for r in caplog.records if "task_dump" in r.getMessage()]
-    kinds = {line.split("kind=")[1].split()[0] for line in dumps}
-    assert "phase_task" in kinds, dumps
-    assert "execute_cmd" in kinds, dumps
+    records = [r for r in caplog.records if "task_dump" in r.getMessage()]
+    kinds = {r.getMessage().split("kind=")[1].split()[0] for r in records}
+    assert "phase_task" in kinds, kinds
+    assert "execute_cmd" in kinds, kinds
+    # **必须是 INFO**：stdout 的处理器只收 INFO，压到 DEBUG 就等于判题器那边
+    # 完全看不到这段原文（"下载不了日志"就是这么来的）
+    assert all(r.levelno == logging.INFO for r in records), [
+        (r.levelname, r.getMessage()[:60]) for r in records
+    ]
 
 
 def test_task_dump_not_emitted_without_task(payload_factory, base_roles, caplog):
-    """没任务就一行都不多打——否则 debug.log 会被撑爆"""
-    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+    """没任务就一行都不多打——否则 stdout 与 debug.log 都会被撑爆"""
+    with caplog.at_level(logging.INFO, logger="agent.brain"):
         decide(payload_factory(round_no=1, roles=base_roles))
     assert not [r for r in caplog.records if "task_dump" in r.getMessage()]
 
 
 def test_task_dump_is_single_line(payload_factory, role_factory, task_factory, caplog):
-    """多行正文必须转义（分析侧按行读）"""
-    with caplog.at_level(logging.DEBUG, logger="agent.brain"):
+    """多行正文必须转义：stdout 那边可能被别的工具按行读"""
+    with caplog.at_level(logging.INFO, logger="agent.brain"):
         decide(payload_factory(
             round_no=2,
             roles=[role_factory(10013, "station", 20, 10),
@@ -359,7 +365,9 @@ def test_task_dump_survives_roundtrip_through_analyzer(
             player_tasks=[task_factory("自进化类1", 24, 12)],
             phase_task=raw,
         ))
-    path = _dump(tmp_path, [r.getMessage() for r in caplog.records])
+    path = _dump(tmp_path, [
+        r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+    ])
     stats = analyze_log.analyze(path)
     restored = [text for _, kind, text in stats.dumps if kind == "phase_task"]
     assert restored, stats.dumps

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -108,8 +109,10 @@ def _decide(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-# 单条 task_dump 的长度上限（防止某次沙盒输出把 debug.log 撑爆）
-TASK_DUMP_LIMIT = 200_000
+# 单条 task_dump 的长度上限（可用环境变量 TASK_DUMP_LIMIT 覆盖）。
+# 沙盒单次输出本身就被判题器截到 64KB，这里留出余量；调小它的场景通常是
+# 判题器侧的 stdout 采集有大小限制。
+TASK_DUMP_LIMIT = int(os.getenv("TASK_DUMP_LIMIT", "200000"))
 
 
 def _dump_task_context(
@@ -117,26 +120,27 @@ def _dump_task_context(
     task_plan: TaskPlan,
     commands: dict[int, dict[str, Any]],
 ) -> None:
-    """**自进化任务相关的全量日志**（DEBUG 级，只进 `debug.log`）
+    """**自进化任务相关的全量日志**（INFO 级，**同时进 stdout 与 `debug.log`**）
 
-    INFO 那三行是给复盘流水线按字段读的，所以一律截断、压行；
-    任务出问题时真正要看的却是**原文**：任务描述写了什么、我们下发了哪条
-    沙盒命令、沙盒原样回了什么、提交的答案长什么样。这些在 INFO 里都看不到，
-    于是 V1 的复盘只能靠"反推"——报告里那句"日志未覆盖"多半就是指这个。
+    上面那三行是给复盘流水线按字段读的，所以一律截断、压行；任务出问题时
+    真正要看的却是**原文**：任务描述写了什么、我们下发了哪条沙盒命令、沙盒
+    原样回了什么、提交的答案长什么样。这些在结构化行里看不到，于是 V1 的
+    复盘只能靠"反推"——报告里那句"日志未覆盖"多半就是指这个。
 
-    设计取舍：
+    三条设计取舍：
 
-    - **只进 DEBUG**。`debug.log` 收 DEBUG、stdout 收 INFO，所以判题器那一侧
-      的报文长度不受影响，而复盘要的原文全在文件里。
-    - **换行转义成 `
-`**。保持"一行一条记录"的不变量，分析侧按行读不会散；
-      `analyze_log.py --full` 会还原成多行给你看。
-    - **只在涉及任务时打**。非任务回合一行都不多写。
+    - **走 INFO，即 stdout 与 `debug.log` 各一份。** 判题系统采集的是进程的
+      stdout，`debug.log` 是给本地工具用的；只写文件的话，对局结束时留在
+      容器里的日志根本拿不出来。
+    - **换行转义成字面量 `
+`**。stdout 那边可能被别的工具按行读，压成一行
+      最保险；本地看的话 `analyze_log.py --full` 会还原成多行。
+    - **只在涉及任务时打**。非任务回合一行都不多写，不会稀释掉结构化行。
 
     只打**与当前这一回合相关**的东西，不做全量战场转储——后者在
     `request_decoded` 里已经有了。
     """
-    if not LOGGER.isEnabledFor(logging.DEBUG):
+    if not LOGGER.isEnabledFor(logging.INFO):
         return
 
     # 只有**这一回合确实碰了任务**才打。否则每个普通回合都跟着一条
@@ -183,7 +187,8 @@ def _dump_task_context(
         body = _escape(text)
         if len(body) > TASK_DUMP_LIMIT:
             body = body[:TASK_DUMP_LIMIT] + "\\n[CLIPPED]"
-        LOGGER.debug(
+        # INFO：stdout（判题器采集）与 debug.log（本地复盘）各一份
+        LOGGER.info(
             "task_dump round=%d kind=%s bytes=%d text=%s",
             turn.round_no, kind, len(text), body,
         )

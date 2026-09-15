@@ -6,7 +6,7 @@
     python CoreGeek/tools/analyze_log.py --template          # 渲染日志分析模板 V2
     python CoreGeek/tools/analyze_log.py --issue             # 渲染 Issue 总结模板 V2
     python CoreGeek/tools/analyze_log.py --task              # 只看自进化任务链路
-    python CoreGeek/tools/analyze_log.py --full              # 任务全量日志（原文）
+    python CoreGeek/tools/analyze_log.py --full              # 任务全量日志（原文，还原成多行）
     python CoreGeek/tools/analyze_log.py --rounds 1-130      # 只看某个回合区间
     python CoreGeek/tools/analyze_log.py --out report.md     # 写到文件
 
@@ -558,13 +558,14 @@ def print_summary(stats: Stats, log_file: Path) -> None:
 def print_full(stats: Stats) -> None:
     """打印自进化任务的**全量日志**（`--full`）
 
-    这些是 `debug.log` 里 DEBUG 级的 `task_dump` 行，还原成多行后打印：
-    任务描述原文、我们下发的沙盒命令、沙盒原样回的什么、提交的答案、
-    LLM 的 prompt 与回复。INFO 那三行是给复盘按字段读的，排查问题要看这个。
+    这些是 `task_dump` 行（INFO 级，stdout 与 `debug.log` 各一份），还原成
+    多行后打印：任务描述原文、我们下发的沙盒命令、沙盒原样回的什么、提交的
+    答案、LLM 的 prompt 与回复。结构化那几行是给复盘按字段读的，排查问题
+    要看的是这一组。
     """
     if not stats.dumps:
-        print("（日志里没有 task_dump 行——只有涉及自进化任务的回合才会打，")
-        print("  另外它走 DEBUG 级，确认 debug.log 是用默认配置写的）")
+        print("（日志里没有 task_dump 行）")
+        print("  只有涉及自进化任务的回合才会打；确认这份日志覆盖到了任务期间。")
         return
 
     current = None

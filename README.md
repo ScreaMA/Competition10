@@ -181,10 +181,11 @@ day_summary     day=1 rounds=1-130 kills=23 gold_peak=120 build=8 task_submit=3 
 freeze_alert    round=200 gold=0 stalled_rounds=20 bag=10012{stone×3}
 ```
 
-**凡是碰到自进化任务的回合**，还会额外打一组 DEBUG 级的全量日志
-（`task_dump`：题面全文 / 下发的沙盒命令全文 / 沙盒原样回的内容 / LLM 问答 /
-提交的答案 / 任务链路内部状态）——INFO 行是给机器按字段读的，一律截断；
-排查任务问题看的是这一组，用 `--full` 还原成多行。
+**凡是碰到自进化任务的回合**，还会额外打一组全量日志（`task_dump`：题面全文 /
+下发的沙盒命令全文 / 沙盒原样回的内容 / LLM 问答 / 提交的答案 / 任务链路内部
+状态）。它**走 INFO，因此同时出现在 stdout（判题器采集的那份）与 `debug.log`**——
+结构化那几行是给机器按字段读的、一律截断，排查任务问题要看的是这一组；
+本地用 `--full` 还原成多行。单条上限 200KB，可用环境变量 `TASK_DUMP_LIMIT` 调整。
 
 比 V1 多出来的是**逐回合增量**（击杀/掉血/建筑损失/空转）、**任务链路事件**
 （start/step/submit/abandon/skill）与**金币停滞自动告警**——V1 报告里大量
