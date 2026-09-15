@@ -52,6 +52,14 @@ WALL_TARGET_SEGMENTS = 8
 
 SIDE_ORDER = ("up", "down", "left", "right")
 
+# 天黑前预留几个回合回防（路程正好等于剩余回合时才出发就太紧了）
+DUSK_MARGIN = 1
+
+# 只在"距天黑还剩这么多回合"以内才去算回防距离。
+# 再早就不用回：哪怕要走 20 步也来得及。这条早退是性能上限——
+# 否则白天每回合都要给每个角色跑一次寻路。
+DUSK_RECALL_WINDOW = 25
+
 
 # ==========================================================================
 # 方位
@@ -262,6 +270,81 @@ def wall_sites(world: World, target: int = WALL_TARGET_SEGMENTS) -> tuple[Pos, .
 
 
 # ==========================================================================
+# 天黑前回防
+# ==========================================================================
+
+
+def rounds_until_night(turn: Turn) -> int:
+    """距离天黑还有几个回合（白天最后 1 回合返回 1，夜晚返回 0）
+
+    任务书 §4.2：白天 70 回合、夜晚 60 回合，每个游戏日 130 回合。
+    """
+    if not turn.is_day:
+        return 0
+    from ..protocol import DAY_ROUNDS, ROUNDS_PER_DAY
+
+    round_in_day = (turn.round_no - 1) % ROUNDS_PER_DAY + 1
+    return max(0, DAY_ROUNDS + 1 - round_in_day)
+
+
+def station_cells(world: World) -> tuple[Pos, ...]:
+    """夜间站位：每座武器周围的落脚点；没有武器时退回基地周围一圈"""
+    turn = world.turn
+    cells: list[Pos] = []
+    for tower in turn.towers():
+        for cell in grid.stand_cells(turn, tower.pos, occupants=turn.occupied()):
+            if cell not in cells:
+                cells.append(cell)
+    if cells:
+        return tuple(cells)
+    station = turn.station()
+    if station is None:
+        return ()
+    return tuple(
+        grid.cells_in_radius(station.pos, 2, turn.width, turn.height)
+    )
+
+
+def station_distance(world: World, unit: Unit, limit: int) -> int:
+    """到最近夜间站位的步数（没有站位时返回 0 = 不用回防）
+
+    超过 `limit` 步一律返回 `limit + 1`（"来不来得及"的语义足够），
+    算不出路径时退回切比雪夫距离——宁可按老办法估一个（因此提前一点出发），
+    也不要返回 0 导致根本不回防。
+    """
+    cells = station_cells(world)
+    if not cells:
+        return 0
+    steps = grid.steps_to_any(world.turn, unit.pos, cells, limit)
+    if steps is not None:
+        return steps
+    if grid.reachable_any(world.turn, unit.pos, cells):
+        return limit + 1          # 能到，但比 limit 远
+    return min(distance(unit.pos, cell) for cell in cells)
+
+
+def dusk_recall(world: World, unit: Unit, claimed: set[Pos]) -> dict | None:
+    """天快黑了：放下手里的活，先回到夜间站位
+
+    这是"炮塔没人操控、小怪直接推进"最直接的一条根因——白天角色在十几格外的
+    矿区/商店，而**就位逻辑是天黑之后才启动的**，等它走回来已经是好几个回合
+    之后，塔在这段时间里一直是空的。
+
+    判据用"路够不够走"而不是固定回合数：`到站位的距离 >= 剩余白天回合` 才出发，
+    所以近的角色继续干活到最后一刻，远的会提前走。
+    """
+    if not world.turn.is_day:
+        return None
+    left = rounds_until_night(world.turn)
+    if left <= 0 or left > DUSK_RECALL_WINDOW:
+        return None
+    threshold = left + DUSK_MARGIN
+    if station_distance(world, unit, threshold) < threshold:
+        return None
+    return guard_weapon(world, unit, claimed)
+
+
+# ==========================================================================
 # 夜晚火力控制
 # ==========================================================================
 
@@ -303,7 +386,10 @@ def night_actions(
         for weapon, controller in _pair(characters, weapons):
             paired_weapons.add(weapon.unit_id)
             paired_characters.add(controller.unit_id)
-            actions.append(_act(world, weapon, controller, robots, claimed))
+            actions.append(_act(
+                world, weapon, controller, robots, claimed,
+                assigned=frozenset(paired_weapons),
+            ))
 
     for character in characters:
         if character.unit_id in paired_characters:
@@ -356,6 +442,7 @@ def _act(
     controller: Unit,
     robots: list[Robot],
     claimed: set[Pos],
+    assigned: frozenset[int] = frozenset(),
 ) -> NightAction:
     """一座武器这一回合的动作"""
     if distance(controller.pos, weapon.pos) <= 1:
@@ -366,7 +453,20 @@ def _act(
             command = attack_command(controller.unit_id, weapon, targets)
             if command is not None:
                 return NightAction(controller, command, "fire")
-        # 射程内没目标 / 在冷却：站住别乱跑
+
+        # **够不着就换一座有目标的塔。** 配对是按距离硬配的：站在加特林
+        # （射程 3）旁边的角色，哪怕火箭（射程 10）那边正有一堆目标，也只会
+        # 站着不动守一整晚——日志上就是 `idle_target` 一直大于 0、击杀很少。
+        better = _tower_with_targets(world, controller, robots, assigned)
+        if better is not None:
+            stand = _stand_near(world, better, controller, claimed)
+            if stand is not None:
+                step = grid.next_step(world.turn, controller, stand, claimed)
+                if step is not None:
+                    claimed.add(step)
+                    return NightAction(controller, move_command(step), "switch")
+
+        # 所有塔都够不着（或都被占了）：站住别乱跑
         return NightAction(controller, None, "idle")
 
     stand = _stand_near(world, weapon, controller, claimed)
@@ -377,6 +477,27 @@ def _act(
         return NightAction(controller, None, "idle")
     claimed.add(step)
     return NightAction(controller, move_command(step), "approach")
+
+
+def _tower_with_targets(
+    world: World,
+    controller: Unit,
+    robots: list[Robot],
+    assigned: frozenset[int],
+) -> Unit | None:
+    """射程内有目标、且还没有人操控的塔里最近的那座"""
+    candidates = [
+        tower
+        for tower in world.turn.towers()
+        if tower.unit_id not in assigned
+        and fire_targets(world.turn, tower, robots)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda t: (distance(controller.pos, t.pos), t.pos.x, t.pos.y),
+    )
 
 
 def _stand_near(

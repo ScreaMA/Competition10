@@ -137,6 +137,49 @@ def step_toward_any(
     return None
 
 
+def steps_to_any(
+    turn: Turn,
+    origin: Pos,
+    goals: tuple[Pos, ...] | frozenset[Pos] | set[Pos],
+    limit: int,
+) -> int | None:
+    """`origin` 走到任意一个 `goals` 的最少步数（BFS，八方向等代价）
+
+    超过 `limit` 步就返回 None——调用方（天黑前回防）只关心"来不来得及"，
+    不关心确切步数，**深度上限就是性能上限**：不限深的话，白天每回合给每个
+    角色做一次全图 BFS，测试套件直接从 8s 涨到 28s。
+
+    用 BFS 步数而不是切比雪夫距离，是因为围墙围起来之后"直线 3 格"可能要绕到
+    缺口再进去、实际十几步；按直线距离判断出发时机，角色会在路上过完前半个
+    夜晚——那正是"炮塔没人操控"的形态。
+    """
+    targets = set(goals)
+    if not targets:
+        return None
+    if origin in targets:
+        return 0
+    if limit <= 0:
+        return None
+
+    blocked = {pos for pos, name in turn.zones.items() if name != LAND}
+    blocked.discard(origin)
+    seen = {origin}
+    frontier = deque([(origin, 0)])
+    while frontier:
+        current, depth = frontier.popleft()
+        if depth >= limit:
+            continue
+        for dx, dy in _STEPS:
+            step = Pos(current.x + dx, current.y + dy)
+            if step in seen or step in blocked or not turn.is_land(step):
+                continue
+            if step in targets:
+                return depth + 1
+            seen.add(step)
+            frontier.append((step, depth + 1))
+    return None
+
+
 def reachable(
     turn: Turn,
     origin: Pos,

@@ -286,11 +286,18 @@ def _fill_idle(
     V1 的对战日志里 `idle_man` 峰值到 3（三个角色一整回合不动），那是最纯粹的
     浪费。兜底动作是"向最近的武器靠拢"：夜里是就位操控，白天是提前站好位、
     天黑不用再跑一趟。
+
+    白天只在**天快黑且路不够走**时才回防（`dusk_recall`），其余时候角色该
+    干活干活——不然一整天都在塔旁边站着，经济和防线都没了。
     """
     for unit in world.turn.characters():
         if unit.unit_id in used:
             continue
-        command = defense.guard_weapon(world, unit, claimed)
+        command = defense.dusk_recall(world, unit, claimed)
+        if command is None and world.turn.is_day:
+            continue
+        if command is None:
+            command = defense.guard_weapon(world, unit, claimed)
         if command is not None:
             commands[unit.unit_id] = command
             used.add(unit.unit_id)

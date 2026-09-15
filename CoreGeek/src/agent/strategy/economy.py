@@ -128,6 +128,14 @@ def _worker_command(
     role: str,
     claimed: set[Pos],
 ) -> dict | None:
+    # 天快黑了：**先回夜间站位**。
+    # 这条排在最前面：白天角色常在十几格外的矿区，等天黑再往回走，走回来的
+    # 这几个回合炮塔是空的，小怪直接推进（真实对局"角色没在那边操作炮塔
+    # 清理小怪"最直接的一条根因）。
+    command = defense.dusk_recall(world, worker, claimed)
+    if command is not None:
+        return command
+
     # 金币见底：先把背包里的矿石换成钱，再谈别的。
     # 这一条对所有角色生效（不只是采集工）——只剩一个工人时它既是建造工又
     # 是采集工，V1 的"金币恒 0" 正是发生在建造工背着石头不卖的时候。

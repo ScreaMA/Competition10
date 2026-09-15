@@ -259,3 +259,97 @@ def test_excluded_units_do_not_get_weapons(
     )
     actions = defense.night_actions(world, exclude=frozenset({10011}))
     assert all(a.unit.unit_id != 10011 for a in actions)
+
+
+# ==========================================================================
+# 天黑前回防与换塔（"角色没在操作炮塔清理小怪"的两条根因）
+# ==========================================================================
+
+
+def _gun(role_factory, unit_id, x, y, kind="gatling", level=1, **kw):
+    return role_factory(unit_id, kind, x, y, level=level,
+                        attackRange=kw.pop("attackRange", 6), **kw)
+
+
+def test_rounds_until_night(payload_factory, role_factory):
+    """白天第 1 回合还剩 70 回合，最后 1 回合还剩 1，夜晚是 0"""
+    def left(round_no):
+        turn = Turn.load(payload_factory(
+            round_no=round_no, roles=[role_factory(10013, "station", 20, 10)]))
+        return defense.rounds_until_night(turn)
+
+    assert left(1) == 70
+    assert left(70) == 1
+    assert left(71) == 0
+    assert left(130) == 0
+
+
+def test_dusk_recall_sends_far_worker_home(payload_factory, role_factory):
+    """天快黑且路不够走 ⇒ 放下手里的活先回塔位
+
+    回归："角色没在操作炮塔清理小怪"最直接的一条根因——白天角色在十几格外的
+    矿区，**就位逻辑是天黑之后才启动的**，等它走回来塔已经空了好几个回合。
+    """
+    world = _world(
+        payload_factory, role_factory, round_no=65,
+        roles=[role_factory(10010, "worker", 5, 5)],
+        towers=[_gun(role_factory, 10020, 20, 12)],
+    )
+    command = defense.dusk_recall(world, world.turn.workers()[0], set())
+    assert command is not None and command["action"] == "move"
+
+
+def test_dusk_recall_leaves_nearby_worker_alone(payload_factory, role_factory):
+    """路够走就别提前收工——角色该干活干活"""
+    world = _world(
+        payload_factory, role_factory, round_no=30,
+        roles=[role_factory(10010, "worker", 5, 5)],
+        towers=[_gun(role_factory, 10020, 20, 12)],
+    )
+    assert defense.dusk_recall(world, world.turn.workers()[0], set()) is None
+
+
+def test_dusk_recall_does_nothing_at_night(payload_factory, role_factory):
+    world = _world(
+        payload_factory, role_factory, round_no=75,
+        roles=[role_factory(10010, "worker", 5, 5)],
+        towers=[_gun(role_factory, 10020, 20, 12)],
+    )
+    assert defense.dusk_recall(world, world.turn.workers()[0], set()) is None
+
+
+def test_controller_switches_to_tower_with_targets(
+    payload_factory, role_factory, robot_factory
+):
+    """自己的塔够不着时，去换一座**有目标**的塔，别守一整晚
+
+    配位是按距离硬配的：站在加特林（射程 3）旁边的角色，哪怕火箭（射程 10）
+    那边正有目标，也只会站着不动——日志上就是 `idle_target` 长期 > 0。
+    """
+    world = _world(
+        payload_factory, role_factory,
+        roles=[role_factory(10010, "worker", 13, 12)],   # 贴着加特林
+        towers=[
+            _gun(role_factory, 10020, 14, 12, attackRange=2),   # 够不着
+            _gun(role_factory, 10040, 10, 12, kind="rocket", attackRange=20),  # 够得着
+        ],
+        robots=[robot_factory(30001, 6, 12, "smallRobot")],
+    )
+    actions = {a.unit.unit_id: a for a in defense.night_actions(world)}
+    action = actions[10010]
+    assert action.role == "switch", action.role
+    assert action.command["action"] == "move"
+
+
+def test_controller_fires_when_own_tower_has_targets(
+    payload_factory, role_factory, robot_factory
+):
+    world = _world(
+        payload_factory, role_factory,
+        roles=[role_factory(10010, "worker", 13, 12)],
+        towers=[_gun(role_factory, 10020, 14, 12, attackRange=6)],
+        robots=[robot_factory(30001, 16, 12, "smallRobot")],
+    )
+    actions = {a.unit.unit_id: a for a in defense.night_actions(world)}
+    assert actions[10010].role == "fire"
+    assert actions[10010].command["action"] == "attack"
