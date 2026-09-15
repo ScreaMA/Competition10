@@ -17,7 +17,11 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 TOOLS = ROOT / "tools"
-for path in (SRC, TOOLS):
+# `ROOT` 本身也要进来：`tools.tasksandbox` 是个包，需要它的**父目录**在
+# sys.path 上。不加这一条时，从仓库根跑 `pytest CoreGeek/tests` 会因为
+# `No module named 'tools'` 整个收集失败——只报一行 ImportError，很容易
+# 被当成"测试写错了"。
+for path in (SRC, TOOLS, ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
