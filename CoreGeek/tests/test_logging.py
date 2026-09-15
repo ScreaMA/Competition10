@@ -467,18 +467,16 @@ def test_full_mode_reports_when_nothing_to_show(capsys, tmp_path):
     assert "task_dump" in capsys.readouterr().out
 
 
-def test_execute_cmd_dump_is_a_summary_not_the_whole_script(
+def test_execute_cmd_full_text_goes_to_stdout(
     payload_factory, role_factory, task_factory, caplog
 ):
-    """`execute_cmd` 进 stdout 的必须是**参数摘要**，不是脚本全文
+    """`execute_cmd` 的**脚本全文**必须在 INFO 里
 
-    全文占了整份日志的 **70%**（每回合 6–8KB），把 INFO 的预算吃光——两次真实
-    日志都在 ~180–200KB 处**从记录中间截断**，`tod=night` 一条都没有，于是
-    "夜里炮塔为什么没人操作"根本无从查起。
-
-    正文没丢：它由 `scripts.build(step, 参数)` 从仓库里的模板确定性生成，
-    而这行摘要里的参数就是全部输入。要原文时 `TASK_DUMP_FULL=1`，或看
-    `debug.log`（全文一直在 DEBUG 上）。
+    **stdout 是对局结束后唯一的取日志手段**（判题器采集的就是它），所以任务
+    全量信息一律走 INFO，一字节都不能精简。曾经试过"正文只留参数摘要、正文
+    走 DEBUG"来省体积——那基于一个错误的判断（以为日志被采集上限截断）；
+    补充后的完整日志有 592KB 且完整收尾，证明根本没有上限，之前的"截断"是
+    抓取时对局还没跑完。
     """
     roles = [role_factory(10013, "station", 20, 10),
              role_factory(10011, "pioneer", 24, 11)]
@@ -490,19 +488,8 @@ def test_execute_cmd_dump_is_a_summary_not_the_whole_script(
             phase_task="请阅读task_1_beijing.md，获取任务信息",
         ))
 
-    def dumps(level):
-        return [r.getMessage() for r in caplog.records
-                if "task_dump" in r.getMessage() and "kind=execute_cmd " in r.getMessage()
-                and r.levelno == level]
-
-    info = dumps(logging.INFO)
-    assert info, "没有 INFO 的 execute_cmd 转储"
-    for line in info:
-        assert "step=" in line and "params=" in line, line
-        assert len(line) < 2000, "INFO 里出现了脚本全文：%d 字节" % len(line)
-        assert "PYEOF" not in line, "INFO 里出现了脚本正文"
-
-    # 全文照旧发一份，但走 DEBUG（落本地 debug.log）
-    debug = dumps(logging.DEBUG)
-    assert debug, "全文没有走 DEBUG"
-    assert any("PYEOF" in line for line in debug), "DEBUG 里没有脚本正文"
+    info = [r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and "kind=execute_cmd " in r.getMessage()]
+    assert info, "INFO 里没有 execute_cmd 转储"
+    assert any("PYEOF" in line for line in info), "INFO 里没有脚本全文"
+    assert any("__PARAMS__" not in line and '"task_hint"' in line for line in info),         "INFO 里的命令缺少参数 blob"

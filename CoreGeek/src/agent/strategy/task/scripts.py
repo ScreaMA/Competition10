@@ -1412,37 +1412,25 @@ def build(
     )
 
 
-#: `_params` 里**每个回合都会变**的键，也是决策日志该记的东西。
-#: 其余那些（超时、预算、搜索根…）是编译期常量，记下来只是把日志撑大。
-_VARYING_PARAMS = (
-    "task_hint", "base", "auth", "param", "endpoint", "target",
-    "alias", "era", "ws", "spec", "check", "check_output",
-)
-
-
-def summarize(
+def build(
     step: StepSpec,
     *,
     phase_task: str,
     facts: dict[str, str],
     check_output: str = "",
 ) -> str:
-    """这一步的**参数摘要**（不含脚本正文），给决策日志用
+    """把一步变成可直接放进 `executeCmd` 的 shell 命令"""
+    body = _PYTHON_BODY.get(step.name)
+    if body is None:
+        body = 'emit("WARN", "unknown_step")\nfinish("unknown")\n'
 
-    为什么记摘要而不是全文：实测 `execute_cmd` 的全文占了整份日志的 **70%**
-    （每回合下发的脚本 6–8KB，一场里几十次），INFO 的日志预算被它吃光——
-    两次真实日志都在 ~180–200KB 处**从记录中间截断**，`tod=night` 一条都没有，
-    于是"夜里炮塔为什么没人操作"根本无从查起。
-
-    正文并没有丢：它由 `build(step, 参数)` 从仓库里的模板**确定性生成**，
-    而这行摘要里的参数就是全部输入。要原文时把 `TASK_DUMP_FULL=1` 打开即可
-    （全文照旧进 INFO），或者看本地 `debug.log`（全文在 DEBUG 上有一份）。
-    """
-    params = _params(step, phase_task, facts, {"check_output": check_output})
-    picking = {key: params[key] for key in _VARYING_PARAMS if params.get(key)}
-    return "step=%s params=%s" % (
-        step.name, json.dumps(picking, ensure_ascii=False, sort_keys=True)
+    blob = json.dumps(_params(step, phase_task, facts, {"check_output": check_output}))
+    script = (_PRELUDE + body).replace("__PARAMS__", repr(blob))
+    return (
+        'for P in python3 python; do command -v "$P" >/dev/null 2>&1 && break;'
+        f" done; $P -u - <<'PYEOF' 2>&1\n{script}\nPYEOF"
     )
+
 
 
 # ==========================================================================
